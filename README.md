@@ -165,13 +165,6 @@ note that `create_parallel`, the path most callers use, is 1.17× *faster* and
 builds an identical DAG. `batched_sequence` is 1.29× on a workload whose absolute
 cost is 114 µs.
 
-Run-to-run variance is roughly ±5%, and the machine drifts about that much
-*between* sessions, so only same-session ratios are meaningful — comparing a Rust
-number taken today against a Go number recorded last week will invent a regression
-that is not there. Both harnesses calibrate an inner repetition count until each
-timed region spans at least 100 ms, then divide; without that, the fast workloads
-measure the clock rather than the code.
-
 ## Versioning
 
 Ports mirror the Go library's version number. A port's version is a claim about
