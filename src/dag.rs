@@ -343,7 +343,20 @@ impl ClassicTreeBranch {
 #[derive(Clone, Debug)]
 pub struct DagLeaf {
     pub(crate) cid: Cid,
-    pub(crate) item_name: String,
+    /// The leaf's name, shared rather than owned.
+    ///
+    /// For the same reason `content` and `Cid::text` are shared: a chunk leaf's
+    /// other fields are all empty (no links, no proofs, no metadata), so this
+    /// `String` was the single heap allocation every `DagLeaf::clone` paid.
+    /// Measured on a 141-leaf DAG, cloning leaves cost 20.3 us of a 102 us
+    /// batched-sequence run -- a fifth of the whole workload -- and Go pays none
+    /// of it because its `Clone()` copies an immutable string header.
+    ///
+    /// Sharing is safe because a leaf's name is immutable: the CID commits to
+    /// `ItemName` through the identity CBOR, so mutating it in place would
+    /// invalidate the leaf's identity. `Arc<str>` hands out no `&mut`, and the
+    /// name is only ever replaced wholesale when a new leaf is built.
+    pub(crate) item_name: Arc<str>,
     pub(crate) leaf_type: LeafType,
     pub(crate) content_hash: Option<Digest>,
     /// The leaf payload, shared rather than owned.
@@ -588,7 +601,7 @@ impl DagLeaf {
     ) -> Self {
         Self {
             cid,
-            item_name,
+            item_name: item_name.into(),
             leaf_type,
             content_hash,
             // Already shared by the caller. The decoder hands over the `Arc` it
@@ -643,14 +656,14 @@ impl DagLeaf {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeafBuilder {
-    item_name: String,
+    item_name: Arc<str>,
     leaf_type: LeafType,
     data: Option<Arc<Vec<u8>>>,
     links: Vec<Cid>,
 }
 
 impl LeafBuilder {
-    pub fn new(item_name: impl Into<String>, leaf_type: LeafType) -> Self {
+    pub fn new(item_name: impl Into<Arc<str>>, leaf_type: LeafType) -> Self {
         Self {
             item_name: item_name.into(),
             leaf_type,
@@ -2035,7 +2048,7 @@ fn encode_storage_shape(leaf: &DagLeaf) -> Vec<u8> {
         ("Hash".to_owned(), CborValue::Text(leaf.cid.to_string())),
         (
             "ItemName".to_owned(),
-            CborValue::Text(leaf.item_name.clone()),
+            CborValue::Text(leaf.item_name.to_string()),
         ),
         (
             "Type".to_owned(),

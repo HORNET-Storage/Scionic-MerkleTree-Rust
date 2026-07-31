@@ -11,7 +11,7 @@ use crate::serialization::{
     JsonValue, WireKey,
 };
 use crate::{Error, Result};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 
 pub const DEFAULT_BATCH_TARGET: usize = 4 * 1024 * 1024;
@@ -405,8 +405,16 @@ impl Dag {
         };
         let mut current_size = estimate_leaf_size(root_leaf)?;
         let mut parents_in_batch = BTreeSet::from([self.root().clone()]);
-        let mut visited = BTreeSet::from([self.root().clone()]);
+        // `visited` is only ever probed and inserted into, never iterated, so it
+        // does not owe anyone an order -- and hashing a CID once beats the seven
+        // 59-byte string comparisons an ordered set pays per lookup.
+        let mut visited = HashSet::from([self.root().clone()]);
         let mut queue = VecDeque::from([self.root().clone()]);
+        // A parent's proof set is derived only from its own sorted links, so a
+        // parent that straddles several batches rebuilds the identical classic
+        // tree and regenerates the identical proofs every time. Memoize it: the
+        // root alone carries dozens of links and spans most of the run.
+        let mut proof_cache: HashMap<Cid, BTreeMap<Cid, ClassicTreeBranch>> = HashMap::new();
 
         while let Some(parent_cid) = queue.pop_front() {
             let parent = self
@@ -432,7 +440,7 @@ impl Dag {
                     > target.get()
                     && !current.leaves.is_empty()
                 {
-                    self.finalize_batch(&mut current, &parents_in_batch)?;
+                    self.finalize_batch(&mut current, &parents_in_batch, &mut proof_cache)?;
                     batches.push(current);
                     current = BatchedTransmissionPacket {
                         leaves: Vec::new(),
@@ -453,13 +461,21 @@ impl Dag {
                         field: "batch estimate",
                     })?;
                 visited.insert(child_cid.clone());
-                parents_in_batch.insert(child_cid.clone());
+                // Only leaves that can actually carry proofs belong in the parent
+                // set. A content chunk with one link or none would reach
+                // finalize_batch just to hit the `current_link_count() <= 1`
+                // guard, after paying for a set insert, a scan and a DAG lookup.
+                // On a chunk-heavy DAG this is the difference between revisiting
+                // every leaf and revisiting only the interior nodes.
+                if child.current_link_count() > 1 {
+                    parents_in_batch.insert(child_cid.clone());
+                }
                 queue.push_back(child_cid);
             }
         }
 
         if !current.leaves.is_empty() {
-            self.finalize_batch(&mut current, &parents_in_batch)?;
+            self.finalize_batch(&mut current, &parents_in_batch, &mut proof_cache)?;
             batches.push(current);
         }
         let total_packets = u64::try_from(batches.len()).map_err(|_| Error::SizeOverflow {
@@ -498,9 +514,17 @@ impl Dag {
         &self,
         batch: &mut BatchedTransmissionPacket,
         parents_in_batch: &BTreeSet<Cid>,
+        proof_cache: &mut HashMap<Cid, BTreeMap<Cid, ClassicTreeBranch>>,
     ) -> Result<()> {
+        // Only the parents this batch will actually inspect need a child count.
+        // Counting every relationship clones a CID and touches the map once per
+        // leaf in the batch, and on a chunk-heavy DAG all but a handful of those
+        // entries are then never read back.
         let mut children_in_batch = BTreeMap::<Cid, usize>::new();
         for parent in batch.relationships.values().flatten() {
+            if !parents_in_batch.contains(parent) {
+                continue;
+            }
             let count = children_in_batch.entry(parent.clone()).or_default();
             *count = count.checked_add(1).ok_or(Error::SizeOverflow {
                 field: "batch relationship count",
@@ -508,6 +532,9 @@ impl Dag {
         }
         let partial = self.is_partial();
         for parent_cid in parents_in_batch {
+            // The caller only admits multi-link leaves into `parents_in_batch`,
+            // so this scan runs once per interior node in the batch rather than
+            // once per leaf in it.
             let Some(index) = batch
                 .leaves
                 .iter()
@@ -518,6 +545,8 @@ impl Dag {
             let Some(original) = self.get(parent_cid) else {
                 continue;
             };
+            // The root enters the set unconditionally, so a single-link root
+            // still has to be turned away here.
             if original.current_link_count() <= 1 {
                 continue;
             }
@@ -528,21 +557,27 @@ impl Dag {
             } else if partial {
                 batch.leaves[index].proofs = original.proofs.clone();
             } else {
-                let mut links = original.links().to_vec();
-                links.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-                let (_, tree) = classic_tree_for_links(&links)?;
-                let tree = tree.ok_or(Error::Invariant {
-                    detail: "multi-link leaf has no classic tree",
-                })?;
-                let mut proofs = BTreeMap::new();
-                for child in links {
-                    let proof = tree.proof_for_key(child.as_str())?.clone();
-                    proofs.insert(
-                        child.clone(),
-                        ClassicTreeBranch::new(child, proof),
-                    );
+                // A parent's proof set is derived only from its own sorted
+                // links, so a parent that straddles several batches would
+                // otherwise rebuild the identical tree once per batch.
+                if !proof_cache.contains_key(parent_cid) {
+                    let mut links = original.links().to_vec();
+                    links.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+                    let (_, tree) = classic_tree_for_links(&links)?;
+                    let tree = tree.ok_or(Error::Invariant {
+                        detail: "multi-link leaf has no classic tree",
+                    })?;
+                    let mut proofs = BTreeMap::new();
+                    for child in links {
+                        let proof = tree.proof_for_key(child.as_str())?.clone();
+                        proofs.insert(
+                            child.clone(),
+                            ClassicTreeBranch::new(child, proof),
+                        );
+                    }
+                    proof_cache.insert(parent_cid.clone(), proofs);
                 }
-                batch.leaves[index].proofs = proofs;
+                batch.leaves[index].proofs = proof_cache[parent_cid].clone();
             }
         }
         Ok(())

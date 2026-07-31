@@ -138,32 +138,50 @@ that built *different* DAGs would be meaningless, so the harness makes that
 impossible to overlook. Both also report identical encoded sizes
 (`cbor_bytes=19188357`, `json_bytes=25591601`).
 
-18.25 MiB corpus, 256 KiB chunks, min of 7 samples, Windows / 24 CPUs / Go 1.24.4,
+18.25 MiB corpus, 256 KiB chunks, min of 15 samples, Windows / 24 CPUs / Go 1.24.4,
 both harnesses run back to back in one session. Lower is better.
 
 | Workload | Rust | Go | Rust vs Go |
 |---|---:|---:|---|
-| `verify` | 4.77 ms | 10.30 ms | **2.16× faster** |
-| `from_json` | 50.46 ms | 68.51 ms | **1.36× faster** |
-| `to_json` | 68.22 ms | 83.82 ms | **1.23× faster** |
-| `to_cbor` | 4.29 ms | 5.06 ms | **1.18× faster** |
-| `create_parallel` | 3.89 ms | 4.53 ms | **1.17× faster** |
-| `leaf_sequence` | 2.52 ms | 2.74 ms | **1.08× faster** |
-| `from_cbor` | 2.60 ms | 2.49 ms | parity (1.04×) |
-| `create_sequential` | 18.31 ms | 16.26 ms | 1.13× slower |
-| `batched_sequence` | 0.114 ms | 0.089 ms | 1.29× slower |
+| `to_cbor` | 3.54 ms | 21.90 ms | **6.19× faster** |
+| `verify` | 4.67 ms | 10.35 ms | **2.22× faster** |
+| `from_json` | 55.03 ms | 79.14 ms | **1.44× faster** |
+| `to_json` | 67.31 ms | 85.23 ms | **1.27× faster** |
+| `create_parallel` | 3.23 ms | 4.07 ms | **1.26× faster** |
+| `leaf_sequence` | 2.47 ms | 2.99 ms | **1.21× faster** |
+| `batched_sequence` | 0.099 ms | 0.104 ms | parity |
+| `from_cbor` | 2.56 ms | 2.53 ms | parity |
+| `create_sequential` | 17.26 ms | 15.12 ms | 1.14× slower |
 
-Leaf payloads are shared through `Arc` rather than deep-copied, so cloning a leaf
-— which transmission, batching and every store read do constantly — is a refcount
-bump. This is sound because leaf content is immutable: a leaf's CID commits to
-`sha256(content)`, and `Arc` hands out no `&mut` while a second owner exists, so
-the invariant is enforced by the type system rather than by convention.
+Read the `to_cbor` row as a snapshot of the current reference build rather than a
+durable six-fold gap: Go's encoder presently routes through a hand-written
+deterministic marshaler instead of its CBOR library's optimized path.
+`batched_sequence` and `from_cbor` are reported as parity because the spread
+between repeated runs of either implementation is wider than the difference
+between them.
 
-Two workloads remain slower. `create_sequential` is 1.13×, consistent with the
-overflow-checked arithmetic and allocation-failure handling this crate performs;
-note that `create_parallel`, the path most callers use, is 1.17× *faster* and
-builds an identical DAG. `batched_sequence` is 1.29× on a workload whose absolute
-cost is 114 µs.
+Leaf payloads and leaf names are shared through `Arc` rather than deep-copied, so
+cloning a leaf — which transmission, batching and every store read do constantly
+— costs a refcount bump instead of an allocation. This is sound because both are
+immutable: a leaf's CID commits to `sha256(content)` and to `ItemName` through the
+identity CBOR, so mutating either in place would invalidate the leaf's identity,
+and `Arc` hands out no `&mut` while a second owner exists. The invariant is
+enforced by the type system rather than by convention.
+
+`create_sequential` is the one workload still behind, and the cause is allocation
+count rather than anything algorithmic: it allocates one retained buffer per
+chunk, and the gap tracks that count rather than the byte total. Same corpus,
+same bytes, same hashing — only the chunk size changes:
+
+| Chunk size | Rust | Go | Rust vs Go |
+|---|---:|---:|---|
+| 256 KiB | 17.26 ms | 15.12 ms | 1.14× slower |
+| 1 MiB | 17.23 ms | 16.21 ms | 1.06× slower |
+| 2 MiB (crate default) | 15.92 ms | 16.08 ms | **1.01× faster** |
+
+So at this crate's own default chunk size the two are level, and the deficit only
+appears when a caller chooses small chunks. `create_parallel`, the path most
+callers use, is 1.26× *faster* at every size and builds an identical DAG.
 
 ## Versioning
 
