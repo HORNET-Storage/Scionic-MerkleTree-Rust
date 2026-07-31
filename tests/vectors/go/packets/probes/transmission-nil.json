@@ -1,0 +1,17 @@
+{
+  "Leaf": {
+    "Hash": "probe",
+    "ItemName": "probe",
+    "Type": "file",
+    "ContentHash": null,
+    "Content": null,
+    "ClassicMerkleRoot": "",
+    "CurrentLinkCount": 0,
+    "LeafCount": 0,
+    "ContentSize": 0,
+    "DagSize": 0,
+    "Links": [],
+    "AdditionalData": {}
+  },
+  "ParentHash": ""
+}

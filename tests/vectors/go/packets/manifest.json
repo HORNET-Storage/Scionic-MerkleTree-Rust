@@ -1,0 +1,1426 @@
+{
+  "schema": 1,
+  "transmission_packets": 45,
+  "default_batches": 7,
+  "artifacts": [
+    {
+      "base_path": "packets/transmission/single_small_file/000",
+      "case": "single_small_file",
+      "kind": "transmission",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe"
+      ],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/single_small_file/001",
+      "case": "single_small_file",
+      "kind": "transmission",
+      "index": 1,
+      "leaf_hashes": [
+        "bafireihbiqi52zqwzotl5inpq2lmhduvurg7x2jmcejht2kedqijyorari"
+      ],
+      "parent_hash": "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe",
+      "packet_index": 1,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/batched/default/single_small_file/000",
+      "case": "single_small_file",
+      "kind": "batched-default",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe",
+        "bafireihbiqi52zqwzotl5inpq2lmhduvurg7x2jmcejht2kedqijyorari"
+      ],
+      "relationships": {
+        "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe": "",
+        "bafireihbiqi52zqwzotl5inpq2lmhduvurg7x2jmcejht2kedqijyorari": "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe"
+      },
+      "packet_index": 0,
+      "total_packets": 1,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaves[0].AdditionalData": 0,
+        "Leaves[0].stored_proofs": 0,
+        "Leaves[1].AdditionalData": 0,
+        "Leaves[1].stored_proofs": 0,
+        "Relationships": 2
+      },
+      "multi_entry_maps": [
+        "Relationships"
+      ],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/single_large_file/000",
+      "case": "single_large_file",
+      "kind": "transmission",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireiel7coatk47jhcsatc4xdjxx3jx7fdqteplhtlxb7y27bzwnstvwy"
+      ],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/single_large_file/001",
+      "case": "single_large_file",
+      "kind": "transmission",
+      "index": 1,
+      "leaf_hashes": [
+        "bafireidpgfh4qypwpbkx2g5th4hz3t4eotvmafgeg6d4vttxchsyt5mcai"
+      ],
+      "parent_hash": "bafireiel7coatk47jhcsatc4xdjxx3jx7fdqteplhtlxb7y27bzwnstvwy",
+      "packet_index": 1,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/single_large_file/002",
+      "case": "single_large_file",
+      "kind": "transmission",
+      "index": 2,
+      "leaf_hashes": [
+        "bafireib46mkhblkqmpogg67fcgqs7223kjo3n4pq6gd55zquad3m3bbfui"
+      ],
+      "parent_hash": "bafireidpgfh4qypwpbkx2g5th4hz3t4eotvmafgeg6d4vttxchsyt5mcai",
+      "packet_index": 2,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/single_large_file/003",
+      "case": "single_large_file",
+      "kind": "transmission",
+      "index": 3,
+      "leaf_hashes": [
+        "bafireies24kuiuasdujtruusoedrzh4icwms5uuu3m6uxqlrznpwgukd6u"
+      ],
+      "parent_hash": "bafireidpgfh4qypwpbkx2g5th4hz3t4eotvmafgeg6d4vttxchsyt5mcai",
+      "packet_index": 3,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/single_large_file/004",
+      "case": "single_large_file",
+      "kind": "transmission",
+      "index": 4,
+      "leaf_hashes": [
+        "bafireihkxvfjdup6cytuabhgr7aistdcje7ubbq6tebrpwmdbg6g67juku"
+      ],
+      "parent_hash": "bafireidpgfh4qypwpbkx2g5th4hz3t4eotvmafgeg6d4vttxchsyt5mcai",
+      "packet_index": 4,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/batched/default/single_large_file/000",
+      "case": "single_large_file",
+      "kind": "batched-default",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireiel7coatk47jhcsatc4xdjxx3jx7fdqteplhtlxb7y27bzwnstvwy",
+        "bafireidpgfh4qypwpbkx2g5th4hz3t4eotvmafgeg6d4vttxchsyt5mcai",
+        "bafireib46mkhblkqmpogg67fcgqs7223kjo3n4pq6gd55zquad3m3bbfui",
+        "bafireies24kuiuasdujtruusoedrzh4icwms5uuu3m6uxqlrznpwgukd6u",
+        "bafireihkxvfjdup6cytuabhgr7aistdcje7ubbq6tebrpwmdbg6g67juku"
+      ],
+      "relationships": {
+        "bafireib46mkhblkqmpogg67fcgqs7223kjo3n4pq6gd55zquad3m3bbfui": "bafireidpgfh4qypwpbkx2g5th4hz3t4eotvmafgeg6d4vttxchsyt5mcai",
+        "bafireidpgfh4qypwpbkx2g5th4hz3t4eotvmafgeg6d4vttxchsyt5mcai": "bafireiel7coatk47jhcsatc4xdjxx3jx7fdqteplhtlxb7y27bzwnstvwy",
+        "bafireiel7coatk47jhcsatc4xdjxx3jx7fdqteplhtlxb7y27bzwnstvwy": "",
+        "bafireies24kuiuasdujtruusoedrzh4icwms5uuu3m6uxqlrznpwgukd6u": "bafireidpgfh4qypwpbkx2g5th4hz3t4eotvmafgeg6d4vttxchsyt5mcai",
+        "bafireihkxvfjdup6cytuabhgr7aistdcje7ubbq6tebrpwmdbg6g67juku": "bafireidpgfh4qypwpbkx2g5th4hz3t4eotvmafgeg6d4vttxchsyt5mcai"
+      },
+      "packet_index": 0,
+      "total_packets": 1,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaves[0].AdditionalData": 0,
+        "Leaves[0].stored_proofs": 0,
+        "Leaves[1].AdditionalData": 0,
+        "Leaves[1].stored_proofs": 0,
+        "Leaves[2].AdditionalData": 0,
+        "Leaves[2].stored_proofs": 0,
+        "Leaves[3].AdditionalData": 0,
+        "Leaves[3].stored_proofs": 0,
+        "Leaves[4].AdditionalData": 0,
+        "Leaves[4].stored_proofs": 0,
+        "Relationships": 5
+      },
+      "multi_entry_maps": [
+        "Relationships"
+      ],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/flat_directory/000",
+      "case": "flat_directory",
+      "kind": "transmission",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u"
+      ],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/flat_directory/001",
+      "case": "flat_directory",
+      "kind": "transmission",
+      "index": 1,
+      "leaf_hashes": [
+        "bafireiacuqkkrqcg3yaele4gmn3c7kfnfe3i7tldbpyy72eutscjio7gda"
+      ],
+      "parent_hash": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+      "packet_index": 1,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/flat_directory/002",
+      "case": "flat_directory",
+      "kind": "transmission",
+      "index": 2,
+      "leaf_hashes": [
+        "bafireib2ifzjmyxaro3s4ygzwg7hg7fp3626o3ojdsbky35cskxdv6xjda"
+      ],
+      "parent_hash": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+      "packet_index": 2,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/flat_directory/003",
+      "case": "flat_directory",
+      "kind": "transmission",
+      "index": 3,
+      "leaf_hashes": [
+        "bafireibfx766siv7teknmhfsynp6h3zyf7tk2f5cdywfyj6n2lczmutmn4"
+      ],
+      "parent_hash": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+      "packet_index": 3,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/flat_directory/004",
+      "case": "flat_directory",
+      "kind": "transmission",
+      "index": 4,
+      "leaf_hashes": [
+        "bafireigprsfkmr22n5bkrj74o3eucew2vedlhofmxz2rlcef2ndqzunfmy"
+      ],
+      "parent_hash": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+      "packet_index": 4,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/flat_directory/005",
+      "case": "flat_directory",
+      "kind": "transmission",
+      "index": 5,
+      "leaf_hashes": [
+        "bafireihlk4ewaethu42vq7hltrkwm5adqepmdttedi72nal4ckbgwhi6ni"
+      ],
+      "parent_hash": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+      "packet_index": 5,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/batched/default/flat_directory/000",
+      "case": "flat_directory",
+      "kind": "batched-default",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+        "bafireiacuqkkrqcg3yaele4gmn3c7kfnfe3i7tldbpyy72eutscjio7gda",
+        "bafireib2ifzjmyxaro3s4ygzwg7hg7fp3626o3ojdsbky35cskxdv6xjda",
+        "bafireibfx766siv7teknmhfsynp6h3zyf7tk2f5cdywfyj6n2lczmutmn4",
+        "bafireigprsfkmr22n5bkrj74o3eucew2vedlhofmxz2rlcef2ndqzunfmy",
+        "bafireihlk4ewaethu42vq7hltrkwm5adqepmdttedi72nal4ckbgwhi6ni"
+      ],
+      "relationships": {
+        "bafireiacuqkkrqcg3yaele4gmn3c7kfnfe3i7tldbpyy72eutscjio7gda": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+        "bafireib2ifzjmyxaro3s4ygzwg7hg7fp3626o3ojdsbky35cskxdv6xjda": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+        "bafireibfx766siv7teknmhfsynp6h3zyf7tk2f5cdywfyj6n2lczmutmn4": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+        "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u": "",
+        "bafireigprsfkmr22n5bkrj74o3eucew2vedlhofmxz2rlcef2ndqzunfmy": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+        "bafireihlk4ewaethu42vq7hltrkwm5adqepmdttedi72nal4ckbgwhi6ni": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u"
+      },
+      "packet_index": 0,
+      "total_packets": 1,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaves[0].AdditionalData": 0,
+        "Leaves[0].stored_proofs": 0,
+        "Leaves[1].AdditionalData": 0,
+        "Leaves[1].stored_proofs": 0,
+        "Leaves[2].AdditionalData": 0,
+        "Leaves[2].stored_proofs": 0,
+        "Leaves[3].AdditionalData": 0,
+        "Leaves[3].stored_proofs": 0,
+        "Leaves[4].AdditionalData": 0,
+        "Leaves[4].stored_proofs": 0,
+        "Leaves[5].AdditionalData": 0,
+        "Leaves[5].stored_proofs": 0,
+        "Relationships": 6
+      },
+      "multi_entry_maps": [
+        "Relationships"
+      ],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/nested_directory/000",
+      "case": "nested_directory",
+      "kind": "transmission",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireiekzu7qss4gcgk3ochl3ehk3ee3rmsqjdh7bin4twzdhkgsfw2kme"
+      ],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/nested_directory/001",
+      "case": "nested_directory",
+      "kind": "transmission",
+      "index": 1,
+      "leaf_hashes": [
+        "bafireigqkqotdzv3kfqx7nuwpyjyesl45bbwtjkqchqcbnfewv7ixxq7vi"
+      ],
+      "parent_hash": "bafireiekzu7qss4gcgk3ochl3ehk3ee3rmsqjdh7bin4twzdhkgsfw2kme",
+      "packet_index": 1,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/nested_directory/002",
+      "case": "nested_directory",
+      "kind": "transmission",
+      "index": 2,
+      "leaf_hashes": [
+        "bafireihtwh3zjvkcwn5kzwv73j42yjhh7emnqx6vyl5icrdojwt6xfqhb4"
+      ],
+      "parent_hash": "bafireiekzu7qss4gcgk3ochl3ehk3ee3rmsqjdh7bin4twzdhkgsfw2kme",
+      "packet_index": 2,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/nested_directory/003",
+      "case": "nested_directory",
+      "kind": "transmission",
+      "index": 3,
+      "leaf_hashes": [
+        "bafireiajknre47ttxov4u3tnjspttrllz5oqd64b2kltbekq7yj4yzyytu"
+      ],
+      "parent_hash": "bafireigqkqotdzv3kfqx7nuwpyjyesl45bbwtjkqchqcbnfewv7ixxq7vi",
+      "packet_index": 3,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/nested_directory/004",
+      "case": "nested_directory",
+      "kind": "transmission",
+      "index": 4,
+      "leaf_hashes": [
+        "bafireiclvajwah7xiuovy472nzkoarwkbgbbxh2fb6hbkc7lthddyjrcxy"
+      ],
+      "parent_hash": "bafireigqkqotdzv3kfqx7nuwpyjyesl45bbwtjkqchqcbnfewv7ixxq7vi",
+      "packet_index": 4,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/nested_directory/005",
+      "case": "nested_directory",
+      "kind": "transmission",
+      "index": 5,
+      "leaf_hashes": [
+        "bafireidrpftpmbxbk3dzrq2k6vjk5gxqv2gmkz436moavckgb27h7epgeu"
+      ],
+      "parent_hash": "bafireihtwh3zjvkcwn5kzwv73j42yjhh7emnqx6vyl5icrdojwt6xfqhb4",
+      "packet_index": 5,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/nested_directory/006",
+      "case": "nested_directory",
+      "kind": "transmission",
+      "index": 6,
+      "leaf_hashes": [
+        "bafireigk22lstqiitz3afw3jhsqwi3etuijapzcpcqtsgfmtjwg4lr6mmq"
+      ],
+      "parent_hash": "bafireihtwh3zjvkcwn5kzwv73j42yjhh7emnqx6vyl5icrdojwt6xfqhb4",
+      "packet_index": 6,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/batched/default/nested_directory/000",
+      "case": "nested_directory",
+      "kind": "batched-default",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireiekzu7qss4gcgk3ochl3ehk3ee3rmsqjdh7bin4twzdhkgsfw2kme",
+        "bafireigqkqotdzv3kfqx7nuwpyjyesl45bbwtjkqchqcbnfewv7ixxq7vi",
+        "bafireihtwh3zjvkcwn5kzwv73j42yjhh7emnqx6vyl5icrdojwt6xfqhb4",
+        "bafireiajknre47ttxov4u3tnjspttrllz5oqd64b2kltbekq7yj4yzyytu",
+        "bafireiclvajwah7xiuovy472nzkoarwkbgbbxh2fb6hbkc7lthddyjrcxy",
+        "bafireidrpftpmbxbk3dzrq2k6vjk5gxqv2gmkz436moavckgb27h7epgeu",
+        "bafireigk22lstqiitz3afw3jhsqwi3etuijapzcpcqtsgfmtjwg4lr6mmq"
+      ],
+      "relationships": {
+        "bafireiajknre47ttxov4u3tnjspttrllz5oqd64b2kltbekq7yj4yzyytu": "bafireigqkqotdzv3kfqx7nuwpyjyesl45bbwtjkqchqcbnfewv7ixxq7vi",
+        "bafireiclvajwah7xiuovy472nzkoarwkbgbbxh2fb6hbkc7lthddyjrcxy": "bafireigqkqotdzv3kfqx7nuwpyjyesl45bbwtjkqchqcbnfewv7ixxq7vi",
+        "bafireidrpftpmbxbk3dzrq2k6vjk5gxqv2gmkz436moavckgb27h7epgeu": "bafireihtwh3zjvkcwn5kzwv73j42yjhh7emnqx6vyl5icrdojwt6xfqhb4",
+        "bafireiekzu7qss4gcgk3ochl3ehk3ee3rmsqjdh7bin4twzdhkgsfw2kme": "",
+        "bafireigk22lstqiitz3afw3jhsqwi3etuijapzcpcqtsgfmtjwg4lr6mmq": "bafireihtwh3zjvkcwn5kzwv73j42yjhh7emnqx6vyl5icrdojwt6xfqhb4",
+        "bafireigqkqotdzv3kfqx7nuwpyjyesl45bbwtjkqchqcbnfewv7ixxq7vi": "bafireiekzu7qss4gcgk3ochl3ehk3ee3rmsqjdh7bin4twzdhkgsfw2kme",
+        "bafireihtwh3zjvkcwn5kzwv73j42yjhh7emnqx6vyl5icrdojwt6xfqhb4": "bafireiekzu7qss4gcgk3ochl3ehk3ee3rmsqjdh7bin4twzdhkgsfw2kme"
+      },
+      "packet_index": 0,
+      "total_packets": 1,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaves[0].AdditionalData": 0,
+        "Leaves[0].stored_proofs": 0,
+        "Leaves[1].AdditionalData": 0,
+        "Leaves[1].stored_proofs": 0,
+        "Leaves[2].AdditionalData": 0,
+        "Leaves[2].stored_proofs": 0,
+        "Leaves[3].AdditionalData": 0,
+        "Leaves[3].stored_proofs": 0,
+        "Leaves[4].AdditionalData": 0,
+        "Leaves[4].stored_proofs": 0,
+        "Leaves[5].AdditionalData": 0,
+        "Leaves[5].stored_proofs": 0,
+        "Leaves[6].AdditionalData": 0,
+        "Leaves[6].stored_proofs": 0,
+        "Relationships": 7
+      },
+      "multi_entry_maps": [
+        "Relationships"
+      ],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/000",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireifzuzba5kihvbxfl5ygrse5pca6aamzumemmrjm32yyl5j4cjdj3u"
+      ],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/001",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 1,
+      "leaf_hashes": [
+        "bafireiel5ss7i32dxtg3ooe55zcgkz4dve76kzh22n7443ad2oc37pbxui"
+      ],
+      "parent_hash": "bafireifzuzba5kihvbxfl5ygrse5pca6aamzumemmrjm32yyl5j4cjdj3u",
+      "packet_index": 1,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/002",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 2,
+      "leaf_hashes": [
+        "bafireidzxxmxeggukewmp3djcwzfrf4cddug3rrc67ihmauwrkngziqkim"
+      ],
+      "parent_hash": "bafireiel5ss7i32dxtg3ooe55zcgkz4dve76kzh22n7443ad2oc37pbxui",
+      "packet_index": 2,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/003",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 3,
+      "leaf_hashes": [
+        "bafireihjors6emzaxvv7vgzbhi5kmc32odgcwzq26ee6r3wytfd2z42al4"
+      ],
+      "parent_hash": "bafireiel5ss7i32dxtg3ooe55zcgkz4dve76kzh22n7443ad2oc37pbxui",
+      "packet_index": 3,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/004",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 4,
+      "leaf_hashes": [
+        "bafireicjnpibc3epkkzncxbv7oi2ukaksrkncgip6uazbekqcmkdjsyk4a"
+      ],
+      "parent_hash": "bafireihjors6emzaxvv7vgzbhi5kmc32odgcwzq26ee6r3wytfd2z42al4",
+      "packet_index": 4,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/005",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 5,
+      "leaf_hashes": [
+        "bafireidx7qzvy4z3r6wbfoad4oq7r4tyzvkd3vz6ypxzcpoixeredte2ay"
+      ],
+      "parent_hash": "bafireihjors6emzaxvv7vgzbhi5kmc32odgcwzq26ee6r3wytfd2z42al4",
+      "packet_index": 5,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/006",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 6,
+      "leaf_hashes": [
+        "bafireiadw2zuzmj3chd23m2xfxa6ovjuj4d7k2xugockpeg4moul2futp4"
+      ],
+      "parent_hash": "bafireicjnpibc3epkkzncxbv7oi2ukaksrkncgip6uazbekqcmkdjsyk4a",
+      "packet_index": 6,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/007",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 7,
+      "leaf_hashes": [
+        "bafireibfwuzipeprghtf5lt3mrtfrgpprp5pgzpzema46bpu3nqwyu4n6i"
+      ],
+      "parent_hash": "bafireicjnpibc3epkkzncxbv7oi2ukaksrkncgip6uazbekqcmkdjsyk4a",
+      "packet_index": 7,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/008",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 8,
+      "leaf_hashes": [
+        "bafireib6xkvqj2c3utubn7gtdpgoonzsd3b2ajpntypjrekbry65bomndi"
+      ],
+      "parent_hash": "bafireibfwuzipeprghtf5lt3mrtfrgpprp5pgzpzema46bpu3nqwyu4n6i",
+      "packet_index": 8,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/009",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 9,
+      "leaf_hashes": [
+        "bafireif7pnrwvuqwxmplp37xg33xxqvbflwpj4jaqoz5wwrolvwxkwcob4"
+      ],
+      "parent_hash": "bafireibfwuzipeprghtf5lt3mrtfrgpprp5pgzpzema46bpu3nqwyu4n6i",
+      "packet_index": 9,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/deep_hierarchy/010",
+      "case": "deep_hierarchy",
+      "kind": "transmission",
+      "index": 10,
+      "leaf_hashes": [
+        "bafireiborlrp3pkvbfvp3p57mivergoo5he4gmpv4yworhptmrt7vtxaiu"
+      ],
+      "parent_hash": "bafireif7pnrwvuqwxmplp37xg33xxqvbflwpj4jaqoz5wwrolvwxkwcob4",
+      "packet_index": 10,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/batched/default/deep_hierarchy/000",
+      "case": "deep_hierarchy",
+      "kind": "batched-default",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireifzuzba5kihvbxfl5ygrse5pca6aamzumemmrjm32yyl5j4cjdj3u",
+        "bafireiel5ss7i32dxtg3ooe55zcgkz4dve76kzh22n7443ad2oc37pbxui",
+        "bafireidzxxmxeggukewmp3djcwzfrf4cddug3rrc67ihmauwrkngziqkim",
+        "bafireihjors6emzaxvv7vgzbhi5kmc32odgcwzq26ee6r3wytfd2z42al4",
+        "bafireicjnpibc3epkkzncxbv7oi2ukaksrkncgip6uazbekqcmkdjsyk4a",
+        "bafireidx7qzvy4z3r6wbfoad4oq7r4tyzvkd3vz6ypxzcpoixeredte2ay",
+        "bafireiadw2zuzmj3chd23m2xfxa6ovjuj4d7k2xugockpeg4moul2futp4",
+        "bafireibfwuzipeprghtf5lt3mrtfrgpprp5pgzpzema46bpu3nqwyu4n6i",
+        "bafireib6xkvqj2c3utubn7gtdpgoonzsd3b2ajpntypjrekbry65bomndi",
+        "bafireif7pnrwvuqwxmplp37xg33xxqvbflwpj4jaqoz5wwrolvwxkwcob4",
+        "bafireiborlrp3pkvbfvp3p57mivergoo5he4gmpv4yworhptmrt7vtxaiu"
+      ],
+      "relationships": {
+        "bafireiadw2zuzmj3chd23m2xfxa6ovjuj4d7k2xugockpeg4moul2futp4": "bafireicjnpibc3epkkzncxbv7oi2ukaksrkncgip6uazbekqcmkdjsyk4a",
+        "bafireib6xkvqj2c3utubn7gtdpgoonzsd3b2ajpntypjrekbry65bomndi": "bafireibfwuzipeprghtf5lt3mrtfrgpprp5pgzpzema46bpu3nqwyu4n6i",
+        "bafireibfwuzipeprghtf5lt3mrtfrgpprp5pgzpzema46bpu3nqwyu4n6i": "bafireicjnpibc3epkkzncxbv7oi2ukaksrkncgip6uazbekqcmkdjsyk4a",
+        "bafireiborlrp3pkvbfvp3p57mivergoo5he4gmpv4yworhptmrt7vtxaiu": "bafireif7pnrwvuqwxmplp37xg33xxqvbflwpj4jaqoz5wwrolvwxkwcob4",
+        "bafireicjnpibc3epkkzncxbv7oi2ukaksrkncgip6uazbekqcmkdjsyk4a": "bafireihjors6emzaxvv7vgzbhi5kmc32odgcwzq26ee6r3wytfd2z42al4",
+        "bafireidx7qzvy4z3r6wbfoad4oq7r4tyzvkd3vz6ypxzcpoixeredte2ay": "bafireihjors6emzaxvv7vgzbhi5kmc32odgcwzq26ee6r3wytfd2z42al4",
+        "bafireidzxxmxeggukewmp3djcwzfrf4cddug3rrc67ihmauwrkngziqkim": "bafireiel5ss7i32dxtg3ooe55zcgkz4dve76kzh22n7443ad2oc37pbxui",
+        "bafireiel5ss7i32dxtg3ooe55zcgkz4dve76kzh22n7443ad2oc37pbxui": "bafireifzuzba5kihvbxfl5ygrse5pca6aamzumemmrjm32yyl5j4cjdj3u",
+        "bafireif7pnrwvuqwxmplp37xg33xxqvbflwpj4jaqoz5wwrolvwxkwcob4": "bafireibfwuzipeprghtf5lt3mrtfrgpprp5pgzpzema46bpu3nqwyu4n6i",
+        "bafireifzuzba5kihvbxfl5ygrse5pca6aamzumemmrjm32yyl5j4cjdj3u": "",
+        "bafireihjors6emzaxvv7vgzbhi5kmc32odgcwzq26ee6r3wytfd2z42al4": "bafireiel5ss7i32dxtg3ooe55zcgkz4dve76kzh22n7443ad2oc37pbxui"
+      },
+      "packet_index": 0,
+      "total_packets": 1,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaves[0].AdditionalData": 0,
+        "Leaves[0].stored_proofs": 0,
+        "Leaves[10].AdditionalData": 0,
+        "Leaves[10].stored_proofs": 0,
+        "Leaves[1].AdditionalData": 0,
+        "Leaves[1].stored_proofs": 0,
+        "Leaves[2].AdditionalData": 0,
+        "Leaves[2].stored_proofs": 0,
+        "Leaves[3].AdditionalData": 0,
+        "Leaves[3].stored_proofs": 0,
+        "Leaves[4].AdditionalData": 0,
+        "Leaves[4].stored_proofs": 0,
+        "Leaves[5].AdditionalData": 0,
+        "Leaves[5].stored_proofs": 0,
+        "Leaves[6].AdditionalData": 0,
+        "Leaves[6].stored_proofs": 0,
+        "Leaves[7].AdditionalData": 0,
+        "Leaves[7].stored_proofs": 0,
+        "Leaves[8].AdditionalData": 0,
+        "Leaves[8].stored_proofs": 0,
+        "Leaves[9].AdditionalData": 0,
+        "Leaves[9].stored_proofs": 0,
+        "Relationships": 11
+      },
+      "multi_entry_maps": [
+        "Relationships"
+      ],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/000",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq"
+      ],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/001",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 1,
+      "leaf_hashes": [
+        "bafireibeelbdrhsanbklxlizamtbzlrtk5zd5545axr3gazxekpnkf6oie"
+      ],
+      "parent_hash": "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+      "packet_index": 1,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/002",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 2,
+      "leaf_hashes": [
+        "bafireiccls7j6zti5rnrnc22sbbxu3yvlzglhb4fzzjfsce65spnisia5a"
+      ],
+      "parent_hash": "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+      "packet_index": 2,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/003",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 3,
+      "leaf_hashes": [
+        "bafireichm6b4fr446oesn7f3h4x4bdinug4ni5ybn35jyekguwxyorzjgu"
+      ],
+      "parent_hash": "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+      "packet_index": 3,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/004",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 4,
+      "leaf_hashes": [
+        "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve"
+      ],
+      "parent_hash": "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+      "packet_index": 4,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/005",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 5,
+      "leaf_hashes": [
+        "bafireiexvnsqxpzcwdtsfcjz32aybnghg6yaiglf2znfdvvo7fyazvbala"
+      ],
+      "parent_hash": "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+      "packet_index": 5,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/006",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 6,
+      "leaf_hashes": [
+        "bafireiapcpjxy3y4a3rbzbfzz5h3msna4lwlo3wtrd7wz5to6f6szawgfm"
+      ],
+      "parent_hash": "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve",
+      "packet_index": 6,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/007",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 7,
+      "leaf_hashes": [
+        "bafireies24kuiuasdujtruusoedrzh4icwms5uuu3m6uxqlrznpwgukd6u"
+      ],
+      "parent_hash": "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve",
+      "packet_index": 7,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/008",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 8,
+      "leaf_hashes": [
+        "bafireihfiyr42nvc6iqpqi6hm6evdcolzi3pmeorzyczzadrdhwq5fje6a"
+      ],
+      "parent_hash": "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve",
+      "packet_index": 8,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/009",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 9,
+      "leaf_hashes": [
+        "bafireihkxvfjdup6cytuabhgr7aistdcje7ubbq6tebrpwmdbg6g67juku"
+      ],
+      "parent_hash": "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve",
+      "packet_index": 9,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/mixed_sizes/010",
+      "case": "mixed_sizes",
+      "kind": "transmission",
+      "index": 10,
+      "leaf_hashes": [
+        "bafireidyuuaehl2rzfxs5ptlrzm77hbxdau4scwyeh6elq3pjdyb3kzd2i"
+      ],
+      "parent_hash": "bafireiexvnsqxpzcwdtsfcjz32aybnghg6yaiglf2znfdvvo7fyazvbala",
+      "packet_index": 10,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/batched/default/mixed_sizes/000",
+      "case": "mixed_sizes",
+      "kind": "batched-default",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+        "bafireibeelbdrhsanbklxlizamtbzlrtk5zd5545axr3gazxekpnkf6oie",
+        "bafireiccls7j6zti5rnrnc22sbbxu3yvlzglhb4fzzjfsce65spnisia5a",
+        "bafireichm6b4fr446oesn7f3h4x4bdinug4ni5ybn35jyekguwxyorzjgu",
+        "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve",
+        "bafireiexvnsqxpzcwdtsfcjz32aybnghg6yaiglf2znfdvvo7fyazvbala",
+        "bafireiapcpjxy3y4a3rbzbfzz5h3msna4lwlo3wtrd7wz5to6f6szawgfm",
+        "bafireies24kuiuasdujtruusoedrzh4icwms5uuu3m6uxqlrznpwgukd6u",
+        "bafireihfiyr42nvc6iqpqi6hm6evdcolzi3pmeorzyczzadrdhwq5fje6a",
+        "bafireihkxvfjdup6cytuabhgr7aistdcje7ubbq6tebrpwmdbg6g67juku",
+        "bafireidyuuaehl2rzfxs5ptlrzm77hbxdau4scwyeh6elq3pjdyb3kzd2i"
+      ],
+      "relationships": {
+        "bafireiapcpjxy3y4a3rbzbfzz5h3msna4lwlo3wtrd7wz5to6f6szawgfm": "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve",
+        "bafireibeelbdrhsanbklxlizamtbzlrtk5zd5545axr3gazxekpnkf6oie": "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+        "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq": "",
+        "bafireiccls7j6zti5rnrnc22sbbxu3yvlzglhb4fzzjfsce65spnisia5a": "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+        "bafireichm6b4fr446oesn7f3h4x4bdinug4ni5ybn35jyekguwxyorzjgu": "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+        "bafireidyuuaehl2rzfxs5ptlrzm77hbxdau4scwyeh6elq3pjdyb3kzd2i": "bafireiexvnsqxpzcwdtsfcjz32aybnghg6yaiglf2znfdvvo7fyazvbala",
+        "bafireies24kuiuasdujtruusoedrzh4icwms5uuu3m6uxqlrznpwgukd6u": "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve",
+        "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve": "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+        "bafireiexvnsqxpzcwdtsfcjz32aybnghg6yaiglf2znfdvvo7fyazvbala": "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+        "bafireihfiyr42nvc6iqpqi6hm6evdcolzi3pmeorzyczzadrdhwq5fje6a": "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve",
+        "bafireihkxvfjdup6cytuabhgr7aistdcje7ubbq6tebrpwmdbg6g67juku": "bafireiettb7sv57aj3emp5xpkmkqqor7sm6ctcz7lga24jhowxtfkb2nve"
+      },
+      "packet_index": 0,
+      "total_packets": 1,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaves[0].AdditionalData": 0,
+        "Leaves[0].stored_proofs": 0,
+        "Leaves[10].AdditionalData": 0,
+        "Leaves[10].stored_proofs": 0,
+        "Leaves[1].AdditionalData": 0,
+        "Leaves[1].stored_proofs": 0,
+        "Leaves[2].AdditionalData": 0,
+        "Leaves[2].stored_proofs": 0,
+        "Leaves[3].AdditionalData": 0,
+        "Leaves[3].stored_proofs": 0,
+        "Leaves[4].AdditionalData": 0,
+        "Leaves[4].stored_proofs": 0,
+        "Leaves[5].AdditionalData": 0,
+        "Leaves[5].stored_proofs": 2,
+        "Leaves[6].AdditionalData": 0,
+        "Leaves[6].stored_proofs": 0,
+        "Leaves[7].AdditionalData": 0,
+        "Leaves[7].stored_proofs": 0,
+        "Leaves[8].AdditionalData": 0,
+        "Leaves[8].stored_proofs": 0,
+        "Leaves[9].AdditionalData": 0,
+        "Leaves[9].stored_proofs": 0,
+        "Relationships": 11
+      },
+      "multi_entry_maps": [
+        "Leaves[5].stored_proofs",
+        "Relationships"
+      ],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/partial/flat_directory_file1_file3.dag",
+      "case": "flat_directory_partial_file1_file3",
+      "kind": "partial-dag",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireibfx766siv7teknmhfsynp6h3zyf7tk2f5cdywfyj6n2lczmutmn4",
+        "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+        "bafireihlk4ewaethu42vq7hltrkwm5adqepmdttedi72nal4ckbgwhi6ni"
+      ],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leafs": 3,
+        "root.stored_proofs": 2
+      },
+      "multi_entry_maps": [
+        "Leafs",
+        "root.stored_proofs"
+      ],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/flat_directory_partial_file1_file3/000",
+      "case": "flat_directory_partial_file1_file3",
+      "kind": "transmission",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u"
+      ],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 2,
+        "proofs": 0
+      },
+      "multi_entry_maps": [
+        "Leaf.stored_proofs"
+      ],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/flat_directory_partial_file1_file3/001",
+      "case": "flat_directory_partial_file1_file3",
+      "kind": "transmission",
+      "index": 1,
+      "leaf_hashes": [
+        "bafireibfx766siv7teknmhfsynp6h3zyf7tk2f5cdywfyj6n2lczmutmn4"
+      ],
+      "parent_hash": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+      "packet_index": 1,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/transmission/flat_directory_partial_file1_file3/002",
+      "case": "flat_directory_partial_file1_file3",
+      "kind": "transmission",
+      "index": 2,
+      "leaf_hashes": [
+        "bafireihlk4ewaethu42vq7hltrkwm5adqepmdttedi72nal4ckbgwhi6ni"
+      ],
+      "parent_hash": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+      "packet_index": 2,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/batched/default/flat_directory_partial_file1_file3/000",
+      "case": "flat_directory_partial_file1_file3",
+      "kind": "batched-default",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+        "bafireibfx766siv7teknmhfsynp6h3zyf7tk2f5cdywfyj6n2lczmutmn4",
+        "bafireihlk4ewaethu42vq7hltrkwm5adqepmdttedi72nal4ckbgwhi6ni"
+      ],
+      "relationships": {
+        "bafireibfx766siv7teknmhfsynp6h3zyf7tk2f5cdywfyj6n2lczmutmn4": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
+        "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u": "",
+        "bafireihlk4ewaethu42vq7hltrkwm5adqepmdttedi72nal4ckbgwhi6ni": "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u"
+      },
+      "packet_index": 0,
+      "total_packets": 1,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaves[0].AdditionalData": 0,
+        "Leaves[0].stored_proofs": 2,
+        "Leaves[1].AdditionalData": 0,
+        "Leaves[1].stored_proofs": 0,
+        "Leaves[2].AdditionalData": 0,
+        "Leaves[2].stored_proofs": 0,
+        "Relationships": 3
+      },
+      "multi_entry_maps": [
+        "Leaves[0].stored_proofs",
+        "Relationships"
+      ],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/batched/size-1/single_small_file/000",
+      "case": "single_small_file",
+      "kind": "batched-size-1",
+      "index": 0,
+      "leaf_hashes": [
+        "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe"
+      ],
+      "relationships": {
+        "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe": ""
+      },
+      "packet_index": 0,
+      "total_packets": 2,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaves[0].AdditionalData": 0,
+        "Leaves[0].stored_proofs": 0,
+        "Relationships": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/batched/size-1/single_small_file/001",
+      "case": "single_small_file",
+      "kind": "batched-size-1",
+      "index": 1,
+      "leaf_hashes": [
+        "bafireihbiqi52zqwzotl5inpq2lmhduvurg7x2jmcejht2kedqijyorari"
+      ],
+      "relationships": {
+        "bafireihbiqi52zqwzotl5inpq2lmhduvurg7x2jmcejht2kedqijyorari": "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe"
+      },
+      "packet_index": 1,
+      "total_packets": 2,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaves[0].AdditionalData": 0,
+        "Leaves[0].stored_proofs": 0,
+        "Relationships": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": false
+    },
+    {
+      "base_path": "packets/batched/compat/legacy-no-counters",
+      "case": "single_small_file",
+      "kind": "batched-legacy-probe",
+      "index": 1,
+      "leaf_hashes": [
+        "bafireihbiqi52zqwzotl5inpq2lmhduvurg7x2jmcejht2kedqijyorari"
+      ],
+      "relationships": {
+        "bafireihbiqi52zqwzotl5inpq2lmhduvurg7x2jmcejht2kedqijyorari": "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe"
+      },
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaves[0].AdditionalData": 0,
+        "Leaves[0].stored_proofs": 0,
+        "Relationships": 1
+      },
+      "multi_entry_maps": [],
+      "synthetic": true,
+      "legacy_counters": true
+    },
+    {
+      "base_path": "packets/probes/transmission-nil",
+      "case": "transmission-nil",
+      "kind": "probe",
+      "index": 0,
+      "leaf_hashes": [
+        "probe"
+      ],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": true
+    },
+    {
+      "base_path": "packets/probes/transmission-empty-content",
+      "case": "transmission-empty-content",
+      "kind": "probe",
+      "index": 0,
+      "leaf_hashes": [
+        "probe"
+      ],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Leaf.AdditionalData": 0,
+        "Leaf.stored_proofs": 0,
+        "proofs": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": true
+    },
+    {
+      "base_path": "packets/probes/batched-empty",
+      "case": "batched-empty",
+      "kind": "probe",
+      "index": 0,
+      "leaf_hashes": [],
+      "packet_index": 0,
+      "total_packets": 0,
+      "json_compare": "bytes",
+      "cbor_compare": "decoded",
+      "map_cardinalities": {
+        "Relationships": 0
+      },
+      "multi_entry_maps": [],
+      "synthetic": true
+    }
+  ]
+}

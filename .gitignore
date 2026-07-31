@@ -1,0 +1,37 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Keep Cargo.lock committed for supply-chain reviewability. This is a library
+# crate, where the older convention is to omit it; reviewable pinned versions
+# are worth more than that convention.
+# Do NOT add Cargo.lock here.
+
+# Stray native artefacts. The crate builds a plain rlib under /target/; there is
+# no WASM or C-ABI adapter, and none is planned.
+*.a
+*.so
+*.dylib
+*.dll
+
+# Go tool binaries (`go build` output; named after their module dir). The
+# generated vectors under tests/vectors/ ARE committed - they are the oracle.
+/tools/gowirevectors/gowirevectors
+/tools/gowirevectors/gowirevectors.exe
+/tools/gobench/gobench
+/tools/gobench/gobench.exe
+
+# Benchmark corpus, if generated in-tree rather than under a temp dir.
+/bench-corpus/
+
+# Local-only working notes, kept out of the published repository.
+/.local/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local index caches
+.chunks/
