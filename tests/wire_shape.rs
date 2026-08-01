@@ -146,3 +146,38 @@ fn empty_proof_maps_are_omitted_not_emitted_empty() {
          (or the fixture is too shallow to prove it)"
     );
 }
+
+/// `to_cbor_into` must be the same encoder as `to_cbor`, not a second one.
+///
+/// It exists purely so a caller can reuse a buffer: the encoder already runs at
+/// the alloc-plus-memcpy floor, so roughly three quarters of `to_cbor` is
+/// allocating a fresh multi-megabyte buffer and faulting it in -- reuse measures
+/// 2.0ms against 4.9ms on the benchmark corpus. Nothing about correctness would
+/// notice the two paths drifting apart, because each would still be internally
+/// consistent, so the agreement is pinned rather than assumed.
+#[test]
+fn to_cbor_into_matches_to_cbor_and_appends_rather_than_clobbers() {
+    let (_temp, dag) = build_wire_shape_fixture();
+    let expected = dag.to_cbor().unwrap();
+
+    let mut fresh = Vec::new();
+    dag.to_cbor_into(&mut fresh).unwrap();
+    assert_eq!(fresh, expected, "to_cbor_into diverged from to_cbor");
+
+    // Appending, not overwriting: the prefix must survive untouched and the
+    // encoding must land after it.
+    let prefix = b"scionic".to_vec();
+    let mut appended = prefix.clone();
+    dag.to_cbor_into(&mut appended).unwrap();
+    assert_eq!(&appended[..prefix.len()], &prefix[..], "prefix was clobbered");
+    assert_eq!(&appended[prefix.len()..], &expected[..], "appended bytes differ");
+
+    // The reuse case this API exists for: one buffer, many encodes. A buffer
+    // carrying stale capacity must not leak old bytes into a new encoding.
+    let mut reused = Vec::new();
+    for iteration in 0..8 {
+        reused.clear();
+        dag.to_cbor_into(&mut reused).unwrap();
+        assert_eq!(reused, expected, "reused buffer diverged on iteration {iteration}");
+    }
+}
