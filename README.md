@@ -137,27 +137,35 @@ no map iteration order can reach a CID.
 
 ## Performance
 
-Measured against the Go reference on the same generated corpus at the same chunk
-size. Both harnesses print their DAG root and the roots match
-(`bafireifuqx7…lrqrmxi`, 141 leaves) — comparing timings between implementations
-that built *different* DAGs would be meaningless, so the harness makes that
-impossible to overlook. Both also report identical encoded sizes
-(`cbor_bytes=19188357`, `json_bytes=25591601`).
+Measured against the Go reference and the Swift port on the same generated corpus
+at the same chunk size. All three harnesses print their DAG root and the roots
+match (`bafireifuqx7…lrqrmxi`, 141 leaves) — comparing timings between
+implementations that built *different* DAGs would be meaningless, so every
+harness makes that impossible to overlook. All three also report an identical
+`cbor_bytes=19188357`, and that still holds at 1 MiB and 2 MiB chunks, where the
+DAG itself changes shape (93 and 85 leaves). CBOR is the wire format, so this is
+the agreement that matters.
 
-18.25 MiB corpus, 256 KiB chunks, min of 15 samples, Windows / 24 CPUs / Go 1.24.4,
-both harnesses run back to back in one session. Lower is better.
+`json_bytes` is the one header field that does **not** agree — Rust and Go both
+report 25591601, Swift 25595491. That is a serialization-format difference, not a
+data difference; see [JSON is not cross-port compatible](#json-is-not-cross-port-compatible)
+below.
 
-| Workload | Rust | Go | Rust vs Go |
-|---|---:|---:|---|
-| `verify` | 4.91 ms | 10.71 ms | **2.18× faster** |
-| `from_json` | 47.24 ms | 69.41 ms | **1.47× faster** |
-| `create_parallel` | 3.31 ms | 4.62 ms | **1.39× faster** |
-| `to_json` | 71.02 ms | 78.15 ms | **1.10× faster** |
-| `from_cbor` | 3.07 ms | 3.09 ms | parity |
-| `leaf_sequence` | 2.62 ms | 2.62 ms | parity |
-| `create_sequential` | 17.47 ms | 15.83 ms | 1.10× slower |
-| `batched_sequence` | 0.102 ms | 0.087 ms | 1.17× slower |
-| `to_cbor` | 5.04 ms | 3.30 ms | 1.53× slower |
+18.25 MiB corpus, 256 KiB chunks, min of 15 samples, Windows / 24 CPUs /
+Go 1.24.4 / Swift 6.3.1, all three harnesses run back to back in one session.
+Lower is better.
+
+| Workload | Rust | Go | Swift | Rust vs Go |
+|---|---:|---:|---:|---|
+| `verify` | 5.12 ms | 11.04 ms | 62.06 ms | **2.16× faster** |
+| `from_json` | 48.49 ms | 69.66 ms | 775.31 ms | **1.44× faster** |
+| `create_parallel` | 3.53 ms | 4.89 ms | 19.33 ms | **1.39× faster** |
+| `to_json` | 70.87 ms | 86.86 ms | 76.51 ms | **1.23× faster** |
+| `from_cbor` | 3.02 ms | 3.12 ms | 3.57 ms | parity |
+| `leaf_sequence` | 2.55 ms | 2.80 ms | 15.26 ms | parity |
+| `batched_sequence` | 0.091 ms | 0.090 ms | 0.338 ms | parity |
+| `create_sequential` | 18.59 ms | 16.46 ms | 94.43 ms | 1.13× slower |
+| `to_cbor` | 4.79 ms | 3.67 ms | 22.66 ms | 1.31× slower |
 
 Every row is a fresh recording on one machine, so the numbers shift slightly
 against the ones this table carried previously. `to_cbor` moved for a real
@@ -175,11 +183,20 @@ parent's — 8.3× the output size in allocation, and 69% of Go's profile inside
 the same single-pass shape this crate and the Swift port have always used. The
 output is byte-identical, and not merely by assertion: the shared spec-vector
 corpus regenerates bit-for-bit in all three repositories. The row went from
-roughly 20 ms to 3.30 ms, which is why Rust no longer leads it.
+roughly 20 ms to 3.67 ms, which is why Rust no longer leads it.
 
-`from_cbor` and `leaf_sequence` are reported as parity because the spread between
-repeated runs of either implementation is wider than the difference between
-them.
+What remains in this crate's `to_cbor` row is not encoder work at all — it is the
+allocator handing back a fresh ~19 MB `Vec`, which is roughly three quarters of
+the measurement. Callers encoding many DAGs can skip that with `to_cbor_into`,
+which appends into a buffer they own and reuse — 2.00 ms against 4.87 ms in a
+dedicated recording, so the reuse figures are not directly comparable to the
+table above.
+Go has the same escape hatch in `AppendCBOR`. Both delegate to the one encoder,
+so neither can drift from `to_cbor`/`ToCBOR`.
+
+`from_cbor`, `leaf_sequence` and `batched_sequence` are reported as parity
+because the spread between repeated runs of either implementation is wider than
+the difference between them.
 
 Leaf payloads and leaf names are shared through `Arc` rather than deep-copied, so
 cloning a leaf — which transmission, batching and every store read do constantly
@@ -189,26 +206,80 @@ identity CBOR, so mutating either in place would invalidate the leaf's identity,
 and `Arc` hands out no `&mut` while a second owner exists. The invariant is
 enforced by the type system rather than by convention.
 
-Rust trails on three rows. `to_cbor` is covered above. `batched_sequence` is the
-smallest workload in the table — under a tenth of a millisecond, where fixed
-per-call overhead dominates — and it recorded as parity with Rust marginally
-ahead in the previous session and 1.17× behind in this one, so treat that ranking
-as noise rather than a result.
+### Where the Swift port sits
 
-`create_sequential` is the substantive one, and the cause is allocation count
-rather than anything algorithmic: it allocates one retained buffer per chunk, and
-the gap tracks that count rather than the byte total. Same corpus, same bytes,
-same hashing — only the chunk size changes:
+Swift builds a bit-identical DAG and a bit-identical CBOR envelope, so nothing
+below is a correctness gap — but it is materially slower on every CPU-bound path,
+by roughly 5–6× (`create_sequential`, `create_parallel`, `to_cbor`,
+`leaf_sequence`) and 12× on `verify`. The interesting part is where it is *not*
+slow: `from_cbor` (3.57 ms) and `to_json` (76.51 ms) land within noise of the
+other two.
 
-| Chunk size | Rust | Go | Rust vs Go |
-|---|---:|---:|---|
-| 256 KiB | 17.47 ms | 15.83 ms | 1.10× slower |
-| 1 MiB | 16.63 ms | 17.20 ms | **1.03× faster** |
-| 2 MiB (crate default) | 16.37 ms | 17.02 ms | **1.04× faster** |
+That split is the diagnostic. The paths where Swift keeps up are the ones it
+implements itself — its hand-written `CBORDecoder`. The paths where it collapses
+are the ones delegated to Foundation, and `from_json` is the extreme case at
+775 ms: 16× Rust, and 10× Swift's own `to_json` on the same document. A decoder
+being an order of magnitude slower than the matching encoder is not a property of
+the data, so the cost is in `JSONDecoder`, not in this port's design.
+
+One caveat on the absolute magnitudes: the Windows Swift 6.3.1 toolchain reports
+`Build config: +assertions`, so the shipped standard library carries internal
+assertions the Go and Rust toolchains do not. `-c release` disables assertions in
+*this* code, not in the stdlib it links against, so some unknown share of the
+5–12× gap is toolchain rather than port. The Swift column is honest about what
+this machine runs; it is not a claim about Swift on Apple platforms, where the
+toolchain is built without assertions.
+
+None of this is on the relay path — CBOR is what peers exchange, and Swift's CBOR
+decode is competitive. It matters for tooling that round-trips DAGs as JSON.
+
+### JSON is not cross-port compatible
+
+Rust and Go emit byte-identical JSON. Swift does not, and the difference is not
+cosmetic — **a JSON document written by one side cannot be read by the other.**
+Every key differs in case, because Go derives JSON keys from its Go field names
+while Swift's `CodingKeys` are Swift-idiomatic:
+
+| | Rust / Go | Swift |
+|---|---|---|
+| Envelope keys | `Root`, `Leafs` | `root`, `leafs` |
+| Leaf keys | `Hash`, `ItemName`, `ContentHash`, … | `hash`, `itemName`, `contentHash`, … |
+| Key order | struct declaration order | alphabetical (`.sortedKeys`) |
+| Separator | `"Hash": …` | `"hash" : …` |
+| Empty collections | `[]`, `{}` | expanded across three lines |
+| Absent optionals | `null` | key omitted |
+| Solidus in base64 | `/` | `\/` |
+
+The size gap scales with leaf count (+3890 bytes at 141 leaves, +2461 at 93,
++2225 at 85 — about 26–28 bytes per leaf), which confirms it is per-leaf
+formatting rather than differing content.
+
+This was never caught because the cross-language vectors in
+`Scionic-MerkleTree-Swift/tools/govectors` are **CBOR-only** — they pin the wire
+format, which is the thing peers actually exchange, and JSON has no equivalent
+oracle. The CBOR path in Swift *does* use PascalCase, hard-coded to match Go, so
+the divergence is confined to the `Codable` path.
+
+### Where Rust trails Go
+
+Rust trails Go on two rows. `to_cbor` is covered above. `create_sequential` is
+the substantive one, and the cause is allocation count rather than anything
+algorithmic: it allocates one retained buffer per chunk, and the gap tracks that
+count rather than the byte total. Same corpus, same bytes, same hashing — only
+the chunk size changes:
+
+| Chunk size | Rust | Go | Swift | Rust vs Go |
+|---|---:|---:|---:|---|
+| 256 KiB | 18.59 ms | 16.46 ms | 94.43 ms | 1.13× slower |
+| 1 MiB | 17.32 ms | 17.23 ms | 98.94 ms | parity |
+| 2 MiB (crate default) | 17.91 ms | 18.38 ms | 102.21 ms | **1.03× faster** |
 
 So at this crate's own default chunk size Rust is slightly ahead, and the deficit
-only appears when a caller chooses small chunks. `create_parallel`, the path most
-callers use, is 1.25–1.44× *faster* at every size and builds an identical DAG.
+only appears when a caller chooses small chunks. Swift's cost is flat across the
+sweep, which is consistent with a constant per-byte penalty rather than the
+per-chunk one this table isolates. `create_parallel`, the path most callers use,
+is 1.32–1.55× *faster* than Go at every size (measured in a separate sweep) and
+builds an identical DAG.
 
 ## Versioning
 
@@ -231,11 +302,28 @@ cargo clippy --all-targets -- -D warnings
 114 tests cover layers 1–5, the committed Go wire vectors, and the shared
 spec-vector corpus under `spec/vectors`.
 
-`tools/gobench` and `tools/gowirevectors` are Go programs that regenerate the
-comparison vectors and benchmark against the reference. They resolve the Go
-library through a local `replace` directive and expect a checkout of
-[Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree)
-alongside this repository. Neither is needed to build or test the crate.
+`tools/gobench` and `tools/gowirevectors` are Go programs; `tools/swiftbench` is
+a SwiftPM package. They regenerate the comparison vectors and benchmark against
+the other two ports. Each resolves its library through a local path — a Go
+`replace` directive, a Swift `.package(path:)` — and expects checkouts of
+[Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) and
+[Scionic-MerkleTree-Swift](https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift)
+alongside this repository. None of them is needed to build or test the crate.
+
+Only the Rust harness generates the shared corpus; the Go and Swift harnesses
+only ever read it, so the three cannot drift apart by generating subtly different
+bytes. Run them back to back — timings recorded in different sessions are not
+comparable:
+
+```bash
+cargo run --release --example bench -- bench-corpus 262144 15
+(cd tools/gobench   && go run . ../../bench-corpus 262144 15)
+(cd tools/swiftbench && swift run -c release swiftbench ../../bench-corpus 262144 15)
+```
+
+Each prints its DAG root and encoded sizes first. Compare those before comparing
+any timing: a port that looks fast because it built a smaller DAG is the failure
+mode that ordering guards against.
 
 ## Related repositories
 
