@@ -125,6 +125,12 @@ make that true:
 
 `stored_proofs` and `proofs` are omitted entirely when empty.
 
+Both rules are implemented by all three ports, so encoding is deterministic in
+all three: the same DAG encodes to the same bytes on every run, in every
+language. That is what makes the envelope safe to digest, cache by, dedupe on and
+compare byte for byte — none of which is true of a CBOR map emitted in whatever
+order a hash table happened to iterate. No port is a special case here.
+
 CID computation is a separate contract and none of the above touches it: the
 hashed preimage flattens `AdditionalData` into a sorted array before hashing, so
 no map iteration order can reach a CID.
@@ -143,22 +149,37 @@ both harnesses run back to back in one session. Lower is better.
 
 | Workload | Rust | Go | Rust vs Go |
 |---|---:|---:|---|
-| `to_cbor` | 3.54 ms | 21.90 ms | **6.19× faster** |
-| `verify` | 4.67 ms | 10.35 ms | **2.22× faster** |
-| `from_json` | 55.03 ms | 79.14 ms | **1.44× faster** |
-| `to_json` | 67.31 ms | 85.23 ms | **1.27× faster** |
-| `create_parallel` | 3.23 ms | 4.07 ms | **1.26× faster** |
-| `leaf_sequence` | 2.47 ms | 2.99 ms | **1.21× faster** |
-| `batched_sequence` | 0.099 ms | 0.104 ms | parity |
-| `from_cbor` | 2.56 ms | 2.53 ms | parity |
-| `create_sequential` | 17.26 ms | 15.12 ms | 1.14× slower |
+| `verify` | 4.91 ms | 10.71 ms | **2.18× faster** |
+| `from_json` | 47.24 ms | 69.41 ms | **1.47× faster** |
+| `create_parallel` | 3.31 ms | 4.62 ms | **1.39× faster** |
+| `to_json` | 71.02 ms | 78.15 ms | **1.10× faster** |
+| `from_cbor` | 3.07 ms | 3.09 ms | parity |
+| `leaf_sequence` | 2.62 ms | 2.62 ms | parity |
+| `create_sequential` | 17.47 ms | 15.83 ms | 1.10× slower |
+| `batched_sequence` | 0.102 ms | 0.087 ms | 1.17× slower |
+| `to_cbor` | 5.04 ms | 3.30 ms | 1.53× slower |
 
-Read the `to_cbor` row as a snapshot of the current reference build rather than a
-durable six-fold gap: Go's encoder presently routes through a hand-written
-deterministic marshaler instead of its CBOR library's optimized path.
-`batched_sequence` and `from_cbor` are reported as parity because the spread
-between repeated runs of either implementation is wider than the difference
-between them.
+Every row is a fresh recording on one machine, so the numbers shift slightly
+against the ones this table carried previously. `to_cbor` moved for a real
+reason, described next.
+
+**Determinism is not what the `to_cbor` row measures, and never was.** All three
+ports encode deterministically, by the two rules above, and in none of them does
+that cost anything visible: ordering a few hundred short keys per DAG does not
+show up in any profile. What this row used to measure was Go's *delivery
+mechanism* for determinism, not determinism itself. Go reached it through
+`cbor.Marshaler`, whose `MarshalCBOR() ([]byte, error)` signature forces every
+nesting level to allocate its own buffer and copy its finished bytes into its
+parent's — 8.3× the output size in allocation, and 69% of Go's profile inside
+`memclrNoHeapPointers` and `memmove`. Go now appends into one pre-sized buffer,
+the same single-pass shape this crate and the Swift port have always used. The
+output is byte-identical, and not merely by assertion: the shared spec-vector
+corpus regenerates bit-for-bit in all three repositories. The row went from
+roughly 20 ms to 3.30 ms, which is why Rust no longer leads it.
+
+`from_cbor` and `leaf_sequence` are reported as parity because the spread between
+repeated runs of either implementation is wider than the difference between
+them.
 
 Leaf payloads and leaf names are shared through `Arc` rather than deep-copied, so
 cloning a leaf — which transmission, batching and every store read do constantly
@@ -168,20 +189,26 @@ identity CBOR, so mutating either in place would invalidate the leaf's identity,
 and `Arc` hands out no `&mut` while a second owner exists. The invariant is
 enforced by the type system rather than by convention.
 
-`create_sequential` is the one workload still behind, and the cause is allocation
-count rather than anything algorithmic: it allocates one retained buffer per
-chunk, and the gap tracks that count rather than the byte total. Same corpus,
-same bytes, same hashing — only the chunk size changes:
+Rust trails on three rows. `to_cbor` is covered above. `batched_sequence` is the
+smallest workload in the table — under a tenth of a millisecond, where fixed
+per-call overhead dominates — and it recorded as parity with Rust marginally
+ahead in the previous session and 1.17× behind in this one, so treat that ranking
+as noise rather than a result.
+
+`create_sequential` is the substantive one, and the cause is allocation count
+rather than anything algorithmic: it allocates one retained buffer per chunk, and
+the gap tracks that count rather than the byte total. Same corpus, same bytes,
+same hashing — only the chunk size changes:
 
 | Chunk size | Rust | Go | Rust vs Go |
 |---|---:|---:|---|
-| 256 KiB | 17.26 ms | 15.12 ms | 1.14× slower |
-| 1 MiB | 17.23 ms | 16.21 ms | 1.06× slower |
-| 2 MiB (crate default) | 15.92 ms | 16.08 ms | **1.01× faster** |
+| 256 KiB | 17.47 ms | 15.83 ms | 1.10× slower |
+| 1 MiB | 16.63 ms | 17.20 ms | **1.03× faster** |
+| 2 MiB (crate default) | 16.37 ms | 17.02 ms | **1.04× faster** |
 
-So at this crate's own default chunk size the two are level, and the deficit only
-appears when a caller chooses small chunks. `create_parallel`, the path most
-callers use, is 1.26× *faster* at every size and builds an identical DAG.
+So at this crate's own default chunk size Rust is slightly ahead, and the deficit
+only appears when a caller chooses small chunks. `create_parallel`, the path most
+callers use, is 1.25–1.44× *faster* at every size and builds an identical DAG.
 
 ## Versioning
 
