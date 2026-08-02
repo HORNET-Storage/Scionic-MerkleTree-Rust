@@ -3111,7 +3111,9 @@ mod tests {
                 .map(|(_, value)| value),
             Some(CborValue::Null)
         ));
-        let CborValue::Map(wire) = crate::serialization::leaf_wire_value(&leaf) else {
+        let CborValue::Map(wire) =
+            crate::serialization::leaf_wire_value(&leaf, crate::encoding::KeyOrder::Cbor)
+        else {
             panic!("wire leaf must be a map");
         };
         assert!(matches!(

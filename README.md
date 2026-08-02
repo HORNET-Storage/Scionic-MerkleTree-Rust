@@ -113,27 +113,39 @@ downloading — or being able to forge — the rest.
 
 ## Wire compatibility
 
-The serialized envelope is byte-identical across Go, Swift and Rust. Two rules
-make that true:
+The serialized envelope is byte-identical across Go, Swift and Rust — in **both**
+CBOR and JSON. Three rules make that true:
 
 - **Struct fields ride in declaration order.** That is the shape deployed peers
   produce and expect.
-- **The five genuinely dynamic maps are key-ordered** — `Leafs`,
-  `AdditionalData`, `stored_proofs`, `proofs` and `Relationships` — sorted
-  length-first, then bytewise over the UTF-8 key, which is RFC 8949's rule for
-  text keys.
+- **Exactly five fields are genuinely dynamic maps**, and only those are
+  key-sorted: `Leafs`, `AdditionalData`, `stored_proofs`, `proofs` and
+  `Relationships`. Everything else is struct-shaped and must not sort.
+- **Each format sorts those five by its own comparator**, because the reference
+  implementation reaches the two formats through different libraries:
+
+| Format | Rule | `m`, `zz-probe`, `aaa-probe` sort to |
+|---|---|---|
+| CBOR | RFC 8949 core-deterministic — length first, then bytewise | `m`, `zz-probe`, `aaa-probe` |
+| JSON | Go `encoding/json` — plain bytewise, no length term | `aaa-probe`, `m`, `zz-probe` |
+
+The two comparators agree on every pair of equal-length keys and disagree
+otherwise, which is exactly why the disagreement stayed invisible for four
+releases — see [The two formats sort map keys by different rules](#the-two-formats-sort-map-keys-by-different-rules).
 
 `stored_proofs` and `proofs` are omitted entirely when empty.
 
-Both rules are implemented by all three ports, so encoding is deterministic in
-all three: the same DAG encodes to the same bytes on every run, in every
-language. That is what makes the envelope safe to digest, cache by, dedupe on and
-compare byte for byte — none of which is true of a CBOR map emitted in whatever
-order a hash table happened to iterate. No port is a special case here.
+All three rules are implemented by all three ports, so encoding is deterministic
+everywhere: the same DAG encodes to the same bytes on every run, in every
+language, in either format. That is what makes the envelope safe to digest, cache
+by, dedupe on and compare byte for byte — none of which is true of a map emitted
+in whatever order a hash table happened to iterate. No port is a special case.
 
-CID computation is a separate contract and none of the above touches it: the
-hashed preimage flattens `AdditionalData` into a sorted array before hashing, so
-no map iteration order can reach a CID.
+CID computation is a **third** contract and none of the above touches it: the
+hashed preimage flattens `AdditionalData` into a sorted *array* before hashing, so
+no map iteration order can reach a CID. That third comparator is frozen into every
+CID ever minted and must never be unified with the two above, however alike they
+look.
 
 ## Performance
 
@@ -141,15 +153,23 @@ Measured against the Go reference and the Swift port on the same generated corpu
 at the same chunk size. All three harnesses print their DAG root and the roots
 match (`bafireifuqx7…lrqrmxi`, 141 leaves) — comparing timings between
 implementations that built *different* DAGs would be meaningless, so every
-harness makes that impossible to overlook. All three also report an identical
-`cbor_bytes=19188357`, and that still holds at 1 MiB and 2 MiB chunks, where the
-DAG itself changes shape (93 and 85 leaves). CBOR is the wire format, so this is
-the agreement that matters.
+harness makes that impossible to overlook.
 
-`json_bytes` is the one header field that does **not** agree — Rust and Go both
-report 25591601, Swift 25595491. That is a serialization-format difference, not a
-data difference; see [JSON is not cross-port compatible](#json-is-not-cross-port-compatible)
-below.
+All three also report an identical `cbor_bytes` **and** an identical `json_bytes`,
+and that holds across the chunk sweep, where the DAG itself changes shape:
+
+| Chunk | Leaves | `cbor_bytes` | `json_bytes` |
+|---|---:|---:|---:|
+| 256 KiB | 141 | 19188357 | 25591601 |
+| 1 MiB | 93 | 19170909 | 25565908 |
+| 2 MiB | 85 | 19168005 | 25561620 |
+
+The `json_bytes` agreement is new. It used to disagree — Swift reported 25595491
+at 256 KiB — and closing that gap is described in
+[JSON is now cross-port compatible](#json-is-now-cross-port-compatible) below.
+Equal sizes are *weak* evidence on their own, though, because reordering a map
+preserves byte length exactly; the byte-for-byte guarantee comes from the shared
+spec-vector corpus, not from this table.
 
 18.25 MiB corpus, 256 KiB chunks, min of 15 samples, Windows / 24 CPUs /
 Go 1.24.4 / Swift 6.3.1, all three harnesses run back to back in one session.
@@ -157,19 +177,19 @@ Lower is better.
 
 | Workload | Rust | Go | Swift | Rust vs Go |
 |---|---:|---:|---:|---|
-| `verify` | 5.12 ms | 11.04 ms | 62.06 ms | **2.16× faster** |
-| `from_json` | 48.49 ms | 69.66 ms | 775.31 ms | **1.44× faster** |
-| `create_parallel` | 3.53 ms | 4.89 ms | 19.33 ms | **1.39× faster** |
-| `to_json` | 70.87 ms | 86.86 ms | 76.51 ms | **1.23× faster** |
-| `from_cbor` | 3.02 ms | 3.12 ms | 3.57 ms | parity |
-| `leaf_sequence` | 2.55 ms | 2.80 ms | 15.26 ms | parity |
-| `batched_sequence` | 0.091 ms | 0.090 ms | 0.338 ms | parity |
-| `create_sequential` | 18.59 ms | 16.46 ms | 94.43 ms | 1.13× slower |
-| `to_cbor` | 4.79 ms | 3.67 ms | 22.66 ms | 1.31× slower |
+| `verify` | 5.27 ms | 11.09 ms | 65.42 ms | **2.10× faster** |
+| `from_json` | 47.08 ms | 71.80 ms | 60.36 ms | **1.53× faster** |
+| `create_parallel` | 3.57 ms | 4.89 ms | 18.54 ms | **1.37× faster** |
+| `to_json` | 69.19 ms | 81.85 ms | 88.35 ms | **1.18× faster** |
+| `from_cbor` | 3.22 ms | 3.33 ms | 3.18 ms | parity |
+| `leaf_sequence` | 2.63 ms | 2.81 ms | 14.99 ms | parity |
+| `batched_sequence` | 0.100 ms | 0.093 ms | 0.322 ms | parity |
+| `create_sequential` | 18.67 ms | 16.28 ms | 96.60 ms | 1.15× slower |
+| `to_cbor` | 5.14 ms | 3.46 ms | 22.70 ms | 1.49× slower |
 
 Every row is a fresh recording on one machine, so the numbers shift slightly
-against the ones this table carried previously. `to_cbor` moved for a real
-reason, described next.
+against the ones this table carried previously. Two things moved for real reasons:
+`to_cbor`, described next, and Swift's JSON pair, described further below.
 
 **Determinism is not what the `to_cbor` row measures, and never was.** All three
 ports encode deterministically, by the two rules above, and in none of them does
@@ -208,39 +228,50 @@ enforced by the type system rather than by convention.
 
 ### Where the Swift port sits
 
-Swift builds a bit-identical DAG and a bit-identical CBOR envelope, so nothing
-below is a correctness gap — but it is materially slower on every CPU-bound path,
-by roughly 5–6× (`create_sequential`, `create_parallel`, `to_cbor`,
-`leaf_sequence`) and 12× on `verify`. The interesting part is where it is *not*
-slow: `from_cbor` (3.57 ms) and `to_json` (76.51 ms) land within noise of the
-other two.
+Swift builds a bit-identical DAG, a bit-identical CBOR envelope and — since the
+JSON rewrite described below — a bit-identical JSON document, so nothing here is a
+correctness gap. It is still materially slower on every CPU-bound path, by roughly
+4–6× (`create_sequential`, `create_parallel`, `to_cbor`, `leaf_sequence`) and 12×
+on `verify`. The interesting part is where it is *not* slow: `from_cbor`
+(3.18 ms) and `from_json` (60.36 ms) land at or ahead of the other two ports.
 
-That split is the diagnostic. The paths where Swift keeps up are the ones it
-implements itself — its hand-written `CBORDecoder`. The paths where it collapses
-are the ones delegated to Foundation, and `from_json` is the extreme case at
-775 ms: 16× Rust, and 10× Swift's own `to_json` on the same document. A decoder
-being an order of magnitude slower than the matching encoder is not a property of
-the data, so the cost is in `JSONDecoder`, not in this port's design.
+That split is the diagnostic, and it now points the same way in both formats. The
+paths where Swift keeps up are the ones it implements itself — its hand-written
+`CBORDecoder`, and now its hand-written wire-JSON writer and parser. The paths
+where it collapses are the ones still delegated to Foundation or `DispatchQueue`.
+
+`from_json` used to be the extreme case in the other direction, at **775 ms** —
+16× Rust, and 10× Swift's own `to_json` on the same document. A decoder being an
+order of magnitude slower than the matching encoder is not a property of the data,
+and it was not: it was `JSONDecoder`. Replacing it measures **60.36 ms**, a
+**12.8× improvement**, and it turns `from_json` into the row Swift does best on
+relative to the other two.
+
+The same rewrite cost about 15% on `to_json` (76.51 ms → 88.35 ms), which is the
+honest trade: Foundation's `JSONEncoder` was never slow, it was merely producing a
+document no other port could read. The rest of Swift's column moved by under 3%
+between the two recordings (`to_cbor` 22.66 → 22.70 ms, `leaf_sequence` 15.26 →
+14.99 ms), which is what makes the two JSON deltas readable as real rather than as
+session noise.
 
 One caveat on the absolute magnitudes: the Windows Swift 6.3.1 toolchain reports
 `Build config: +assertions`, so the shipped standard library carries internal
 assertions the Go and Rust toolchains do not. `-c release` disables assertions in
 *this* code, not in the stdlib it links against, so some unknown share of the
-5–12× gap is toolchain rather than port. The Swift column is honest about what
+4–12× gap is toolchain rather than port. The Swift column is honest about what
 this machine runs; it is not a claim about Swift on Apple platforms, where the
 toolchain is built without assertions.
 
-None of this is on the relay path — CBOR is what peers exchange, and Swift's CBOR
-decode is competitive. It matters for tooling that round-trips DAGs as JSON.
+### JSON is now cross-port compatible
 
-### JSON is not cross-port compatible
+It was not until recently, and the two failures behind that are worth recording,
+because they broke in opposite ways and hid behind the same blind spot.
 
-Rust and Go emit byte-identical JSON. Swift does not, and the difference is not
-cosmetic — **a JSON document written by one side cannot be read by the other.**
-Every key differs in case, because Go derives JSON keys from its Go field names
-while Swift's `CodingKeys` are Swift-idiomatic:
+**Swift disagreed on every key.** It reached JSON through `Codable` while reaching
+CBOR through a hand-built wire tree, so the two encodings did not even share field
+*names* — a JSON document written by one side could not be read by the other:
 
-| | Rust / Go | Swift |
+| | Rust / Go | Swift (before) |
 |---|---|---|
 | Envelope keys | `Root`, `Leafs` | `root`, `leafs` |
 | Leaf keys | `Hash`, `ItemName`, `ContentHash`, … | `hash`, `itemName`, `contentHash`, … |
@@ -250,15 +281,53 @@ while Swift's `CodingKeys` are Swift-idiomatic:
 | Absent optionals | `null` | key omitted |
 | Solidus in base64 | `/` | `\/` |
 
-The size gap scales with leaf count (+3890 bytes at 141 leaves, +2461 at 93,
-+2225 at 85 — about 26–28 bytes per leaf), which confirms it is per-leaf
-formatting rather than differing content.
+Swift now builds one wire tree and hands it to either a CBOR writer or a
+Go-compatible JSON writer, which is the shape this crate already had. The
+`Codable` conformances were **removed** rather than corrected: leaving them would
+have left a loaded gun, since any consumer reaching for `JSONEncoder` on those
+types would silently emit the old unreadable document again.
 
-This was never caught because the cross-language vectors in
-`Scionic-MerkleTree-Swift/tools/govectors` are **CBOR-only** — they pin the wire
-format, which is the thing peers actually exchange, and JSON has no equivalent
-oracle. The CBOR path in Swift *does* use PascalCase, hard-coded to match Go, so
-the divergence is confined to the `Codable` path.
+**This crate disagreed on key order**, which is the subtler half.
+
+#### The two formats sort map keys by different rules
+
+The two formats do not share a map-key comparator, and both rules are correct:
+
+| | Rule | `zz-probe` vs `aaa-probe` |
+|---|---|---|
+| CBOR | RFC 8949 core-deterministic — length first, then bytewise | `zz-probe`, `aaa-probe` |
+| JSON | Go `encoding/json` — plain bytewise, no length term | `aaa-probe`, `zz-probe` |
+
+Building one wire tree and handing it to either writer is exactly what keeps key
+*names* from drifting between the two formats — but it also meant JSON silently
+inherited CBOR's comparator. Both writers now sort under an explicit `KeyOrder`,
+applied only at the five genuinely dynamic maps. Struct-shaped maps stay in
+declaration order for both formats, as they must.
+
+Nothing in any of the three repositories could have caught this, and the reason is
+the part worth keeping. The two rules **agree on every pair of equal-length
+keys**, and four of those five maps are keyed by CIDs — and a CID is `b` plus
+base32 of exactly 36 bytes, so it is exactly 59 characters, always. That leaves
+`AdditionalData`, the one map keyed by arbitrary caller strings, and it was empty
+in every spec vector and in every leaf of the benchmark corpus. So no map that any
+cross-language check had ever compared held two keys of differing length. The
+matching `json_bytes` was not evidence against it either: reordering keys
+preserves byte length exactly.
+
+That blind spot is now closed at the source. The shared spec-vector corpus commits
+a `.json` sibling for every `.cbor` artifact, and carries a `json_metadata_probe`
+case whose root leaf holds three `AdditionalData` keys of lengths 1, 8 and 9 —
+chosen so the two rules produce completely reversed orders. All three ports
+assert, per artifact, that re-encoding reproduces the committed JSON bytes *and*
+that the value decoded from JSON re-encodes to the committed CBOR bytes. The
+generator refuses to emit a corpus in which the two orderings agree, so the probe
+cannot quietly lose its teeth.
+
+It has teeth today, and that was checked rather than assumed: reverting either
+port's JSON comparator to the CBOR one fails the corpus, and fails it *only* on
+`json_metadata_probe` — every pre-existing case still passes, which is the blind
+spot demonstrating itself. Swift's failure message is the whole lesson in one
+line: `("10902 bytes") is not equal to ("10902 bytes")`.
 
 ### Where Rust trails Go
 
@@ -270,16 +339,16 @@ the chunk size changes:
 
 | Chunk size | Rust | Go | Swift | Rust vs Go |
 |---|---:|---:|---:|---|
-| 256 KiB | 18.59 ms | 16.46 ms | 94.43 ms | 1.13× slower |
-| 1 MiB | 17.32 ms | 17.23 ms | 98.94 ms | parity |
-| 2 MiB (crate default) | 17.91 ms | 18.38 ms | 102.21 ms | **1.03× faster** |
+| 256 KiB | 18.67 ms | 16.28 ms | 96.60 ms | 1.15× slower |
+| 1 MiB | 17.39 ms | 17.84 ms | 103.05 ms | **1.03× faster** |
+| 2 MiB (crate default) | 17.87 ms | 18.56 ms | 101.48 ms | **1.04× faster** |
 
 So at this crate's own default chunk size Rust is slightly ahead, and the deficit
 only appears when a caller chooses small chunks. Swift's cost is flat across the
 sweep, which is consistent with a constant per-byte penalty rather than the
 per-chunk one this table isolates. `create_parallel`, the path most callers use,
-is 1.32–1.55× *faster* than Go at every size (measured in a separate sweep) and
-builds an identical DAG.
+is 1.27–1.37× *faster* than Go at every size in the same sweep, and builds an
+identical DAG.
 
 ## Versioning
 
@@ -299,8 +368,9 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-114 tests cover layers 1–5, the committed Go wire vectors, and the shared
-spec-vector corpus under `spec/vectors`.
+119 tests cover layers 1–5, the committed Go wire vectors, and the shared
+spec-vector corpus under `spec/vectors` — which pins both encodings, `.cbor` and
+`.json`, for every artifact it carries.
 
 `tools/gobench` and `tools/gowirevectors` are Go programs; `tools/swiftbench` is
 a SwiftPM package. They regenerate the comparison vectors and benchmark against

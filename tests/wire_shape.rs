@@ -13,7 +13,7 @@
 
 mod support;
 
-use scionic_merkletree::{create_dag_with_options, Dag};
+use scionic_merkletree::{create_dag_with_options, Dag, Metadata};
 use support::{create_fixture, options_4096, TempDir};
 
 const DEPLOYED_LEAF_KEY_ORDER: [&str; 12] = [
@@ -180,4 +180,69 @@ fn to_cbor_into_matches_to_cbor_and_appends_rather_than_clobbers() {
         dag.to_cbor_into(&mut reused).unwrap();
         assert_eq!(reused, expected, "reused buffer diverged on iteration {iteration}");
     }
+}
+
+/// The two wire formats sort dynamic map keys by DIFFERENT rules, and both are
+/// deliberate.
+///
+/// CBOR follows RFC 8949 core-deterministic ordering: length first, then
+/// bytewise. Go reaches JSON through `encoding/json`, which sorts map keys with
+/// a plain bytewise compare and no length term at all. Rust emitted the CBOR
+/// order into JSON until this test existed.
+///
+/// Nothing already in the repo could have caught that. The other four dynamic
+/// wire maps -- `Leafs`, `stored_proofs`, `proofs`, `Relationships` -- are keyed
+/// by CIDs, and a CID is always exactly 59 characters (`b` plus base32 of 36
+/// bytes), so the two rules agree on every key those maps can hold.
+/// `AdditionalData` is the one map keyed by arbitrary caller strings, it is
+/// empty in every spec vector and every benchmark-corpus leaf, and the
+/// cross-language oracle in `tools/govectors` compares CBOR only.
+///
+/// The two keys below are chosen so the rules disagree completely:
+///
+/// ```text
+/// CBOR (length-first): zz-probe (8), aaa-probe (9)
+/// JSON (bytewise):     aaa-probe,    zz-probe
+/// ```
+///
+/// They are also long enough that searching the raw CBOR for their encoded key
+/// bytes cannot collide with fixture file content.
+#[test]
+fn json_sorts_dynamic_map_keys_bytewise_while_cbor_sorts_length_first() {
+    let temp = TempDir::new("json-key-order").unwrap();
+    let path = create_fixture(temp.path(), "flat_directory").unwrap();
+    let options = options_4096().with_root_metadata(Metadata::from([
+        ("zz-probe".to_owned(), "1".to_owned()),
+        ("aaa-probe".to_owned(), "2".to_owned()),
+    ]));
+    let dag = create_dag_with_options(&path, &options).unwrap();
+
+    let json = String::from_utf8(dag.to_json().unwrap()).unwrap();
+    let json_zz = json
+        .find("\"zz-probe\":")
+        .expect("AdditionalData key zz-probe is not in the JSON at all");
+    let json_aaa = json
+        .find("\"aaa-probe\":")
+        .expect("AdditionalData key aaa-probe is not in the JSON at all");
+    assert!(
+        json_aaa < json_zz,
+        "JSON must sort dynamic map keys bytewise (aaa-probe before zz-probe), \
+         the way Go's encoding/json does"
+    );
+
+    let cbor = dag.to_cbor().unwrap();
+    let cbor_zz = find(&cbor, &cbor_text_key("zz-probe"))
+        .expect("AdditionalData key zz-probe is not in the CBOR at all");
+    let cbor_aaa = find(&cbor, &cbor_text_key("aaa-probe"))
+        .expect("AdditionalData key aaa-probe is not in the CBOR at all");
+    assert!(
+        cbor_zz < cbor_aaa,
+        "CBOR must sort dynamic map keys length-first (zz-probe before aaa-probe), \
+         the way RFC 8949 core-deterministic encoding does"
+    );
+
+    // Both orderings have to survive a round trip, or the fix would have traded
+    // a silent ordering bug for a loud decoding one.
+    assert_eq!(Dag::from_json(json.as_bytes()).unwrap(), dag);
+    assert_eq!(Dag::from_cbor(&cbor).unwrap(), dag);
 }

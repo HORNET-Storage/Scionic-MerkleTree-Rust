@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 #[cfg(test)]
 mod wire_map_ordering_tests {
-    use super::{cbor_encode, sorted_cbor_map, CborValue};
+    use super::{cbor_encode, sorted_wire_map, CborValue, KeyOrder};
 
-    /// Pins the wire map comparator across all three ports.
+    /// Pins the CBOR wire map comparator across all three ports.
     ///
     /// Every map key the spec-vector corpus exercises is a CID of uniform length,
     /// where length-first and plain-lexicographic ordering coincide -- so the
@@ -24,11 +24,14 @@ mod wire_map_ordering_tests {
 
     #[test]
     fn wire_maps_sort_length_first_then_bytewise() {
-        let encoded = cbor_encode(&sorted_cbor_map(vec![
-            ("zz".to_owned(), CborValue::Text("1".to_owned())),
-            ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
-            ("mm".to_owned(), CborValue::Text("2".to_owned())),
-        ]));
+        let encoded = cbor_encode(&sorted_wire_map(
+            vec![
+                ("zz".to_owned(), CborValue::Text("1".to_owned())),
+                ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
+                ("mm".to_owned(), CborValue::Text("2".to_owned())),
+            ],
+            KeyOrder::Cbor,
+        ));
         let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex, EXPECTED,
@@ -38,17 +41,58 @@ mod wire_map_ordering_tests {
 
     #[test]
     fn wire_map_ordering_is_independent_of_insertion_order() {
-        let forward = cbor_encode(&sorted_cbor_map(vec![
-            ("mm".to_owned(), CborValue::Text("2".to_owned())),
-            ("zz".to_owned(), CborValue::Text("1".to_owned())),
-            ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
-        ]));
-        let reverse = cbor_encode(&sorted_cbor_map(vec![
-            ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
-            ("zz".to_owned(), CborValue::Text("1".to_owned())),
-            ("mm".to_owned(), CborValue::Text("2".to_owned())),
-        ]));
+        let forward = cbor_encode(&sorted_wire_map(
+            vec![
+                ("mm".to_owned(), CborValue::Text("2".to_owned())),
+                ("zz".to_owned(), CborValue::Text("1".to_owned())),
+                ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
+            ],
+            KeyOrder::Cbor,
+        ));
+        let reverse = cbor_encode(&sorted_wire_map(
+            vec![
+                ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
+                ("zz".to_owned(), CborValue::Text("1".to_owned())),
+                ("mm".to_owned(), CborValue::Text("2".to_owned())),
+            ],
+            KeyOrder::Cbor,
+        ));
         assert_eq!(forward, reverse);
+    }
+
+    /// Pins the JSON comparator, which is deliberately NOT the CBOR one.
+    ///
+    /// Go reaches JSON through `encoding/json`, which sorts map keys with a
+    /// plain bytewise compare and no length term. On these same three keys the
+    /// two rules disagree completely:
+    ///
+    /// ```text
+    /// CBOR (length-first): mm, zz, aaaaaa
+    /// JSON (bytewise):     aaaaaa, mm, zz
+    /// ```
+    ///
+    /// Rust emitted the CBOR order into JSON until this was caught, and nothing
+    /// in the cross-port machinery could see it: tools/govectors compares CBOR
+    /// only, and the one wire map with mixed-length keys (AdditionalData) is
+    /// empty in every spec vector and every benchmark-corpus leaf.
+    #[test]
+    fn json_wire_maps_sort_bytewise_and_cbor_maps_do_not() {
+        fn keys(order: KeyOrder) -> Vec<String> {
+            let CborValue::Map(pairs) = sorted_wire_map(
+                vec![
+                    ("zz".to_owned(), CborValue::Text("1".to_owned())),
+                    ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
+                    ("mm".to_owned(), CborValue::Text("2".to_owned())),
+                ],
+                order,
+            ) else {
+                panic!("sorted_wire_map must produce a map");
+            };
+            pairs.into_iter().map(|(key, _)| key).collect()
+        }
+
+        assert_eq!(keys(KeyOrder::Cbor), ["mm", "zz", "aaaaaa"]);
+        assert_eq!(keys(KeyOrder::Json), ["aaaaaa", "mm", "zz"]);
     }
 }
 
@@ -193,7 +237,31 @@ pub fn cbor_encode(value: &CborValue) -> Vec<u8> {
     output
 }
 
-/// Builds a CBOR map whose keys are in RFC 8949 core-deterministic order.
+/// Which comparator a dynamic wire map's keys sort by.
+///
+/// CBOR and JSON do not agree on map key order, and never did. Both rules are
+/// deterministic; they are simply different rules, so the choice belongs to the
+/// output format rather than to the tree the formats share:
+///
+/// * `Cbor` is RFC 8949 core-deterministic ordering -- keys sort by their
+///   ENCODED bytes, which for text keys reduces exactly to length-first, then
+///   bytewise. See [`sorted_wire_map`] for why that reduction is exact.
+/// * `Json` is what Go's `encoding/json` does to a map: a plain bytewise
+///   compare over the key string, with no length term at all.
+///
+/// The two agree on every pair of equal-length keys, which is precisely why
+/// this divergence went unnoticed for so long. Four of the five dynamic wire
+/// maps are keyed by CIDs, which are fixed width. `AdditionalData` is the one
+/// keyed by arbitrary caller-chosen strings, and it is empty in every spec
+/// vector and every benchmark-corpus leaf -- so no map any cross-port check has
+/// ever compared held two keys of different lengths.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeyOrder {
+    Cbor,
+    Json,
+}
+
+/// Builds a wire map whose keys are ordered by `order`.
 ///
 /// This is deliberately applied PER MAP, at the few sites that build a genuinely
 /// dynamic map, rather than as a blanket pass over the whole encoded tree. The
@@ -218,7 +286,9 @@ pub fn cbor_encode(value: &CborValue) -> Vec<u8> {
 ///
 /// The five maps that DO need this -- `Leafs`, `AdditionalData`, `stored_proofs`,
 /// `proofs`, `Relationships` -- are exactly the five map fields on Go's wire
-/// structs, so the ports agree map for map.
+/// structs, so the ports agree map for map. That same five-way scoping is what
+/// makes [`KeyOrder`] safe to vary: only these maps see the JSON comparator, and
+/// the struct-shaped maps around them stay in declaration order for both formats.
 ///
 /// RFC 8949 orders map keys by their ENCODED bytes, bytewise. For text keys that
 /// reduces to length-first, then bytewise on the UTF-8 -- and it reduces exactly,
@@ -227,12 +297,19 @@ pub fn cbor_encode(value: &CborValue) -> Vec<u8> {
 /// 24..=255 bytes starts with `0x78`, and one of 256..=65535 starts with `0x79`.
 /// A shorter key therefore always has a smaller leading byte, so comparing
 /// `(len, bytes)` and comparing the encoded forms never disagree.
-pub(crate) fn sorted_cbor_map(mut pairs: Vec<(String, CborValue)>) -> CborValue {
-    pairs.sort_by(|(left, _), (right, _)| {
-        left.len()
-            .cmp(&right.len())
-            .then_with(|| left.as_bytes().cmp(right.as_bytes()))
-    });
+pub(crate) fn sorted_wire_map(mut pairs: Vec<(String, CborValue)>, order: KeyOrder) -> CborValue {
+    match order {
+        KeyOrder::Cbor => {
+            pairs.sort_by(|(left, _), (right, _)| {
+                left.len()
+                    .cmp(&right.len())
+                    .then_with(|| left.as_bytes().cmp(right.as_bytes()))
+            });
+        }
+        KeyOrder::Json => {
+            pairs.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+        }
+    }
     CborValue::Map(pairs)
 }
 

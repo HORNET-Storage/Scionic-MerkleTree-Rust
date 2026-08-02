@@ -19,7 +19,7 @@ that cannot be undone.
 |---|---|---|
 | Produced by | leaf identity encoding | `ToCBOR` / `ToJSON` |
 | Determines | the CID — permanent identity | bytes on the network and on disk |
-| Map ordering | none: maps are flattened to sorted arrays *before* hashing | keys sorted, length-first then bytewise |
+| Map ordering | none: maps are flattened to sorted arrays *before* hashing | keys sorted, by a comparator that depends on the output format (§2.2) |
 | Field ordering | declaration order | declaration order |
 | Changing it | rewrites every CID ever minted | changes the wire format for deployed peers |
 
@@ -28,10 +28,18 @@ reaches the hash, so **no map iteration order can ever reach a CID**. That is wh
 the wire-ordering rules below are free to exist: they operate strictly above the
 layer where identity is decided.
 
-The comparator used inside the preimage (plain lexicographic over the decoded
-string, applied to an array) and the comparator used for wire map keys
-(length-first over encoded UTF-8, applied to a map) are **not the same** and must
-not be unified. They agree only on uniform-length keys.
+There are therefore **three** comparators in this system, and no two of them may
+ever be unified:
+
+| Comparator | Applies to | Rule |
+|---|---|---|
+| CID preimage | a sorted *array*, before hashing | plain lexicographic over the decoded string |
+| CBOR wire map | the five maps in §2.2 | length-first, then bytewise over encoded UTF-8 |
+| JSON wire map | the same five maps | plain bytewise over encoded UTF-8, no length term |
+
+All three agree on uniform-length keys — which is exactly how two of them drifted
+apart without any test noticing. The preimage comparator is frozen into every CID
+ever minted; the other two are frozen into deployed peers.
 
 ---
 
@@ -64,16 +72,32 @@ nothing else, are sorted:
 | `proofs` | `SerializableTransmissionPacket` |
 | `Relationships` | `SerializableBatchedTransmissionPacket` |
 
-Ordering is **length-first, then bytewise** over the UTF-8 key — RFC 8949's rule
+**The comparator depends on the output format, and the two do not agree.**
+
+*CBOR* sorts **length-first, then bytewise** over the UTF-8 key — RFC 8949's rule
 for text keys. For text keys this reduces exactly to sorting by encoded bytes,
 because the encoded head grows monotonically with length (`0x60+len` below 24,
 `0x78` for 24–255, `0x79` for 256–65535).
 
+*JSON* sorts **plain bytewise, with no length term**. Go reaches JSON through
+`encoding/json`, which sorts map keys with a straight string compare, and Go is
+the reference — so every port must reproduce that rule and not the CBOR one. The
+two agree on every pair of equal-length keys and disagree otherwise:
+
+```text
+keys: zz-probe (8), aaa-probe (9)
+CBOR: zz-probe, aaa-probe
+JSON: aaa-probe, zz-probe
+```
+
+Section 2.1 is unaffected by the format: struct fields ride in declaration order
+in both. Only these five maps re-sort, and only they switch comparator.
+
 Each language expresses the same scoping differently. Go declares those fields as
 a `sortedMap[T]` type that sorts inside its own `MarshalCBOR`; Swift and Rust
 cannot distinguish a struct from a map at the CBOR layer — both are just maps — so
-they apply `CBOREncoder.sortedCBORMap` / `sorted_cbor_map` at exactly those five
-call sites and nowhere else.
+they apply `CBOREncoder.sortedWireMap` / `sorted_wire_map`, each taking an
+explicit key-order argument, at exactly those five call sites and nowhere else.
 
 ### 2.3 Empty proof maps are omitted, not emitted empty
 
@@ -81,22 +105,52 @@ call sites and nowhere else.
 leaf or packet genuinely carries proofs. A full DAG therefore contains no
 `stored_proofs` key at all, while transmission packets do.
 
-### 2.4 The axis the corpus cannot see
+### 2.4 The axis the corpus could not see, and now can
 
-Every map key the shared corpus exercises is a CID of uniform length, where
-length-first and plain-lexicographic ordering **coincide**. `AdditionalData` is
-the only wire map with arbitrary, mixed-length keys, and it is empty in every
-corpus case — so the corpus alone cannot distinguish the two comparators, and the
-ports could drift onto different ones while staying green.
+For four releases, every map key the shared corpus exercised was a CID of uniform
+length — always exactly 59 characters, because a CID is `b` plus base32 of exactly
+36 bytes — and on uniform-length keys length-first and plain-bytewise ordering
+**coincide**. `AdditionalData` is the only wire map with arbitrary, mixed-length
+keys, and it was empty in every corpus case. So the corpus could not distinguish
+the two comparators, and the ports were free to drift onto different ones while
+staying green. Matching output sizes were not evidence either: reordering keys
+preserves byte length exactly.
 
-That axis is pinned separately by one 20-byte vector asserted identically in all
-three ports (`dag/sortedmap_test.go`, `src/encoding.rs`, `WireMapOrderingTests.swift`):
+That is not hypothetical. The Rust port emitted the CBOR comparator into JSON, and
+the Swift port emitted a different set of key *names* altogether through
+`Codable`. Both stayed green throughout, because nothing in any of the three
+repositories ever compared a JSON byte across ports.
+
+The axis is now pinned three ways:
+
+| Guard | Lives in | Pins |
+|---|---|---|
+| 20-byte CBOR ordering vector | `dag/sortedmap_test.go`, `src/encoding.rs`, `WireMapOrderingTests.swift` | the CBOR comparator alone |
+| Both comparators, side by side | `src/encoding.rs`, `WireMapOrderingTests.swift` | that the two rules produce *different* orders |
+| `json_metadata_probe` corpus case | `spec/vectors`, asserted by all three ports | both comparators, end to end, against committed Go bytes |
+
+The 20-byte vector:
 
 ```text
 a3626d6d6132627a7a6131666161616161616133
 keys mm, zz, aaaaaa — length-first, then bytewise
-plain lexicographic would emit aaaaaa, mm, zz
+plain bytewise would emit aaaaaa, mm, zz
 ```
+
+The corpus case carries three `AdditionalData` keys of lengths 1, 8 and 9 — `m`,
+`zz-probe`, `aaa-probe` — chosen so the two rules produce *completely reversed*
+orders, so that no subset of them can come out right by luck:
+
+```text
+CBOR: m, zz-probe, aaa-probe
+JSON: aaa-probe, m, zz-probe
+```
+
+Every `.cbor` artifact in the corpus now has a `.json` sibling, and each port
+asserts per artifact that re-encoding reproduces the committed JSON bytes *and*
+that the value decoded from JSON re-encodes to the committed CBOR bytes. The
+generator refuses to emit a corpus in which the two orderings agree, so the probe
+cannot silently stop testing anything.
 
 ---
 
@@ -162,9 +216,9 @@ silently wrong rather than loudly wrong.
 
 | Port | Suite | Result | Static analysis |
 |---|---|---|---|
-| Go | `go test -count=1 ./...` | 124 tests across 4 packages | `go vet ./...` clean |
-| Swift | `swift test` | 269 tests, **0 skips** | — |
-| Rust | `cargo test` | 114 tests | `cargo clippy --all-targets -- -D warnings` clean |
+| Go | `go test -count=1 ./...` | 128 tests across 4 packages | `go vet ./...` clean |
+| Swift | `swift test` | 280 tests, **0 skips** | — |
+| Rust | `cargo test` | 119 tests | `cargo clippy --all-targets -- -D warnings` clean |
 
 ### 5.1 Shared guards
 
@@ -173,14 +227,19 @@ watching a given contract:
 
 | Guard | Pins |
 |---|---|
-| Spec-vector corpus | Re-encoding the committed corpus reproduces it **byte for byte** — full DAGs, transmission packets and batched packets alike |
+| Spec-vector corpus, CBOR | Re-encoding the committed corpus reproduces it **byte for byte** — full DAGs, partials, transmission packets and batched packets alike |
+| Spec-vector corpus, JSON | The same, for the `.json` sibling of every artifact — plus that a value decoded from JSON re-encodes to the committed *CBOR* bytes, which is what makes the two decoders provably equivalent rather than merely both self-consistent |
+| Negative vectors | Deliberately broken DAGs are rejected in **both** encodings, so a lenient JSON path cannot shelter behind a strict CBOR one |
 | Wire shape | Struct fields in declaration order; re-encoding is byte-stable across 200 encodes; empty proof maps omitted but present on the transmission path |
-| Wire map ordering | The 20-byte length-first vector from §2.4 |
+| Wire map ordering | The 20-byte length-first vector from §2.4, and the two comparators asserted against each other |
+| Mixed-length map keys | The `json_metadata_probe` corpus case from §2.4 — the only vector able to tell the two comparators apart |
 | Batch splitting | At least one corpus case splits across multiple batches, so the splitting path cannot go untested while looking tested |
 
 The corpus is generated by the Go repository's `tools/specvectors` and committed
 into all three repositories. A missing corpus fails loudly in each; it never
-skips.
+skips. Regeneration is bit-for-bit reproducible, and the three committed copies
+are identical — 226 files each, compared by digesting every relative path and its
+contents in sorted order.
 
 ### 5.2 Guards are mutation-tested
 
@@ -194,6 +253,11 @@ suite discriminates rather than alarming on any change:
 | Two leaf fields swapped | The declaration-order guard in all three ports, naming the offending key; every committed-byte comparison |
 | `stored_proofs` emitted unconditionally | The omitempty guard in all three ports, and nothing else |
 | Plain-lexicographic map keys | The 20-byte ordering vector in all three ports |
+| CBOR's length-first comparator used to write JSON | The JSON corpus assertion, in Rust and in Swift — and **only** on `json_metadata_probe`; all six fixture cases still pass, which is §2.4's blind spot demonstrating itself |
+
+That last row is worth reading twice: it is the mutation test that would have
+caught the original bug, run against the corpus that exists precisely because it
+did not.
 
 ---
 
@@ -201,19 +265,25 @@ suite discriminates rather than alarming on any change:
 
 | Evidence | Result |
 |---|---|
-| Go and Rust DAG root on the same corpus | identical — `bafireifuqx7auvelcittqzbmrvto5m66xp4zj5yddrup3ueo6edlrqrmxi`, 141 leaves |
-| CBOR encoding size | identical — `19188357` bytes |
-| JSON encoding size | identical — `25591601` bytes |
-| CBOR comparison method | byte-for-byte across all three ports — each re-encodes the committed corpus to identical bytes |
-| JSON comparison method | byte-for-byte |
+| Go, Swift and Rust DAG root on the same corpus | identical — `bafireifuqx7auvelcittqzbmrvto5m66xp4zj5yddrup3ueo6edlrqrmxi`, 141 leaves |
+| CBOR encoding size | identical across all three — `19188357` bytes, and again at 1 MiB and 2 MiB chunks |
+| JSON encoding size | identical across all three — `25591601` bytes |
+| CBOR comparison method | byte-for-byte — each port re-encodes the committed corpus to identical bytes |
+| JSON comparison method | byte-for-byte, both directions — JSON→JSON and JSON→CBOR |
+| Committed corpus, three repositories | identical — 226 files each, digested path-and-contents in sorted order |
 | Deployed wire shape | unchanged — pinned against golden bytes from a deployed build |
+
+The two size rows are the weakest lines in that table and are there for
+orientation only: reordering a map preserves byte length, so equal sizes cannot
+distinguish a correct encoder from one using the wrong comparator. The
+byte-for-byte rows are what carry the claim.
 
 ---
 
 ## 7. Performance
 
-Same corpus, same chunk size, both harnesses run back to back in one session.
-Rust is faster on six workloads, at parity on one, and slower on two. The full
+Same corpus, same chunk size, all three harnesses run back to back in one session.
+Rust is faster on four workloads, at parity on three, and slower on two. The full
 table, method, and the two remaining gaps are in [`README.md`](README.md).
 
 Only same-session ratios are meaningful: the machine drifts by roughly the

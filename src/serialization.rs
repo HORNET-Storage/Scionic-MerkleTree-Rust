@@ -2,7 +2,7 @@ use crate::classic::{Digest, MerkleProof};
 use crate::dag::{Cid, ClassicTreeBranch, Dag, DagLeaf, Metadata};
 use crate::encoding::{
     base64_standard, base64_standard_decode, cbor_decode_shared, cbor_encode, cbor_encode_into,
-    sorted_cbor_map, CborValue,
+    sorted_wire_map, CborValue, KeyOrder,
 };
 use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -115,8 +115,13 @@ static ALL_WIRE_KEYS: [&WireKey; 19] = [
 
 impl Dag {
     pub fn to_json(&self) -> Result<Vec<u8>> {
+        // JSON is not CBOR with different punctuation. Go reaches it through
+        // encoding/json, which sorts map keys bytewise with no length term, so
+        // the dynamic maps have to be rebuilt under KeyOrder::Json instead of
+        // reusing the CBOR-ordered tree. Everything else about the two trees --
+        // key names, struct field order, which values are null -- is identical.
         let mut output = String::new();
-        write_json(&dag_wire_value(self), &mut output, 0)?;
+        write_json(&dag_wire_value(self, KeyOrder::Json), &mut output, 0)?;
         Ok(output.into_bytes())
     }
 
@@ -127,7 +132,7 @@ impl Dag {
     }
 
     pub fn to_cbor(&self) -> Result<Vec<u8>> {
-        Ok(cbor_encode(&dag_wire_value(self)))
+        Ok(cbor_encode(&dag_wire_value(self, KeyOrder::Cbor)))
     }
 
     /// Encodes the DAG into a buffer the caller owns, appending to it.
@@ -143,7 +148,7 @@ impl Dag {
     /// Callers that encode once should keep using `to_cbor` -- it is the same
     /// work, and an owned `Vec` is the friendlier return.
     pub fn to_cbor_into(&self, output: &mut Vec<u8>) -> Result<()> {
-        cbor_encode_into(&dag_wire_value(self), output);
+        cbor_encode_into(&dag_wire_value(self, KeyOrder::Cbor), output);
         Ok(())
     }
 
@@ -153,21 +158,21 @@ impl Dag {
     }
 }
 
-fn dag_wire_value(dag: &Dag) -> CborValue {
+fn dag_wire_value(dag: &Dag, order: KeyOrder) -> CborValue {
     let leaves = dag
         .leaves()
         .iter()
-        .map(|(cid, leaf)| (cid.to_string(), leaf_wire_value(leaf)))
+        .map(|(cid, leaf)| (cid.to_string(), leaf_wire_value(leaf, order)))
         .collect();
     CborValue::Map(vec![
         ("Root".to_owned(), CborValue::Text(dag.root().to_string())),
         // Leafs is a genuine dynamic map (Go: SerializableDag.Leafs), so it
         // sorts. The two pairs around it are struct fields and must not.
-        ("Leafs".to_owned(), sorted_cbor_map(leaves)),
+        ("Leafs".to_owned(), sorted_wire_map(leaves, order)),
     ])
 }
 
-pub(crate) fn leaf_wire_value(leaf: &DagLeaf) -> CborValue {
+pub(crate) fn leaf_wire_value(leaf: &DagLeaf, order: KeyOrder) -> CborValue {
     let mut pairs = vec![
         ("Hash".to_owned(), CborValue::Text(leaf.cid().to_string())),
         (
@@ -219,22 +224,26 @@ pub(crate) fn leaf_wire_value(leaf: &DagLeaf) -> CborValue {
         ),
         (
             "AdditionalData".to_owned(),
-            sorted_cbor_map(
+            // The only wire map keyed by arbitrary strings, and therefore the
+            // only one where the CBOR and JSON comparators can actually differ.
+            sorted_wire_map(
                 leaf.additional_data()
                     .iter()
                     .map(|(key, value)| (key.clone(), CborValue::Text(value.clone())))
                     .collect(),
+                order,
             ),
         ),
     ];
     if !leaf.proofs().is_empty() {
         pairs.push((
             "stored_proofs".to_owned(),
-            sorted_cbor_map(
+            sorted_wire_map(
                 leaf.proofs()
                     .iter()
                     .map(|(key, branch)| (key.to_string(), proof_wire_value(branch)))
                     .collect(),
+                order,
             ),
         ));
     }

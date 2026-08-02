@@ -3,7 +3,9 @@ use crate::dag::{
     classic_tree_for_links, encode_non_root_identity, encode_root_identity, metadata_array, Cid,
     ClassicTreeBranch, Dag, DagLeaf,
 };
-use crate::encoding::{cbor_decode_shared, cbor_encode, sha256, sorted_cbor_map, CborValue};
+use crate::encoding::{
+    cbor_decode_shared, cbor_encode, sha256, sorted_wire_map, CborValue, KeyOrder,
+};
 use crate::serialization::{
     cbor_get, cbor_map, cbor_optional_text, cbor_optional_unsigned, cbor_required_text,
     decode_leaf, decode_proofs, json_get, json_leaf_to_cbor, json_object, json_proof_to_cbor,
@@ -77,7 +79,7 @@ impl TransmissionPacket {
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>> {
-        encode_json(&transmission_packet_wire_value(self))
+        encode_json(&transmission_packet_wire_value(self, KeyOrder::Json))
     }
 
     pub fn from_json(input: &[u8]) -> Result<Self> {
@@ -87,7 +89,10 @@ impl TransmissionPacket {
     }
 
     pub fn to_cbor(&self) -> Result<Vec<u8>> {
-        Ok(cbor_encode(&transmission_packet_wire_value(self)))
+        Ok(cbor_encode(&transmission_packet_wire_value(
+            self,
+            KeyOrder::Cbor,
+        )))
     }
 
     pub fn from_cbor(input: &[u8]) -> Result<Self> {
@@ -149,7 +154,7 @@ impl BatchedTransmissionPacket {
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>> {
-        encode_json(&batched_packet_wire_value(self))
+        encode_json(&batched_packet_wire_value(self, KeyOrder::Json))
     }
 
     pub fn from_json(input: &[u8]) -> Result<Self> {
@@ -159,7 +164,7 @@ impl BatchedTransmissionPacket {
     }
 
     pub fn to_cbor(&self) -> Result<Vec<u8>> {
-        Ok(cbor_encode(&batched_packet_wire_value(self)))
+        Ok(cbor_encode(&batched_packet_wire_value(self, KeyOrder::Cbor)))
     }
 
     pub fn from_cbor(input: &[u8]) -> Result<Self> {
@@ -935,9 +940,9 @@ fn estimate_add(total: &mut usize, value: usize) -> Result<()> {
     Ok(())
 }
 
-fn transmission_packet_wire_value(packet: &TransmissionPacket) -> CborValue {
+fn transmission_packet_wire_value(packet: &TransmissionPacket, order: KeyOrder) -> CborValue {
     let mut pairs = vec![
-        ("Leaf".to_owned(), leaf_wire_value(&packet.leaf)),
+        ("Leaf".to_owned(), leaf_wire_value(&packet.leaf, order)),
         (
             "ParentHash".to_owned(),
             CborValue::Text(
@@ -951,12 +956,13 @@ fn transmission_packet_wire_value(packet: &TransmissionPacket) -> CborValue {
     if !packet.proofs.is_empty() {
         pairs.push((
             "proofs".to_owned(),
-            sorted_cbor_map(
+            sorted_wire_map(
                 packet
                     .proofs
                     .iter()
                     .map(|(key, branch)| (key.to_string(), proof_wire_value(branch)))
                     .collect(),
+                order,
             ),
         ));
     }
@@ -986,15 +992,21 @@ fn transmission_packet_from_wire_value(value: &CborValue) -> Result<Transmission
     })
 }
 
-fn batched_packet_wire_value(packet: &BatchedTransmissionPacket) -> CborValue {
+fn batched_packet_wire_value(packet: &BatchedTransmissionPacket, order: KeyOrder) -> CborValue {
     CborValue::Map(vec![
         (
             "Leaves".to_owned(),
-            CborValue::Array(packet.leaves.iter().map(leaf_wire_value).collect()),
+            CborValue::Array(
+                packet
+                    .leaves
+                    .iter()
+                    .map(|leaf| leaf_wire_value(leaf, order))
+                    .collect(),
+            ),
         ),
         (
             "Relationships".to_owned(),
-            sorted_cbor_map(
+            sorted_wire_map(
                 packet
                     .relationships
                     .iter()
@@ -1009,6 +1021,7 @@ fn batched_packet_wire_value(packet: &BatchedTransmissionPacket) -> CborValue {
                         )
                     })
                     .collect(),
+                order,
             ),
         ),
         (
