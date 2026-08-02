@@ -1,0 +1,24 @@
+name: CI
+
+# Mirrors the local verification bar used for parity work:
+# clippy across every target with warnings promoted to errors, then the full
+# test suite (which includes the committed spec-vector corpus assertions).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: clippy -D warnings + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test

@@ -177,19 +177,22 @@ Lower is better.
 
 | Workload | Rust | Go | Swift | Rust vs Go |
 |---|---:|---:|---:|---|
-| `verify` | 5.27 ms | 11.09 ms | 65.42 ms | **2.10× faster** |
-| `from_json` | 47.08 ms | 71.80 ms | 60.36 ms | **1.53× faster** |
-| `create_parallel` | 3.57 ms | 4.89 ms | 18.54 ms | **1.37× faster** |
-| `to_json` | 69.19 ms | 81.85 ms | 88.35 ms | **1.18× faster** |
-| `from_cbor` | 3.22 ms | 3.33 ms | 3.18 ms | parity |
-| `leaf_sequence` | 2.63 ms | 2.81 ms | 14.99 ms | parity |
-| `batched_sequence` | 0.100 ms | 0.093 ms | 0.322 ms | parity |
-| `create_sequential` | 18.67 ms | 16.28 ms | 96.60 ms | 1.15× slower |
-| `to_cbor` | 5.14 ms | 3.46 ms | 22.70 ms | 1.49× slower |
+| `verify` | 5.02 ms | 10.93 ms | 17.44 ms | **2.18× faster** |
+| `from_json` | 48.29 ms | 70.78 ms | 61.43 ms | **1.47× faster** |
+| `create_parallel` | 3.46 ms | 4.80 ms | 9.66 ms | **1.39× faster** |
+| `to_json` | 67.09 ms | 79.75 ms | 81.38 ms | **1.19× faster** |
+| `from_cbor` | 3.09 ms | 3.16 ms | 3.02 ms | parity |
+| `leaf_sequence` | 2.63 ms | 2.79 ms | 0.32 ms | parity |
+| `batched_sequence` | 0.102 ms | 0.089 ms | 0.291 ms | parity |
+| `create_sequential` | 18.66 ms | 15.80 ms | 53.48 ms | 1.18× slower |
+| `to_cbor` | 4.71 ms | 3.57 ms | 9.95 ms | 1.32× slower |
 
 Every row is a fresh recording on one machine, so the numbers shift slightly
-against the ones this table carried previously. Two things moved for real reasons:
-`to_cbor`, described next, and Swift's JSON pair, described further below.
+against the ones this table carried previously. The move that is not session
+noise is Swift's column, which improved on every previously slow row — that
+work, and the caveats around it, are described in
+[Where the Swift port sits](#where-the-swift-port-sits). The `to_cbor` story
+below explains why Go's number is ~3.5 ms rather than the ~20 ms it once was.
 
 **Determinism is not what the `to_cbor` row measures, and never was.** All three
 ports encode deterministically, by the two rules above, and in none of them does
@@ -229,38 +232,67 @@ enforced by the type system rather than by convention.
 ### Where the Swift port sits
 
 Swift builds a bit-identical DAG, a bit-identical CBOR envelope and — since the
-JSON rewrite described below — a bit-identical JSON document, so nothing here is a
-correctness gap. It is still materially slower on every CPU-bound path, by roughly
-4–6× (`create_sequential`, `create_parallel`, `to_cbor`, `leaf_sequence`) and 12×
-on `verify`. The interesting part is where it is *not* slow: `from_cbor`
-(3.18 ms) and `from_json` (60.36 ms) land at or ahead of the other two ports.
+JSON rewrite described below — a bit-identical JSON document, so nothing here is
+a correctness gap. It also no longer trails the way it used to: an optimization
+pass over the Swift port (a Windows CNG/BCrypt SHA-256 backend, a pre-sized
+`[UInt8]` CBOR encoder, streamed sibling-pair hashing, and building each
+parent's transmission proof tree once instead of once per child) moved every
+slow row without changing one output byte — same roots, same `cbor_bytes` and
+`json_bytes`, same 226-file corpus digest, 280/280 tests:
 
-That split is the diagnostic, and it now points the same way in both formats. The
-paths where Swift keeps up are the ones it implements itself — its hand-written
-`CBORDecoder`, and now its hand-written wire-JSON writer and parser. The paths
-where it collapses are the ones still delegated to Foundation or `DispatchQueue`.
+| Workload | Swift before | Swift after | Swift vs Go | Swift vs Rust |
+|---|---:|---:|---|---|
+| `verify` | 65.42 ms | 17.44 ms | 1.6× slower | 3.5× slower |
+| `create_sequential` | 96.60 ms | 53.48 ms | 3.4× slower | 2.9× slower |
+| `create_parallel` | 18.54 ms | 9.66 ms | 2.0× slower | 2.8× slower |
+| `to_cbor` | 22.70 ms | 9.95 ms | 2.8× slower | 2.1× slower |
+| `leaf_sequence` | 14.99 ms | 0.32 ms | **8.6× faster** | **8.1× faster** |
+| `batched_sequence` | 0.322 ms | 0.291 ms | 3.3× slower | 2.9× slower |
+| `to_json` | 88.35 ms | 81.38 ms | parity | 1.21× slower |
+| `from_json` | 60.36 ms | 61.43 ms | **1.15× faster** | 1.27× slower |
+| `from_cbor` | 3.18 ms | 3.02 ms | **fastest of the three** | **fastest of the three** |
 
-`from_json` used to be the extreme case in the other direction, at **775 ms** —
-16× Rust, and 10× Swift's own `to_json` on the same document. A decoder being an
-order of magnitude slower than the matching encoder is not a property of the data,
-and it was not: it was `JSONDecoder`. Replacing it measures **60.36 ms**, a
-**12.8× improvement**, and it turns `from_json` into the row Swift does best on
-relative to the other two.
+The decode rows were already at or ahead of the other ports before that pass —
+`from_json` had been the extreme case in the other direction, at **775 ms**,
+until `JSONDecoder` was replaced with the port's own wire parser for a **12.8×**
+improvement — and that split was the diagnostic: the paths Swift implements by
+hand kept up, while the paths delegated to Foundation or to swift-crypto's
+Windows fallback collapsed. Four changes closed most of the rest:
 
-The same rewrite cost about 15% on `to_json` (76.51 ms → 88.35 ms), which is the
-honest trade: Foundation's `JSONEncoder` was never slow, it was merely producing a
-document no other port could read. The rest of Swift's column moved by under 3%
-between the two recordings (`to_cbor` 22.66 → 22.70 ms, `leaf_sequence` 15.26 →
-14.99 ms), which is what makes the two JSON deltas readable as real rather than as
-session noise.
+- **Windows SHA-256 now goes through CNG/BCrypt.** swift-crypto's vendored
+  BoringSSL ships 123 assembly files, every one of them guarded
+  `__ELF__`/`__APPLE__`, so on Windows they all compile to empty objects and
+  SHA-256 runs as portable C — 449 MB/s on this machine, against 4,199 MB/s
+  through `BCryptHashData` (9.4× one-shot, and ahead at every input size down to
+  64-byte pairs: 287 ns against 515 ns per hash). The port's default hash path
+  now runs through one internal seam that is BCrypt on Windows and swift-crypto
+  everywhere else — Apple keeps CryptoKit, Linux keeps BoringSSL's ELF assembly,
+  and the digests are identical by definition and by the 280-test suite.
+- **The CBOR encoder appends into one exactly pre-sized `[UInt8]` buffer** —
+  the same single-pass shape this crate and Go use — instead of growing a
+  `Data` through repeated reallocation.
+- **Default sibling-pair hashing streams both halves into one hasher** instead
+  of allocating a concatenated temporary per Merkle pair.
+- **`getLeafSequence` builds each parent's proof tree once per parent**, not
+  once per child — which is why `leaf_sequence` flipped from 5× slower than Go
+  to 8× faster than either port: the other two still rebuild per child.
+
+What remains of the create/verify gap is allocation and ARC traffic in the
+builder paths, not hashing.
 
 One caveat on the absolute magnitudes: the Windows Swift 6.3.1 toolchain reports
 `Build config: +assertions`, so the shipped standard library carries internal
-assertions the Go and Rust toolchains do not. `-c release` disables assertions in
-*this* code, not in the stdlib it links against, so some unknown share of the
-4–12× gap is toolchain rather than port. The Swift column is honest about what
-this machine runs; it is not a claim about Swift on Apple platforms, where the
-toolchain is built without assertions.
+assertions the Go and Rust toolchains do not, and `-c release` disables
+assertions in *this* code, not in the stdlib it links against — some unknown
+share of the remaining 2–3.5× gap is toolchain rather than port. (An earlier
+revision of this caveat also charged the column with swift-crypto's C-fallback
+SHA-256; that penalty no longer applies here, since the port hashes through
+CNG/BCrypt on Windows.) The Windows column also remains a declared proxy for the
+production target: the encoder/allocation gains are relative and expected to
+transfer to iOS, the BCrypt change does not reach iOS at all — on Apple
+platforms swift-crypto is `@_exported import CryptoKit` and hashing is already
+hardware-backed — and absolute iOS numbers stay unmeasured until this runs on a
+Mac.
 
 ### JSON is now cross-port compatible
 
@@ -339,16 +371,16 @@ the chunk size changes:
 
 | Chunk size | Rust | Go | Swift | Rust vs Go |
 |---|---:|---:|---:|---|
-| 256 KiB | 18.67 ms | 16.28 ms | 96.60 ms | 1.15× slower |
-| 1 MiB | 17.39 ms | 17.84 ms | 103.05 ms | **1.03× faster** |
-| 2 MiB (crate default) | 17.87 ms | 18.56 ms | 101.48 ms | **1.04× faster** |
+| 256 KiB | 18.66 ms | 15.80 ms | 53.48 ms | 1.18× slower |
+| 1 MiB | 17.46 ms | 17.53 ms | 60.01 ms | parity |
+| 2 MiB (crate default) | 17.02 ms | 18.11 ms | 63.24 ms | **1.06× faster** |
 
 So at this crate's own default chunk size Rust is slightly ahead, and the deficit
-only appears when a caller chooses small chunks. Swift's cost is flat across the
-sweep, which is consistent with a constant per-byte penalty rather than the
-per-chunk one this table isolates. `create_parallel`, the path most callers use,
-is 1.27–1.37× *faster* than Go at every size in the same sweep, and builds an
-identical DAG.
+only appears when a caller chooses small chunks. Swift's remaining cost rises
+mildly with chunk size (53 → 63 ms) — per-byte buffer work in its builder rather
+than the per-chunk allocation this table isolates. `create_parallel`, the path
+most callers use, is 1.34–1.43× *faster* than Go at every size in the same
+sweep, and builds an identical DAG.
 
 ## Versioning
 
