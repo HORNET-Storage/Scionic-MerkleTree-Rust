@@ -2,6 +2,7 @@ use crate::classic::{ClassicMerkleTree, Digest, MerkleProof};
 use crate::encoding::{
     base32_lower_decode, cbor_encode, cid_bytes_for_cbor, cid_text, sha256, CborValue,
 };
+use crate::fastcdc::{stream_fastcdc_chunks, CHUNKING_FASTCDC_V1, CHUNKING_TAG_KEY};
 use crate::{io_error, Error, Result};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -14,6 +15,9 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Legacy fixed-mode chunk size (2 MiB). New trees default to fastcdc-v1
+/// content-defined chunking ([`Chunking::FastCdcV1`]), which targets this
+/// same size per chunk; `with_chunk_size` selects the legacy fixed mode.
 pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 pub const MAX_IN_MEMORY_LEAF_BYTES: usize = 64 * 1024 * 1024;
 pub type Metadata = BTreeMap<String, String>;
@@ -167,7 +171,16 @@ impl DagStats {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Chunking {
+    /// fastcdc-v1 content-defined chunking (the Go repo's normative
+    /// `docs/fastcdc-v1.md`): 512 KiB min / 2 MiB target / 8 MiB max,
+    /// gear-hash boundaries. The DEFAULT for new trees; roots built under
+    /// it carry the `"chunking": "fastcdc-v1"` tag in their additional
+    /// data.
+    FastCdcV1,
+    /// Legacy fixed-size slabs (the pre-fastcdc default cut 2 MiB slabs).
     Fixed(NonZeroUsize),
+    /// One whole-file leaf regardless of size (bounded by the in-memory
+    /// limit).
     Disabled,
 }
 
@@ -194,9 +207,7 @@ pub struct ParallelDagBuildOptions {
 impl Default for DagBuildOptions {
     fn default() -> Self {
         Self {
-            chunking: Chunking::Fixed(
-                NonZeroUsize::new(DEFAULT_CHUNK_SIZE).expect("default chunk size is nonzero"),
-            ),
+            chunking: Chunking::FastCdcV1,
             root_metadata: Metadata::new(),
             timestamp_root: false,
         }
@@ -215,6 +226,13 @@ impl DagBuildOptions {
 
     pub fn with_chunking_disabled(mut self) -> Self {
         self.chunking = Chunking::Disabled;
+        self
+    }
+
+    /// Restore the default content-defined chunking (fastcdc-v1) — the
+    /// mirror of the Go library's `SetDefaultChunkSize`.
+    pub fn with_fastcdc(mut self) -> Self {
+        self.chunking = Chunking::FastCdcV1;
         self
     }
 
@@ -1209,11 +1227,21 @@ where
     let filesystem_metadata =
         fs::metadata(path).map_err(|error| io_error("stat", path, error))?;
     let root_name = root_item_name(path)?;
-    let effective_root_metadata = if options.timestamp_root() {
+    let mut effective_root_metadata = if options.timestamp_root() {
         timestamp_root_metadata()?
     } else {
         options.root_metadata().clone()
     };
+    // The library owns the chunking tag: a root cut with fastcdc-v1 records
+    // it in its additional data (overwriting any caller-supplied value),
+    // because a tag that does not reflect how the tree was actually cut
+    // breaks delta tooling. Legacy fixed/disabled modes stamp nothing
+    // (absent tag ⇒ fixed-2m). Stamped AFTER the timestamp replacement
+    // above, matching the Go library's order exactly — root metadata is
+    // hashed into the root CID, so the order is cross-language normative.
+    if options.chunking() == Chunking::FastCdcV1 {
+        effective_root_metadata.insert(CHUNKING_TAG_KEY.to_owned(), CHUNKING_FASTCDC_V1.to_owned());
+    }
     let (provisional, batch) = if filesystem_metadata.is_dir() {
         process_directory(
             path,
@@ -1408,6 +1436,33 @@ fn process_file<P: ProcessorFn + ?Sized>(
     match options.chunking() {
         Chunking::Disabled => {
             leaf_builder.set_data(read_disabled_file(&mut file, path)?);
+        }
+        Chunking::FastCdcV1 => {
+            // Same first-chunk deferral as the fixed path below: a file
+            // that cuts to a single chunk stores its data on the file leaf
+            // and produces no chunk leaves.
+            let mut first_chunk: Option<Vec<u8>> = None;
+            let mut produced = 0_usize;
+            stream_fastcdc_chunks(&mut file, path, |chunk, index| {
+                if index == 0 {
+                    first_chunk = Some(chunk);
+                } else {
+                    if index == 1 {
+                        let first = first_chunk.take().ok_or(Error::Invariant {
+                            detail: "first file chunk was lost",
+                        })?;
+                        add_chunk(&mut leaf_builder, &mut batch, 0, first)?;
+                    }
+                    add_chunk(&mut leaf_builder, &mut batch, index, chunk)?;
+                }
+                produced = index + 1;
+                Ok(())
+            })?;
+            if produced == 1 {
+                leaf_builder.set_data(first_chunk.take().ok_or(Error::Invariant {
+                    detail: "single file chunk was lost",
+                })?);
+            }
         }
         Chunking::Fixed(chunk_size) => {
             let mut remaining = file

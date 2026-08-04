@@ -12,14 +12,17 @@ as it arrives — independently, and without holding the whole structure.
 ## Status
 
 Byte-compatible with the Go reference implementation at **v2.4.3**, across all five
-layers of the parity specification.
+layers of the parity specification — plus the fastcdc-v1 content-defined chunking
+mode currently on the Go reference's main branch, pinned by an 11-case shared
+conformance corpus with identical rebuilt DAG roots. The version claim advances
+when the Go reference tags that release.
 
 | Layer | Scope |
 |---|---|
 | 1 — Primitives | CBOR, base32lower, base58btc, varint, CIDv1 |
 | 2 — Classic Merkle tree | construction, proof generation, proof verification |
 | 3 — Leaf hashing | CBOR → SHA-256 → CIDv1 → base32lower |
-| 4 — DAG creation | filesystem walk, chunking, sequential and parallel |
+| 4 — DAG creation | filesystem walk, chunking (fastcdc-v1 default, legacy fixed), sequential and parallel |
 | 5 — DAG operations | verify, serialize, transmit, diff, partial DAGs, store |
 
 Compatibility is not asserted from a round trip against this crate's own encoder.
@@ -61,8 +64,38 @@ use scionic_merkletree::{create_dag_parallel, ParallelDagBuildOptions};
 let dag = create_dag_parallel("path/to/directory", &ParallelDagBuildOptions::default())?;
 ```
 
-Chunk size and other build settings live on `DagBuildOptions`, passed through
+Build settings live on `DagBuildOptions`, passed through
 `create_dag_with_options`.
+
+### Chunking
+
+New trees default to **fastcdc-v1** content-defined chunking — 512 KiB min /
+2 MiB target / 8 MiB max, gear-hash boundaries. Boundaries follow content
+rather than offsets, so an edit re-cuts only the chunks it touches and
+identical runs deduplicate across files and versions. Roots built under it
+carry `"chunking": "fastcdc-v1"` in their additional data, stamped by the
+library (absent ⇒ legacy fixed-2m).
+
+```rust
+use scionic_merkletree::{Chunking, DagBuildOptions};
+
+// fastcdc-v1 is the default. These opt back into the legacy modes:
+let fixed = DagBuildOptions::default().with_chunk_size(2 * 1024 * 1024)?;
+let whole_file = DagBuildOptions::default().with_chunking_disabled();
+
+// Producers holding content in memory cut through the same normative cutter,
+// so every producer slices identical content into identical chunks:
+let chunks = Chunking::FastCdcV1.cut(&content);
+```
+
+The algorithm is frozen: its constants, gear table and boundary loop are
+normative (the Go repository's `docs/fastcdc-v1.md`), and the port is
+deliberately cross-implementation compatible: Go, Rust and Swift cut
+bit-identical boundaries for identical bytes on every platform, so chunks
+deduplicate across implementations, operating systems and uploaders. The
+shared conformance corpus under `spec/fastcdc-vectors` pins boundary offsets,
+chunk digests, edit-reuse partitions, rebuilt DAG roots and the root tag for
+11 cases across every port.
 
 ### Serialize
 
@@ -322,10 +355,11 @@ the chunk size changes:
 |---|---:|---:|---:|---|
 | 256 KiB | 18.66 ms | 15.80 ms | 53.48 ms | 1.18× slower |
 | 1 MiB | 17.46 ms | 17.53 ms | 60.01 ms | parity |
-| 2 MiB (crate default) | 17.02 ms | 18.11 ms | 63.24 ms | **1.06× faster** |
+| 2 MiB (fastcdc target / legacy fixed default) | 17.02 ms | 18.11 ms | 63.24 ms | **1.06× faster** |
 
-So at this crate's own default chunk size Rust is slightly ahead, and the deficit
-only appears when a caller chooses small chunks. Swift's cost rises mildly with
+So at 2 MiB — the legacy fixed default and the fastcdc-v1 target — Rust is
+slightly ahead, and the deficit only appears when a caller chooses small
+chunks. Swift's cost rises mildly with
 chunk size (53 → 63 ms) — per-byte buffer work in its builder rather than the
 per-chunk allocation this table isolates. `create_parallel`, the path
 most callers use, is 1.34–1.43× *faster* than Go at every size in the same
@@ -349,9 +383,11 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-119 tests cover layers 1–5, the committed Go wire vectors, and the shared
+132 tests cover layers 1–5, the committed Go wire vectors, the shared
 spec-vector corpus under `spec/vectors` — which pins both encodings, `.cbor` and
-`.json`, for every artifact it carries.
+`.json`, for every artifact it carries — and the fastcdc-v1 conformance corpus
+under `spec/fastcdc-vectors` (11 cases: boundary offsets, chunk digests,
+edit-reuse partitions, rebuilt DAG roots and the root `chunking` tag).
 
 `tools/gobench` and `tools/gowirevectors` are Go programs; `tools/swiftbench` is
 a SwiftPM package. They regenerate the comparison vectors and benchmark against

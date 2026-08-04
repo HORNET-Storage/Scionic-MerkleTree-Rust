@@ -290,12 +290,17 @@ fn disabled_chunking_hashes_an_explicit_empty_buffer() {
 }
 
 #[test]
-fn default_chunk_size_is_two_mib_and_streams_a_plus_one_file() {
+fn legacy_fixed_default_chunk_size_is_two_mib_and_streams_a_plus_one_file() {
+    // Pinned to the legacy fixed mode: the DEFAULT chunking is fastcdc-v1
+    // now, and this test's link-count assertion is a fixed-mode contract.
     assert_eq!(DEFAULT_CHUNK_SIZE, 2 * 1024 * 1024);
     let temp = TempDir::new("default-chunk-size").unwrap();
     let file = temp.path().join("default.bin");
     write(&file, &alpha_data(DEFAULT_CHUNK_SIZE + 1)).unwrap();
-    let dag = create_dag(&file).unwrap();
+    let options = DagBuildOptions::default()
+        .with_chunk_size(DEFAULT_CHUNK_SIZE)
+        .unwrap();
+    let dag = create_dag_with_options(&file, &options).unwrap();
     assert_eq!(dag.root_leaf().leaf_type(), LeafType::File);
     assert_eq!(dag.root_leaf().links().len(), 2);
     assert!(dag.root_leaf().content().is_none());
@@ -311,7 +316,12 @@ fn timestamp_root_replaces_caller_metadata_once_and_only_on_the_root() {
         ("timestamp".to_owned(), "caller".to_owned()),
         ("keep".to_owned(), "x".to_owned()),
     ]);
+    // Pinned to the legacy fixed mode so the exact-metadata assertions
+    // below stay byte-precise: the fastcdc-v1 default additionally stamps
+    // the "chunking" root tag (covered by tests/fastcdc_vectors.rs).
     let enabled_options = DagBuildOptions::default()
+        .with_chunk_size(DEFAULT_CHUNK_SIZE)
+        .unwrap()
         .with_root_metadata(caller.clone())
         .with_timestamp_root(true);
     let timestamped = create_dag_with_options(&root, &enabled_options).unwrap();
@@ -335,10 +345,16 @@ fn timestamp_root_replaces_caller_metadata_once_and_only_on_the_root() {
         .filter(|leaf| leaf.cid() != timestamped.root())
         .all(|leaf| leaf.additional_data().is_empty()));
 
-    let explicit_options = DagBuildOptions::default().with_root_metadata(generated.clone());
+    let explicit_options = DagBuildOptions::default()
+        .with_chunk_size(DEFAULT_CHUNK_SIZE)
+        .unwrap()
+        .with_root_metadata(generated.clone());
     let explicit = create_dag_with_options(&root, &explicit_options).unwrap();
     assert_eq!(timestamped.root(), explicit.root());
-    let disabled_options = DagBuildOptions::default().with_root_metadata(caller.clone());
+    let disabled_options = DagBuildOptions::default()
+        .with_chunk_size(DEFAULT_CHUNK_SIZE)
+        .unwrap()
+        .with_root_metadata(caller.clone());
     let disabled = create_dag_with_options(&root, &disabled_options).unwrap();
     assert_eq!(disabled.root_leaf().additional_data(), &caller);
 }

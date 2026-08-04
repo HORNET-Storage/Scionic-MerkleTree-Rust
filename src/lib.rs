@@ -5,6 +5,7 @@ mod classic;
 mod dag;
 pub mod diff;
 pub mod encoding;
+mod fastcdc;
 mod operations;
 mod serialization;
 mod store;
@@ -13,6 +14,7 @@ mod transmission;
 pub use classic::{ClassicMerkleTree, Digest, MerkleProof};
 pub use dag::*;
 pub use diff::*;
+pub use fastcdc::*;
 pub use store::*;
 pub use transmission::*;
 
