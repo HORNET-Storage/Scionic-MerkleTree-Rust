@@ -1,8 +1,8 @@
 mod support;
 
 use scionic_merkletree::{
-    create_dag_custom, create_dag_custom_parallel, create_dag_parallel,
-    create_dag_with_options, DagBuildOptions, LeafType, Metadata,
+    create_dag_custom, create_dag_custom_parallel, create_dag_parallel, create_dag_with_options,
+    DagBuildOptions, LeafType, Metadata,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -94,8 +94,7 @@ fn parallel_sync_processor_matches_sequential_metadata_and_coverage() {
     let sequential = create_dag_custom(&input, &options_4096(), Some(&processor)).unwrap();
     calls.lock().unwrap().clear();
     let parallel_options = options_4096().with_parallel_workers(4);
-    let parallel =
-        create_dag_custom_parallel(&input, &parallel_options, Some(&processor)).unwrap();
+    let parallel = create_dag_custom_parallel(&input, &parallel_options, Some(&processor)).unwrap();
     assert_eq!(parallel, sequential);
     assert_eq!(
         *calls.lock().unwrap(),

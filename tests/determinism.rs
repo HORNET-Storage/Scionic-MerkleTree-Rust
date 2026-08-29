@@ -224,7 +224,10 @@ fn deserializing_the_same_bytes_reassigns_identical_parent_hashes() {
     let cbor = dag.to_cbor().unwrap();
     let mut baseline: Option<BTreeMap<String, Option<String>>> = None;
     for iteration in 0..64 {
-        for restored in [Dag::from_json(&json).unwrap(), Dag::from_cbor(&cbor).unwrap()] {
+        for restored in [
+            Dag::from_json(&json).unwrap(),
+            Dag::from_cbor(&cbor).unwrap(),
+        ] {
             restored.verify().unwrap();
             assert_eq!(
                 restored.root_leaf().parent_hash(),

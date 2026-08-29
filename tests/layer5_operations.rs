@@ -1,8 +1,6 @@
 mod support;
 
-use scionic_merkletree::{
-    create_dag_with_options, Cid, Dag, Error, LeafType,
-};
+use scionic_merkletree::{create_dag_with_options, Cid, Dag, Error, LeafType};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -35,18 +33,19 @@ fn verification_rejects_content_and_root_aggregate_tampering_in_precedence_order
         .position(|window| window == marker)
         .unwrap()
         + marker.len();
-    content_tampered[start] = if content_tampered[start] == b'A' { b'B' } else { b'A' };
+    content_tampered[start] = if content_tampered[start] == b'A' {
+        b'B'
+    } else {
+        b'A'
+    };
     let content_dag = Dag::from_json(&content_tampered).unwrap();
     assert!(matches!(
         content_dag.verify(),
         Err(Error::ContentHashMismatch { .. })
     ));
 
-    let content_size_tampered = replace_once(
-        &json,
-        b"\"ContentSize\": 1024",
-        b"\"ContentSize\": 1025",
-    );
+    let content_size_tampered =
+        replace_once(&json, b"\"ContentSize\": 1024", b"\"ContentSize\": 1025");
     let content_size_dag = Dag::from_json(&content_size_tampered).unwrap();
     assert!(matches!(
         content_size_dag.verify(),
@@ -56,11 +55,7 @@ fn verification_rejects_content_and_root_aggregate_tampering_in_precedence_order
         })
     ));
 
-    let dag_size_tampered = replace_once(
-        &json,
-        b"\"DagSize\": 1467",
-        b"\"DagSize\": 1468",
-    );
+    let dag_size_tampered = replace_once(&json, b"\"DagSize\": 1467", b"\"DagSize\": 1468");
     let dag_size_dag = Dag::from_json(&dag_size_tampered).unwrap();
     assert!(matches!(
         dag_size_dag.verify(),
@@ -135,10 +130,7 @@ fn pruned_root_only_and_proof_bearing_partials_verify() {
         .unwrap();
     assert_eq!(partial.len(), 2);
     assert!(partial.is_partial());
-    assert_eq!(
-        partial.root_leaf().links(),
-        std::slice::from_ref(&selected)
-    );
+    assert_eq!(partial.root_leaf().links(), std::slice::from_ref(&selected));
     assert!(partial.root_leaf().proof_for(&selected).is_some());
     partial.verify().unwrap();
 }
@@ -164,7 +156,10 @@ fn assert_same_tree(left: &Path, right: &Path) {
     }
     let left_entries = directory_entries(left);
     let right_entries = directory_entries(right);
-    assert_eq!(left_entries.keys().collect::<Vec<_>>(), right_entries.keys().collect::<Vec<_>>());
+    assert_eq!(
+        left_entries.keys().collect::<Vec<_>>(),
+        right_entries.keys().collect::<Vec<_>>()
+    );
     for (name, left_path) in left_entries {
         assert_same_tree(&left_path, right_entries.get(&name).unwrap());
     }

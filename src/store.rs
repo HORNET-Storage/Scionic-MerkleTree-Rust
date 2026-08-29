@@ -183,7 +183,8 @@ fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 }
 
 fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Lightweight traversal metadata: hashes and edges only, never leaf payloads.
@@ -252,7 +253,10 @@ impl DagStore {
     }
 
     /// An empty store, for building a DAG incrementally from packets.
-    pub fn empty(leaf_store: Box<dyn LeafStore>, content_store: Option<Box<dyn ContentStore>>) -> Self {
+    pub fn empty(
+        leaf_store: Box<dyn LeafStore>,
+        content_store: Option<Box<dyn ContentStore>>,
+    ) -> Self {
         Self {
             root: None,
             labels: Labels::new(),
@@ -402,7 +406,11 @@ impl DagStore {
         let mut index = DagIndex::new();
         for (child, parent) in relationships {
             if let Some(parent) = parent {
-                index.children.entry(parent.clone()).or_default().push(child.clone());
+                index
+                    .children
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(child.clone());
             }
         }
         // Sorted so a cache that hands back edges in any order still yields one
@@ -466,7 +474,9 @@ impl DagStore {
             };
             index.leaf_hashes.push(current.clone());
             if !leaf.links().is_empty() {
-                index.children.insert(current.clone(), leaf.links().to_vec());
+                index
+                    .children
+                    .insert(current.clone(), leaf.links().to_vec());
                 for child in leaf.links() {
                     if !visited.contains(child) {
                         queue.push_back(child.clone());
@@ -572,11 +582,11 @@ impl DagStore {
             if !visited.insert(cid.clone()) {
                 continue;
             }
-            let leaf = self
-                .retrieve_leaf_without_content(&cid)?
-                .ok_or_else(|| Error::MissingLeaf {
-                    cid: cid.to_string(),
-                })?;
+            let leaf =
+                self.retrieve_leaf_without_content(&cid)?
+                    .ok_or_else(|| Error::MissingLeaf {
+                        cid: cid.to_string(),
+                    })?;
             let parent = match &parent_cid {
                 Some(parent_cid) => self.retrieve_leaf_without_content(parent_cid)?,
                 None => None,
@@ -819,9 +829,12 @@ impl DagStore {
         let mut current = leaf.clone();
         let mut seen = BTreeSet::from([current.cid().clone()]);
         while current.cid() != root {
-            let parent_cid = parent_of.get(current.cid()).ok_or_else(|| Error::BrokenPathToRoot {
-                cid: leaf.cid().to_string(),
-            })?;
+            let parent_cid =
+                parent_of
+                    .get(current.cid())
+                    .ok_or_else(|| Error::BrokenPathToRoot {
+                        cid: leaf.cid().to_string(),
+                    })?;
             let parent = self
                 .retrieve_leaf_without_content(parent_cid)?
                 .ok_or_else(|| Error::BrokenPathToRoot {
@@ -975,11 +988,11 @@ impl DagStore {
                 fs::create_dir_all(path)
                     .map_err(|error| io_error("create directory", path, error))?;
                 for child_cid in leaf.links() {
-                    let child = self
-                        .retrieve_leaf_without_content(child_cid)?
-                        .ok_or_else(|| Error::MissingLeaf {
-                            cid: child_cid.to_string(),
-                        })?;
+                    let child =
+                        self.retrieve_leaf_without_content(child_cid)?
+                            .ok_or_else(|| Error::MissingLeaf {
+                                cid: child_cid.to_string(),
+                            })?;
                     // safe_join rejects empty, dot, dot-dot, absolute and separator
                     // bearing names, so a hostile DAG cannot write outside the
                     // target directory.
@@ -1026,10 +1039,14 @@ impl DagStore {
                 });
             }
             if parent.current_link_count() > 1 {
-                let branch = packet.proofs().get(leaf.cid()).ok_or_else(|| Error::MissingProof {
-                    parent: parent.cid().to_string(),
-                    child: leaf.cid().to_string(),
-                })?;
+                let branch =
+                    packet
+                        .proofs()
+                        .get(leaf.cid())
+                        .ok_or_else(|| Error::MissingProof {
+                            parent: parent.cid().to_string(),
+                            child: leaf.cid().to_string(),
+                        })?;
                 if branch.child() != leaf.cid() {
                     return Err(Error::ProofKeyMismatch {
                         key: leaf.cid().to_string(),
@@ -1061,11 +1078,11 @@ impl DagStore {
 
         let mut new_root: Option<&DagLeaf> = None;
         for leaf in packet.leaves() {
-            let parent_cid = packet
-                .parent_for(leaf.cid())
-                .ok_or_else(|| Error::MissingTransmissionRelationship {
+            let parent_cid = packet.parent_for(leaf.cid()).ok_or_else(|| {
+                Error::MissingTransmissionRelationship {
                     child: leaf.cid().to_string(),
-                })?;
+                }
+            })?;
             let Some(parent_cid) = parent_cid else {
                 verify_identity_as(leaf, IdentityRole::Root)?;
                 if let Some(existing) = &self.root {
@@ -1157,9 +1174,11 @@ fn verify_leaf_content_hash(leaf: &DagLeaf) -> Result<()> {
     let Some(content) = leaf.content() else {
         return Ok(());
     };
-    let expected = leaf.content_hash().ok_or_else(|| Error::MissingContentHash {
-        cid: leaf.cid().to_string(),
-    })?;
+    let expected = leaf
+        .content_hash()
+        .ok_or_else(|| Error::MissingContentHash {
+            cid: leaf.cid().to_string(),
+        })?;
     if crate::encoding::sha256(content) != *expected {
         return Err(Error::ContentHashMismatch {
             cid: leaf.cid().to_string(),
@@ -1167,4 +1186,3 @@ fn verify_leaf_content_hash(leaf: &DagLeaf) -> Result<()> {
     }
     Ok(())
 }
-

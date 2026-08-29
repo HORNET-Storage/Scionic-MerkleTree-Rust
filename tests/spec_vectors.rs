@@ -50,15 +50,15 @@ fn read_vector(relative: &str) -> Vec<u8> {
         panic!(
             "spec vector missing at {}: {error}\n\
              Regenerate the corpus from the Go repo with:\n  \
-             go run ./tools/specvectors -out ../Scionic-MerkleTree-Rust/spec/vectors"
-,
+             go run ./tools/specvectors -out ../Scionic-MerkleTree-Rust/spec/vectors",
             path.display()
         )
     })
 }
 
 fn manifest() -> CborValue {
-    let decoded = cbor_decode(&read_vector("manifest.cbor")).expect("manifest.cbor does not decode");
+    let decoded =
+        cbor_decode(&read_vector("manifest.cbor")).expect("manifest.cbor does not decode");
     assert_eq!(
         number(field(&decoded, "chunk_size")),
         4096,
@@ -172,7 +172,11 @@ fn assert_shape(label: &str, dag: &Dag, case: &CborValue) {
             chunks += 1;
         }
     }
-    assert_eq!(files, number(field(case, "file_leaves")), "{label}: file leaves");
+    assert_eq!(
+        files,
+        number(field(case, "file_leaves")),
+        "{label}: file leaves"
+    );
     assert_eq!(
         directories,
         number(field(case, "directory_leaves")),
@@ -277,7 +281,11 @@ fn spec_vector_partial_dags_parse_and_verify() {
             let partial = Dag::from_cbor(&read_vector(&partial_path)).unwrap_or_else(|error| {
                 panic!("{name}: partial {partial_path} does not decode: {error:?}")
             });
-            assert_eq!(partial.root().as_str(), root_hash, "{name}: {partial_path} root");
+            assert_eq!(
+                partial.root().as_str(),
+                root_hash,
+                "{name}: {partial_path} root"
+            );
             partial.verify().unwrap_or_else(|error| {
                 panic!("{name}: partial {partial_path} does not verify: {error:?}")
             });
@@ -368,7 +376,10 @@ fn spec_vector_transmission_packets_replay() {
             );
 
             let round_tripped = TransmissionPacket::from_cbor(&first).unwrap();
-            assert_eq!(round_tripped, packet, "{name}: {packet_path} does not round trip");
+            assert_eq!(
+                round_tripped, packet,
+                "{name}: {packet_path} does not round trip"
+            );
             receiver
                 .apply_and_verify_transmission_packet(round_tripped)
                 .unwrap_or_else(|error| panic!("{name}: could not apply {packet_path}: {error:?}"));
@@ -409,7 +420,10 @@ fn spec_vector_batched_packets_replay() {
             );
 
             let round_tripped = BatchedTransmissionPacket::from_cbor(&first).unwrap();
-            assert_eq!(round_tripped, batch, "{name}: {batch_path} does not round trip");
+            assert_eq!(
+                round_tripped, batch,
+                "{name}: {batch_path} does not round trip"
+            );
             receiver
                 .apply_and_verify(&round_tripped)
                 .unwrap_or_else(|error| panic!("{name}: could not apply {batch_path}: {error:?}"));

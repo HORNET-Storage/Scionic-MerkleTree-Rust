@@ -76,21 +76,17 @@ fn partial_round_trips_preserve_bound_proof_keys_children_siblings_and_paths() {
     assert!(!branch.proof().siblings().is_empty());
 
     let json = partial.to_json().unwrap();
-    assert!(json.windows(b"\"stored_proofs\"".len()).any(|window| window == b"\"stored_proofs\""));
+    assert!(json
+        .windows(b"\"stored_proofs\"".len())
+        .any(|window| window == b"\"stored_proofs\""));
     let from_json = Dag::from_json(&json).unwrap();
     assert_eq!(from_json, partial);
-    assert_eq!(
-        from_json.root_leaf().proof_for(&selected).unwrap(),
-        branch
-    );
+    assert_eq!(from_json.root_leaf().proof_for(&selected).unwrap(), branch);
     from_json.verify().unwrap();
 
     let cbor = partial.to_cbor().unwrap();
     let from_cbor = Dag::from_cbor(&cbor).unwrap();
     assert_eq!(from_cbor, partial);
-    assert_eq!(
-        from_cbor.root_leaf().proof_for(&selected).unwrap(),
-        branch
-    );
+    assert_eq!(from_cbor.root_leaf().proof_for(&selected).unwrap(), branch);
     from_cbor.verify().unwrap();
 }

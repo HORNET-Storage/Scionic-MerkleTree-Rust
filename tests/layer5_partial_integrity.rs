@@ -23,7 +23,11 @@ fn unpruned_root_only_partial_rejects_a_same_length_link_substitution() {
     let partial = dag
         .get_partial(std::slice::from_ref(dag.root()), false)
         .unwrap();
-    assert_eq!(partial.len(), 1, "a root-only partial retains just the root");
+    assert_eq!(
+        partial.len(),
+        1,
+        "a root-only partial retains just the root"
+    );
     assert!(partial.is_partial());
     assert_eq!(
         partial.root_leaf().links().len(),
@@ -101,4 +105,3 @@ fn unpruned_partial_still_accepts_a_permuted_link_list() {
         .verify()
         .expect("a permuted complete link list still verifies");
 }
-

@@ -202,10 +202,7 @@ fn link_root_semantics_and_stored_order_match_go() {
     let mut reversed_dag = DagBuilder::new();
     reversed_dag.add_leaf(file_reversed.clone()).unwrap();
     assert_eq!(forward_dag.stats(), reversed_dag.stats());
-    assert_eq!(
-        forward_dag.stats().dag_size(),
-        file_forward_storage_size
-    );
+    assert_eq!(forward_dag.stats().dag_size(), file_forward_storage_size);
 
     let stats = DagStats::new(2, 0, 0);
     let file_forward_root = file_forward_builder

@@ -103,11 +103,12 @@ impl Dag {
                         cid: current.to_string(),
                     });
                 }
-                let parent_cid = parent_of
-                    .get(&current)
-                    .ok_or_else(|| Error::BrokenPathToRoot {
-                        cid: leaf.cid().to_string(),
-                    })?;
+                let parent_cid =
+                    parent_of
+                        .get(&current)
+                        .ok_or_else(|| Error::BrokenPathToRoot {
+                            cid: leaf.cid().to_string(),
+                        })?;
                 let parent = self.get(parent_cid).ok_or_else(|| Error::MissingLeaf {
                     cid: parent_cid.to_string(),
                 })?;
@@ -136,9 +137,9 @@ impl Dag {
         self.visit_unique(|leaf, _| {
             if leaf.cid() != self.root() {
                 labels.insert(next.to_string(), leaf.cid().clone());
-                next = next.checked_add(1).ok_or(Error::SizeOverflow {
-                    field: "label",
-                })?;
+                next = next
+                    .checked_add(1)
+                    .ok_or(Error::SizeOverflow { field: "label" })?;
             }
             Ok(())
         })?;
@@ -212,12 +213,13 @@ impl Dag {
                         cid: current.to_string(),
                     });
                 }
-                current = parent_of
-                    .get(&current)
-                    .cloned()
-                    .ok_or_else(|| Error::BrokenPathToRoot {
-                        cid: cid.to_string(),
-                    })?;
+                current =
+                    parent_of
+                        .get(&current)
+                        .cloned()
+                        .ok_or_else(|| Error::BrokenPathToRoot {
+                            cid: cid.to_string(),
+                        })?;
             }
         }
 
@@ -273,23 +275,16 @@ impl Dag {
 }
 
 fn verify_root_sizes(dag: &Dag, root: &DagLeaf) -> Result<()> {
-    let count_matches = u64::try_from(dag.len()).ok() == Some(root.leaf_count());
-    let totals_available =
-        root.content_size() != 0 || root.dag_size() != 0 || root.leaf_count() == 1;
-    let links_complete = dag
-        .leaves()
-        .values()
-        .all(|leaf| leaf.links().len() >= leaf.current_link_count());
     let content_complete = dag
         .leaves()
         .values()
         .all(|leaf| leaf.content_hash().is_none() || leaf.content().is_some());
-    if !(count_matches && totals_available && links_complete && content_complete) {
+    if !content_complete || !root_sizes_checkable(dag, root) {
         return Ok(());
     }
 
     let mut content_size = 0_u64;
-    let mut dag_size = 0_u64;
+    let mut non_root_storage_size = 0_u64;
     for leaf in dag.leaves().values() {
         if let Some(content) = leaf.content() {
             content_size = checked_add(
@@ -301,10 +296,37 @@ fn verify_root_sizes(dag: &Dag, root: &DagLeaf) -> Result<()> {
             )?;
         }
         if leaf.cid() != dag.root() {
-            dag_size = checked_add(dag_size, leaf.storage_size()?, "DagSize")?;
+            non_root_storage_size =
+                checked_add(non_root_storage_size, leaf.storage_size()?, "DagSize")?;
         }
     }
+    verify_root_sizes_against(root, content_size, non_root_storage_size)
+}
 
+/// Whether a root's `ContentSize`/`DagSize` can be held to a DAG at all: the
+/// leaf count must match, the root must actually carry totals, and every
+/// leaf's links must be complete. Content completeness is the caller's
+/// question — a retained DAG answers it from its payloads, a streamed one
+/// from what passed its sink.
+fn root_sizes_checkable(dag: &Dag, root: &DagLeaf) -> bool {
+    let count_matches = u64::try_from(dag.len()).ok() == Some(root.leaf_count());
+    let totals_available =
+        root.content_size() != 0 || root.dag_size() != 0 || root.leaf_count() == 1;
+    let links_complete = dag
+        .leaves()
+        .values()
+        .all(|leaf| leaf.links().len() >= leaf.current_link_count());
+    count_matches && totals_available && links_complete
+}
+
+/// Compare the root's signed totals with sizes summed elsewhere. `DagSize` is
+/// the non-root storage projections plus the root's own identity encoded with
+/// `DagSize` zeroed, exactly as the builder computed it.
+fn verify_root_sizes_against(
+    root: &DagLeaf,
+    content_size: u64,
+    non_root_storage_size: u64,
+) -> Result<()> {
     let root_without_size = encode_root_identity(
         root.item_name(),
         root.leaf_type(),
@@ -318,11 +340,10 @@ fn verify_root_sizes(dag: &Dag, root: &DagLeaf) -> Result<()> {
         root.content_hash(),
         metadata_array(Some(root.additional_data())),
     );
-    dag_size = checked_add(
-        dag_size,
-        u64::try_from(root_without_size.len()).map_err(|_| Error::SizeOverflow {
-            field: "DagSize",
-        })?,
+    let dag_size = checked_add(
+        non_root_storage_size,
+        u64::try_from(root_without_size.len())
+            .map_err(|_| Error::SizeOverflow { field: "DagSize" })?,
         "DagSize",
     )?;
 
@@ -339,6 +360,57 @@ fn verify_root_sizes(dag: &Dag, root: &DagLeaf) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// The size totals `verify_root_sizes` sums from retained payloads, summed
+/// instead while payloads stream past a receiver that keeps none of them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StreamedSizeTotals {
+    /// Every streamed payload's length, the root's included.
+    content_size: u64,
+    /// Every non-root leaf's storage projection, measured while its payload
+    /// was still attached — the figure `verify_root_sizes` reads from a
+    /// retained leaf.
+    non_root_storage_size: u64,
+    /// A leaf that declares a content hash arrived without its payload, so
+    /// the totals are incomplete and cannot be held against the root.
+    missing_content: bool,
+}
+
+impl StreamedSizeTotals {
+    /// Account one leaf exactly as `verify_root_sizes` would with its payload
+    /// still attached: payload length into `ContentSize`, and for a non-root
+    /// leaf the storage projection into `DagSize`.
+    pub(crate) fn record(&mut self, leaf: &DagLeaf, is_root: bool) -> Result<()> {
+        match leaf.content() {
+            Some(content) => {
+                self.content_size = checked_add(
+                    self.content_size,
+                    u64::try_from(content.len()).map_err(|_| Error::SizeOverflow {
+                        field: "ContentSize",
+                    })?,
+                    "ContentSize",
+                )?;
+            }
+            None if leaf.content_hash().is_some() => self.missing_content = true,
+            None => {}
+        }
+        if !is_root {
+            self.non_root_storage_size =
+                checked_add(self.non_root_storage_size, leaf.storage_size()?, "DagSize")?;
+        }
+        Ok(())
+    }
+
+    /// Hold the root of a finished, content-free skeleton to these totals,
+    /// under the same gate `verify_root_sizes` applies to a retained DAG.
+    pub(crate) fn verify(&self, dag: &Dag) -> Result<()> {
+        let root = dag.try_root_leaf().ok_or(Error::MissingRoot)?;
+        if self.missing_content || !root_sizes_checkable(dag, root) {
+            return Ok(());
+        }
+        verify_root_sizes_against(root, self.content_size, self.non_root_storage_size)
+    }
 }
 
 fn verify_complete_classic_root(leaf: &DagLeaf) -> Result<()> {
@@ -395,17 +467,12 @@ fn verify_partial_parent(dag: &Dag, parent: &DagLeaf, child: &Cid) -> Result<()>
                     child: branch.child().to_string(),
                 });
             }
-            let root: &Digest = parent
-                .classic_merkle_root()
-                .try_into()
-                .map_err(|_| Error::ClassicRootMismatch {
+            let root: &Digest = parent.classic_merkle_root().try_into().map_err(|_| {
+                Error::ClassicRootMismatch {
                     cid: parent.cid().to_string(),
-                })?;
-            ClassicMerkleTree::verify_against(
-                child.as_str().as_bytes(),
-                branch.proof(),
-                root,
-            )
+                }
+            })?;
+            ClassicMerkleTree::verify_against(child.as_str().as_bytes(), branch.proof(), root)
         }
     }
 }
@@ -434,5 +501,3 @@ fn create_directory_leaf(dag: &Dag, leaf: &DagLeaf, path: &Path) -> Result<()> {
 fn checked_add(left: u64, right: u64, field: &'static str) -> Result<u64> {
     left.checked_add(right).ok_or(Error::SizeOverflow { field })
 }
-
-

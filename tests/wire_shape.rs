@@ -169,8 +169,16 @@ fn to_cbor_into_matches_to_cbor_and_appends_rather_than_clobbers() {
     let prefix = b"scionic".to_vec();
     let mut appended = prefix.clone();
     dag.to_cbor_into(&mut appended).unwrap();
-    assert_eq!(&appended[..prefix.len()], &prefix[..], "prefix was clobbered");
-    assert_eq!(&appended[prefix.len()..], &expected[..], "appended bytes differ");
+    assert_eq!(
+        &appended[..prefix.len()],
+        &prefix[..],
+        "prefix was clobbered"
+    );
+    assert_eq!(
+        &appended[prefix.len()..],
+        &expected[..],
+        "appended bytes differ"
+    );
 
     // The reuse case this API exists for: one buffer, many encodes. A buffer
     // carrying stale capacity must not leak old bytes into a new encoding.
@@ -178,7 +186,10 @@ fn to_cbor_into_matches_to_cbor_and_appends_rather_than_clobbers() {
     for iteration in 0..8 {
         reused.clear();
         dag.to_cbor_into(&mut reused).unwrap();
-        assert_eq!(reused, expected, "reused buffer diverged on iteration {iteration}");
+        assert_eq!(
+            reused, expected,
+            "reused buffer diverged on iteration {iteration}"
+        );
     }
 }
 

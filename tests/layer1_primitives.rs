@@ -23,10 +23,7 @@ fn cbor_reference_table_is_byte_exact() {
         (CborValue::negative(-1).unwrap(), "20"),
         (CborValue::negative(-10).unwrap(), "29"),
         (CborValue::negative(-100).unwrap(), "3863"),
-        (
-            CborValue::negative(i64::MIN).unwrap(),
-            "3b7fffffffffffffff",
-        ),
+        (CborValue::negative(i64::MIN).unwrap(), "3b7fffffffffffffff"),
         (CborValue::Bytes(Vec::new()), "40"),
         (CborValue::Bytes(vec![1, 2, 3, 4]), "4401020304"),
         (CborValue::Text(String::new()), "60"),

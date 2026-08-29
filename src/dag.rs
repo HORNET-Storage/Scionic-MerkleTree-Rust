@@ -22,8 +22,7 @@ pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 pub const MAX_IN_MEMORY_LEAF_BYTES: usize = 64 * 1024 * 1024;
 pub type Metadata = BTreeMap<String, String>;
 pub type Labels = BTreeMap<String, Cid>;
-pub type LeafProcessor =
-    dyn Fn(&Path, &str, &DirEntry, bool, LeafType) -> Option<Metadata>;
+pub type LeafProcessor = dyn Fn(&Path, &str, &DirEntry, bool, LeafType) -> Option<Metadata>;
 pub type SyncLeafProcessor =
     dyn Fn(&Path, &str, &DirEntry, bool, LeafType) -> Option<Metadata> + Sync;
 
@@ -330,10 +329,8 @@ fn dag_worker_count(workers: isize) -> DagWorkerCount {
         0 => DagWorkerCount::Auto,
         ..=-1 => DagWorkerCount::PerEntry,
         _ => DagWorkerCount::Fixed(
-            NonZeroUsize::new(
-                usize::try_from(workers).expect("positive worker count fits usize"),
-            )
-            .expect("positive worker count is nonzero"),
+            NonZeroUsize::new(usize::try_from(workers).expect("positive worker count fits usize"))
+                .expect("positive worker count is nonzero"),
         ),
     }
 }
@@ -484,6 +481,16 @@ impl DagLeaf {
     /// leaf's content without copying it.
     pub(crate) fn content_arc(&self) -> Option<Arc<Vec<u8>>> {
         self.content.clone()
+    }
+
+    /// The same leaf without its payload: identity, links, proofs, sizes and
+    /// metadata stay, `content` becomes `None`. The copy still verifies,
+    /// because the CID commits to the payload through `content_hash`, which
+    /// stays. The source keeps its shared payload untouched.
+    pub fn without_content(&self) -> Self {
+        let mut leaf = self.clone();
+        leaf.content = None;
+        leaf
     }
 
     pub fn classic_merkle_root(&self) -> &[u8] {
@@ -656,11 +663,7 @@ impl DagLeaf {
         self.links.retain(|link| retained.contains(link));
     }
 
-    pub(crate) fn insert_bound_proof(
-        &mut self,
-        key: Cid,
-        branch: ClassicTreeBranch,
-    ) -> Result<()> {
+    pub(crate) fn insert_bound_proof(&mut self, key: Cid, branch: ClassicTreeBranch) -> Result<()> {
         if key != branch.child {
             return Err(Error::ProofKeyMismatch {
                 key: key.to_string(),
@@ -1106,8 +1109,7 @@ impl<P: ProcessorFn + ?Sized> EntryScheduler<P> for SequentialScheduler {
         options: &DagBuildOptions,
         processor: Option<&P>,
     ) -> Vec<IndexedEntryResult> {
-        jobs
-            .into_iter()
+        jobs.into_iter()
             .map(|job| {
                 let index = job.index;
                 IndexedEntryResult {
@@ -1135,8 +1137,7 @@ impl<P: ProcessorFn + Sync + ?Sized> EntryScheduler<P> for ParallelScheduler {
             let worker_count = resolve_worker_count(self.workers, jobs.len());
             process_entries_parallel(jobs, worker_count, options, processor, self)
         } else {
-            jobs
-                .into_iter()
+            jobs.into_iter()
                 .map(|job| {
                     let index = job.index;
                     IndexedEntryResult {
@@ -1224,8 +1225,7 @@ where
     S: EntryScheduler<P>,
 {
     validate_chunking(options.chunking())?;
-    let filesystem_metadata =
-        fs::metadata(path).map_err(|error| io_error("stat", path, error))?;
+    let filesystem_metadata = fs::metadata(path).map_err(|error| io_error("stat", path, error))?;
     let root_name = root_item_name(path)?;
     let mut effective_root_metadata = if options.timestamp_root() {
         timestamp_root_metadata()?
@@ -1243,15 +1243,7 @@ where
         effective_root_metadata.insert(CHUNKING_TAG_KEY.to_owned(), CHUNKING_FASTCDC_V1.to_owned());
     }
     let (provisional, batch) = if filesystem_metadata.is_dir() {
-        process_directory(
-            path,
-            root_name,
-            None,
-            true,
-            options,
-            processor,
-            scheduler,
-        )?
+        process_directory(path, root_name, None, true, options, processor, scheduler)?
     } else {
         process_file(path, root_name, None, true, options, processor)?
     };
@@ -1482,12 +1474,7 @@ fn process_file<P: ProcessorFn + ?Sized>(
                             field: "chunk size",
                         })?;
                     let mut chunk = Vec::new();
-                    reserve_exact_bytes(
-                        &mut chunk,
-                        next_size_usize,
-                        "chunk buffer",
-                        next_size,
-                    )?;
+                    reserve_exact_bytes(&mut chunk, next_size_usize, "chunk buffer", next_size)?;
                     chunk.resize(next_size_usize, 0);
                     file.read_exact(&mut chunk)
                         .map_err(|error| io_error("read file chunk", path, error))?;
@@ -1603,13 +1590,16 @@ fn add_chunk(
 }
 
 fn chunk_index_from_item_name(name: &str) -> Option<isize> {
-    let tail = name
-        .rfind(['/', '\\'])
-        .map_or(name, |cut| &name[cut + 1..]);
+    let tail = name.rfind(['/', '\\']).map_or(name, |cut| &name[cut + 1..]);
     tail.parse::<isize>().ok()
 }
 
-pub(crate) fn compare_chunk_item_names(left: &str, right: &str) -> Ordering {
+/// The order in which a chunked file's chunk leaves are concatenated back into
+/// the file: by the numeric chunk index in each leaf's item name, exactly as
+/// `Dag::get_content_from_leaf` assembles them. Public so a caller that copies
+/// verified chunk bytes from its own storage can reproduce the file without
+/// holding it whole.
+pub fn compare_chunk_item_names(left: &str, right: &str) -> Ordering {
     match (
         chunk_index_from_item_name(left),
         chunk_index_from_item_name(right),
@@ -1707,7 +1697,13 @@ fn go_clean(path: &str) -> String {
         volume.to_owned()
     };
     let bare_unc_root = cfg!(windows) && volume_len > 2 && remainder.is_empty();
-    if rooted && !bare_unc_root && !output.as_bytes().last().is_some_and(|byte| is_go_separator(*byte)) {
+    if rooted
+        && !bare_unc_root
+        && !output
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| is_go_separator(*byte))
+    {
         output.push(separator);
     }
     if components.is_empty() {
@@ -1724,8 +1720,7 @@ fn go_clean(path: &str) -> String {
         return ".".to_owned();
     }
     let bare_windows_volume = cfg!(windows) && volume_len == 2 && !rooted;
-    if !output.is_empty() && !output.ends_with(separator) && !bare_windows_volume
-    {
+    if !output.is_empty() && !output.ends_with(separator) && !bare_windows_volume {
         output.push(separator);
     }
     output.push_str(&components.join(&separator.to_string()));
@@ -1854,9 +1849,8 @@ fn format_system_time_rfc3339_utc(time: SystemTime) -> Result<String> {
     let elapsed = time
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Error::SystemTimeBeforeUnixEpoch)?;
-    let seconds = i64::try_from(elapsed.as_secs()).map_err(|_| Error::SizeOverflow {
-        field: "timestamp",
-    })?;
+    let seconds =
+        i64::try_from(elapsed.as_secs()).map_err(|_| Error::SizeOverflow { field: "timestamp" })?;
     Ok(format_epoch_seconds_rfc3339_utc(seconds))
 }
 
@@ -1867,11 +1861,9 @@ fn format_epoch_seconds_rfc3339_utc(seconds: i64) -> String {
     let era = shifted_days.div_euclid(146_097);
     let day_of_era = shifted_days - era * 146_097;
     let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096)
-            / 365;
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let mut year = year_of_era + era * 400;
-    let day_of_year =
-        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
@@ -1927,11 +1919,7 @@ fn proofs_for_present_children(
     Ok(proofs)
 }
 
-pub(crate) fn assemble_chunk_content(
-    dag: &Dag,
-    file: &DagLeaf,
-    max_bytes: u64,
-) -> Result<Vec<u8>> {
+pub(crate) fn assemble_chunk_content(dag: &Dag, file: &DagLeaf, max_bytes: u64) -> Result<Vec<u8>> {
     let mut chunks = Vec::<&DagLeaf>::with_capacity(file.links().len());
     for cid in file.links() {
         let chunk = dag.get(cid).ok_or_else(|| Error::MissingLeaf {
@@ -1939,9 +1927,7 @@ pub(crate) fn assemble_chunk_content(
         })?;
         chunks.push(chunk);
     }
-    chunks.sort_by(|left, right| {
-        compare_chunk_item_names(left.item_name(), right.item_name())
-    });
+    chunks.sort_by(|left, right| compare_chunk_item_names(left.item_name(), right.item_name()));
 
     let mut total = 0_u64;
     for chunk in &chunks {
@@ -2113,10 +2099,7 @@ fn encode_storage_shape(leaf: &DagLeaf) -> Vec<u8> {
             "ContentHash".to_owned(),
             optional_digest(leaf.content_hash.as_ref()),
         ),
-        (
-            "Content".to_owned(),
-            optional_bytes(leaf.content()),
-        ),
+        ("Content".to_owned(), optional_bytes(leaf.content())),
         (
             "ClassicMerkleRoot".to_owned(),
             optional_bytes(leaf.classic_merkle_root.as_deref()),
@@ -2159,20 +2142,14 @@ fn ensure_in_memory_limit(resource: &'static str, requested: u64) -> Result<()> 
 
 fn validate_chunking(chunking: Chunking) -> Result<()> {
     if let Chunking::Fixed(size) = chunking {
-        ensure_in_memory_limit(
-            "chunk buffer",
-            usize_to_u64(size.get(), "chunk size")?,
-        )?;
+        ensure_in_memory_limit("chunk buffer", usize_to_u64(size.get(), "chunk size")?)?;
     }
     Ok(())
 }
 
 fn validate_leaf_data(data: Option<&[u8]>) -> Result<()> {
     if let Some(data) = data {
-        ensure_in_memory_limit(
-            "leaf content",
-            usize_to_u64(data.len(), "leaf content")?,
-        )?;
+        ensure_in_memory_limit("leaf content", usize_to_u64(data.len(), "leaf content")?)?;
     }
     Ok(())
 }
@@ -2251,10 +2228,7 @@ fn storage_shape_len(leaf: &DagLeaf) -> Result<u64> {
     add_text_len(&mut total, "CurrentLinkCount")?;
     add_encoded_len(
         &mut total,
-        cbor_argument_encoded_len(usize_to_u64(
-            leaf.current_link_count,
-            "CurrentLinkCount",
-        )?),
+        cbor_argument_encoded_len(usize_to_u64(leaf.current_link_count, "CurrentLinkCount")?),
     )?;
     add_text_len(&mut total, "LeafCount")?;
     add_encoded_len(&mut total, cbor_argument_encoded_len(leaf.leaf_count))?;
@@ -2277,10 +2251,7 @@ fn storage_shape_len(leaf: &DagLeaf) -> Result<u64> {
     add_text_len(&mut total, "AdditionalData")?;
     add_encoded_len(
         &mut total,
-        cbor_argument_encoded_len(usize_to_u64(
-            leaf.additional_data.len(),
-            "AdditionalData",
-        )?),
+        cbor_argument_encoded_len(usize_to_u64(leaf.additional_data.len(), "AdditionalData")?),
     )?;
     for (key, value) in &leaf.additional_data {
         add_text_len(&mut total, key)?;
@@ -2351,7 +2322,10 @@ mod tests {
 
         let mut stripped = graph.dag.clone();
         stripped.remove_all_content();
-        assert!(stripped.leaves().values().all(|leaf| leaf.content().is_none()));
+        assert!(stripped
+            .leaves()
+            .values()
+            .all(|leaf| leaf.content().is_none()));
 
         let after: Vec<Option<Vec<u8>>> = graph
             .dag
@@ -2363,6 +2337,30 @@ mod tests {
             after, before,
             "remove_all_content must repoint each clone's handle, never write \
              through the payload it shares with the source"
+        );
+    }
+
+    /// `without_content` is the per-leaf form of `remove_all_content`: the
+    /// copy drops only its payload handle, verifies on identity alone, and
+    /// leaves the source's shared payload intact.
+    #[test]
+    fn a_leaf_without_content_keeps_its_identity_and_leaves_the_source_intact() {
+        let leaf = LeafBuilder::new("0", LeafType::Chunk)
+            .with_data(b"payload".to_vec())
+            .build(None)
+            .unwrap();
+        let stripped = leaf.without_content();
+        assert!(stripped.content().is_none());
+        assert_eq!(stripped.cid(), leaf.cid());
+        assert_eq!(stripped.content_hash(), leaf.content_hash());
+        assert_eq!(stripped.links(), leaf.links());
+        assert_eq!(stripped.additional_data(), leaf.additional_data());
+        stripped.verify_identity().unwrap();
+        assert_eq!(leaf.content(), Some(b"payload".as_slice()));
+        leaf.verify_identity().unwrap();
+        assert_ne!(
+            stripped, leaf,
+            "leaf equality compares payloads, so the copy must differ from its source"
         );
     }
 
@@ -2540,8 +2538,7 @@ mod tests {
         fn from_bytes(bytes: &[u8], dag: &Dag) -> Self {
             const CID_TEXT_LEN: usize = 59;
             let child_text = std::str::from_utf8(&bytes[..CID_TEXT_LEN]).unwrap();
-            let parent_text =
-                std::str::from_utf8(&bytes[CID_TEXT_LEN..CID_TEXT_LEN * 2]).unwrap();
+            let parent_text = std::str::from_utf8(&bytes[CID_TEXT_LEN..CID_TEXT_LEN * 2]).unwrap();
             let child = dag
                 .leaves()
                 .keys()
@@ -2554,11 +2551,7 @@ mod tests {
                 .find(|cid| cid.as_str() == parent_text)
                 .unwrap()
                 .clone();
-            let proof = proof_for_parent_child(
-                dag.get(&declared_parent).unwrap(),
-                &child,
-            )
-            .unwrap();
+            let proof = proof_for_parent_child(dag.get(&declared_parent).unwrap(), &child).unwrap();
             Self {
                 child,
                 declared_parent,
@@ -2594,7 +2587,10 @@ mod tests {
         for _ in 0..ITERATIONS {
             let packets = packet_sequence(&graph.dag);
             assert_eq!(
-                packets.iter().filter(|packet| packet.child == graph.shared).count(),
+                packets
+                    .iter()
+                    .filter(|packet| packet.child == graph.shared)
+                    .count(),
                 1
             );
             let shared_packet = packets
@@ -2614,12 +2610,15 @@ mod tests {
                 let parent = graph.dag.get(&decoded.declared_parent).unwrap();
                 if let Some(proof) = &decoded.proof {
                     verify_parent_proof(parent, &decoded.child, proof);
-                    proof_placement.insert((
-                        decoded.declared_parent.clone(),
-                        decoded.child.clone(),
-                    ));
+                    proof_placement
+                        .insert((decoded.declared_parent.clone(), decoded.child.clone()));
                 }
-                graph.dag.get(&decoded.child).unwrap().verify_identity().unwrap();
+                graph
+                    .dag
+                    .get(&decoded.child)
+                    .unwrap()
+                    .verify_identity()
+                    .unwrap();
                 receiver.insert(decoded.child);
                 fingerprint.extend_from_slice(&bytes);
             }
@@ -2656,15 +2655,12 @@ mod tests {
             const CID_TEXT_LEN: usize = 59;
             let mut cursor = 0;
             let read_u32 = |bytes: &[u8], cursor: &mut usize| {
-                let value = u32::from_be_bytes(
-                    bytes[*cursor..*cursor + 4].try_into().unwrap(),
-                );
+                let value = u32::from_be_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap());
                 *cursor += 4;
                 value as usize
             };
             let read_cid = |bytes: &[u8], cursor: &mut usize| {
-                let text =
-                    std::str::from_utf8(&bytes[*cursor..*cursor + CID_TEXT_LEN]).unwrap();
+                let text = std::str::from_utf8(&bytes[*cursor..*cursor + CID_TEXT_LEN]).unwrap();
                 *cursor += CID_TEXT_LEN;
                 dag.leaves()
                     .keys()
@@ -2832,7 +2828,15 @@ mod tests {
             assert_eq!(chunk_index_from_item_name(name), Some(expected));
         }
         for name in [
-            "", "file/", "file\\", "x", "1x", " 1", "1 ", "0x10", "1_0",
+            "",
+            "file/",
+            "file\\",
+            "x",
+            "1x",
+            " 1",
+            "1 ",
+            "0x10",
+            "1_0",
             "999999999999999999999999999999999999999999",
         ] {
             assert_eq!(chunk_index_from_item_name(name), None, "{name:?}");
@@ -2843,10 +2847,7 @@ mod tests {
             Ordering::Less
         );
         assert_eq!(compare_chunk_item_names("2", "02"), Ordering::Equal);
-        assert_eq!(
-            compare_chunk_item_names("z/0", "a/x"),
-            Ordering::Greater
-        );
+        assert_eq!(compare_chunk_item_names("z/0", "a/x"), Ordering::Greater);
 
         const PERMUTATION: [usize; 12] = [10, 2, 11, 0, 9, 1, 8, 3, 7, 4, 6, 5];
         for prefix in ["", "legacy/", "legacy\\"] {
@@ -2898,7 +2899,15 @@ mod tests {
     #[test]
     fn safe_join_rejects_five_unsafe_classes_and_accepts_basenames() {
         let base = Path::new("base");
-        for name in ["", ".", "..", "dir/file", "dir\\file", "../escape", "..\\escape"] {
+        for name in [
+            "",
+            ".",
+            "..",
+            "dir/file",
+            "dir\\file",
+            "../escape",
+            "..\\escape",
+        ] {
             assert!(matches!(
                 safe_join(base, name),
                 Err(Error::UnsafeItemName { .. })
@@ -2941,10 +2950,7 @@ mod tests {
         #[cfg(windows)]
         {
             assert_eq!(root_item_name(Path::new("C:\\")).unwrap(), ".");
-            assert_eq!(
-                root_item_name(Path::new("\\\\server\\share")).unwrap(),
-                "."
-            );
+            assert_eq!(root_item_name(Path::new("\\\\server\\share")).unwrap(), ".");
             assert_eq!(
                 root_item_name(Path::new("\\\\server\\share\\")).unwrap(),
                 "."
@@ -2963,10 +2969,8 @@ mod tests {
             assert_eq!(format_epoch_seconds_rfc3339_utc(seconds), expected);
         }
         assert_eq!(
-            format_system_time_rfc3339_utc(
-                UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_999),
-            )
-            .unwrap(),
+            format_system_time_rfc3339_utc(UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_999),)
+                .unwrap(),
             "2023-11-14T22:13:20Z"
         );
     }
@@ -2981,11 +2985,7 @@ mod tests {
         let merged = merge_metadata(Some(&base), Some(custom)).unwrap();
         assert_eq!(merged.get("k").map(String::as_str), Some("custom"));
         assert_eq!(merged.get("keep").map(String::as_str), Some("yes"));
-        assert!(ensure_in_memory_limit(
-            "test",
-            MAX_IN_MEMORY_LEAF_BYTES as u64
-        )
-        .is_ok());
+        assert!(ensure_in_memory_limit("test", MAX_IN_MEMORY_LEAF_BYTES as u64).is_ok());
         assert!(matches!(
             ensure_in_memory_limit("test", MAX_IN_MEMORY_LEAF_BYTES as u64 + 1),
             Err(Error::InMemoryLimitExceeded { .. })
@@ -2997,10 +2997,7 @@ mod tests {
         static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _lock = CWD_LOCK.lock().unwrap();
         let original = std::env::current_dir().unwrap();
-        let temp = original.join(format!(
-            "target/dot-root-test-{}",
-            std::process::id()
-        ));
+        let temp = original.join(format!("target/dot-root-test-{}", std::process::id()));
         if temp.exists() {
             fs::remove_dir_all(&temp).unwrap();
         }

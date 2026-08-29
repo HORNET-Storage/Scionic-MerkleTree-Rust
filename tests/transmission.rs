@@ -14,14 +14,8 @@ fn assert_leaf_core_eq(expected: &DagLeaf, actual: &DagLeaf) {
     assert_eq!(actual.leaf_type(), expected.leaf_type());
     assert_eq!(actual.content_hash(), expected.content_hash());
     assert_eq!(actual.content(), expected.content());
-    assert_eq!(
-        actual.classic_merkle_root(),
-        expected.classic_merkle_root()
-    );
-    assert_eq!(
-        actual.current_link_count(),
-        expected.current_link_count()
-    );
+    assert_eq!(actual.classic_merkle_root(), expected.classic_merkle_root());
+    assert_eq!(actual.current_link_count(), expected.current_link_count());
     assert_eq!(actual.leaf_count(), expected.leaf_count());
     assert_eq!(actual.content_size(), expected.content_size());
     assert_eq!(actual.dag_size(), expected.dag_size());
@@ -145,9 +139,7 @@ fn default_disabled_and_size_one_batches_pin_grouping_counters_and_replay() {
     let input = create_fixture(single_small.path(), "single_small_file").unwrap();
     let source = create_dag_with_options(&input, &options_4096()).unwrap();
     let size_one = source
-        .batched_leaf_sequence_with(Batching::ApproximateBytes(
-            NonZeroUsize::new(1).unwrap(),
-        ))
+        .batched_leaf_sequence_with(Batching::ApproximateBytes(NonZeroUsize::new(1).unwrap()))
         .unwrap();
     assert_eq!(size_one.len(), 2);
     assert_eq!(
@@ -219,9 +211,7 @@ fn chunk_content_order_survives_batched_packet_replay() {
         .unwrap();
     let source = create_dag_with_options(&input, &options).unwrap();
     let batches = source
-        .batched_leaf_sequence_with(Batching::ApproximateBytes(
-            NonZeroUsize::new(128).unwrap(),
-        ))
+        .batched_leaf_sequence_with(Batching::ApproximateBytes(NonZeroUsize::new(128).unwrap()))
         .unwrap();
     assert!(batches.len() > 1);
     let reconstructed = replay_batched(&batches);
@@ -254,7 +244,8 @@ fn legacy_batched_cbor_without_counters_defaults_to_zero_and_reencodes_current_s
     );
     let restored = BatchedTransmissionPacket::from_cbor(&legacy).unwrap();
     assert_eq!((restored.packet_index(), restored.total_packets()), (0, 0));
-    let reencoded = scionic_merkletree::encoding::cbor_decode(&restored.to_cbor().unwrap()).unwrap();
+    let reencoded =
+        scionic_merkletree::encoding::cbor_decode(&restored.to_cbor().unwrap()).unwrap();
     let scionic_merkletree::encoding::CborValue::Map(pairs) = reencoded else {
         panic!("restored batch is not a map");
     };
@@ -269,11 +260,7 @@ fn transmission_decoders_reject_outer_alias_coexistence() {
     let source = create_dag_with_options(&input, &options_4096()).unwrap();
     let packet = source.get_leaf_sequence().unwrap().remove(0);
     let json = String::from_utf8(packet.to_json().unwrap()).unwrap();
-    let ambiguous = json.replacen(
-        "\"Leaf\":",
-        "\"leaf\": null,\n  \"Leaf\":",
-        1,
-    );
+    let ambiguous = json.replacen("\"Leaf\":", "\"leaf\": null,\n  \"Leaf\":", 1);
     assert!(matches!(
         TransmissionPacket::from_json(ambiguous.as_bytes()),
         Err(scionic_merkletree::Error::AmbiguousFieldSpellings { .. })

@@ -164,7 +164,11 @@ fn every_fixture_verifies_through_the_store_both_ways() {
         let store = DagStore::from_dag(&dag).unwrap();
         assert_eq!(store.root(), Some(dag.root()));
         assert_eq!(store.leaf_count(), fixture.leaves as u64);
-        assert!(!store.is_partial().unwrap(), "{} is a full DAG", fixture.name);
+        assert!(
+            !store.is_partial().unwrap(),
+            "{} is a full DAG",
+            fixture.name
+        );
         store.verify().unwrap();
         store.verify_streaming().unwrap();
         assert_eq!(store.to_dag().unwrap(), dag, "{}", fixture.name);
@@ -231,7 +235,10 @@ fn verify_streaming_accepts_a_partial_dag_through_stored_proofs() {
         .unwrap()
         .unwrap();
     assert_eq!(stored_root.links().len(), 1);
-    assert_eq!(stored_root.current_link_count(), dag.root_leaf().links().len());
+    assert_eq!(
+        stored_root.current_link_count(),
+        dag.root_leaf().links().len()
+    );
     store.verify_streaming().unwrap();
 }
 
@@ -323,7 +330,12 @@ fn index_orders_parents_before_children_and_survives_the_lifecycle() {
                     fixture.name
                 );
             } else {
-                assert_eq!(cid, dag.root(), "{}: only the root has no parent", fixture.name);
+                assert_eq!(
+                    cid,
+                    dag.root(),
+                    "{}: only the root has no parent",
+                    fixture.name
+                );
             }
             seen.push(cid.clone());
         }
@@ -377,7 +389,10 @@ fn cached_relationships_and_traversal_agree_on_the_index() {
         // is populated exactly the way such a backend would see them.
         let mut relationships: BTreeMap<Cid, Option<Cid>> = BTreeMap::new();
         dag.visit_unique(|leaf, parent| {
-            relationships.insert(leaf.cid().clone(), parent.map(|parent| parent.cid().clone()));
+            relationships.insert(
+                leaf.cid().clone(),
+                parent.map(|parent| parent.cid().clone()),
+            );
             Ok(())
         })
         .unwrap();
@@ -427,7 +442,11 @@ fn iterate_with_index_yields_every_leaf_without_loading_content() {
         .unwrap();
 
     assert_eq!(visited.len(), dag.len());
-    assert_eq!(probe.content_reads(), 0, "index iteration must not load payloads");
+    assert_eq!(
+        probe.content_reads(),
+        0,
+        "index iteration must not load payloads"
+    );
     assert_eq!(
         probe.leaf_reads(),
         0,
@@ -473,7 +492,10 @@ fn update_parent_hashes_streaming_matches_the_index_and_keeps_content() {
 
         let effective = if batch_size == 0 { 10 } else { batch_size };
         let sizes = probe.batch_sizes();
-        assert!(!sizes.is_empty(), "batch {batch_size}: leaves must be written back");
+        assert!(
+            !sizes.is_empty(),
+            "batch {batch_size}: leaves must be written back"
+        );
         assert!(
             sizes.iter().all(|size| *size <= effective),
             "batch {batch_size}: writes must stay bounded, saw {sizes:?}"
@@ -580,7 +602,12 @@ fn batched_packets_rebuild_an_empty_store_and_pass_verify_streaming() {
                     "{}: {cid}",
                     fixture.name
                 );
-                assert_eq!(actual.content(), expected.content(), "{}: {cid}", fixture.name);
+                assert_eq!(
+                    actual.content(),
+                    expected.content(),
+                    "{}: {cid}",
+                    fixture.name
+                );
                 assert_eq!(actual.links(), expected.links(), "{}: {cid}", fixture.name);
             }
         }
@@ -624,7 +651,11 @@ fn batched_finalization_attaches_parent_proofs_for_a_shared_chunk() {
             "only multi-child parents carry proofs"
         );
         for (key, branch) in leaf.proofs() {
-            assert_eq!(branch.child(), key, "every stored proof is bound to its key");
+            assert_eq!(
+                branch.child(),
+                key,
+                "every stored proof is bound to its key"
+            );
         }
     }
     store.verify_streaming().unwrap();
@@ -651,7 +682,8 @@ fn store_rejects_a_packet_whose_declared_parent_does_not_link_it() {
         "the parent CID appears only as ParentHash"
     );
     let forged = TransmissionPacket::from_json(
-        json.replace(real_parent.as_str(), impostor_parent.as_str()).as_bytes(),
+        json.replace(real_parent.as_str(), impostor_parent.as_str())
+            .as_bytes(),
     )
     .unwrap();
 
@@ -780,4 +812,3 @@ fn read_tree(root: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
     }
     files
 }
-

@@ -80,8 +80,9 @@ fn go_json_vectors_decode_and_reemit_byte_for_byte() {
             "{}: decoded Go JSON has the wrong root",
             fixture.name
         );
-        dag.verify()
-            .unwrap_or_else(|error| panic!("{}: decoded Go JSON failed verify: {error}", fixture.name));
+        dag.verify().unwrap_or_else(|error| {
+            panic!("{}: decoded Go JSON failed verify: {error}", fixture.name)
+        });
 
         let reemitted = dag
             .to_json()
@@ -104,9 +105,9 @@ fn go_cbor_vectors_decode_to_the_json_equivalent_dag() {
             "{}: decoded Go CBOR has the wrong root",
             fixture.name
         );
-        from_cbor
-            .verify()
-            .unwrap_or_else(|error| panic!("{}: decoded Go CBOR failed verify: {error}", fixture.name));
+        from_cbor.verify().unwrap_or_else(|error| {
+            panic!("{}: decoded Go CBOR failed verify: {error}", fixture.name)
+        });
 
         let from_json = Dag::from_json(&vector(fixture.name, "json"))
             .unwrap_or_else(|error| panic!("{}: Go JSON failed to decode: {error}", fixture.name));
@@ -192,4 +193,3 @@ fn go_empty_and_absent_wire_states_are_preserved_exactly() {
         "a nil ContentHash must survive as null, never as an empty string"
     );
 }
-

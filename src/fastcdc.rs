@@ -310,8 +310,16 @@ mod tests {
         assert_eq!(FASTCDC_TARGET_SIZE, 2048 * 1024);
         assert_eq!(FASTCDC_MAX_SIZE, 8192 * 1024);
         let all_ones = !0_u64;
-        assert_eq!(FASTCDC_STRICT_MASK, all_ones << 41, "strict mask must be the top 23 bits");
-        assert_eq!(FASTCDC_LOOSE_MASK, all_ones << 45, "loose mask must be the top 19 bits");
+        assert_eq!(
+            FASTCDC_STRICT_MASK,
+            all_ones << 41,
+            "strict mask must be the top 23 bits"
+        );
+        assert_eq!(
+            FASTCDC_LOOSE_MASK,
+            all_ones << 45,
+            "loose mask must be the top 19 bits"
+        );
         assert_eq!(FASTCDC_STRICT_MASK.count_ones(), 23);
         assert_eq!(FASTCDC_LOOSE_MASK.count_ones(), 19);
         assert_eq!(
@@ -337,7 +345,10 @@ mod tests {
                     chunk.len()
                 );
             }
-            assert!(chunk.len() <= FASTCDC_MAX_SIZE, "chunk {index} exceeds the max");
+            assert!(
+                chunk.len() <= FASTCDC_MAX_SIZE,
+                "chunk {index} exceeds the max"
+            );
             total += chunk.len();
         }
         assert_eq!(total, data.len(), "chunks must cover the input exactly");
@@ -361,7 +372,10 @@ mod tests {
             if self.offset >= self.data.len() {
                 return Ok(0);
             }
-            let take = self.step.min(buffer.len()).min(self.data.len() - self.offset);
+            let take = self
+                .step
+                .min(buffer.len())
+                .min(self.data.len() - self.offset);
             buffer[..take].copy_from_slice(&self.data[self.offset..self.offset + take]);
             self.offset += take;
             Ok(take)
@@ -400,7 +414,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-            assert_eq!(streamed, expected, "length {length}: streaming vs slice cutting");
+            assert_eq!(
+                streamed, expected,
+                "length {length}: streaming vs slice cutting"
+            );
         }
     }
 
@@ -421,7 +438,11 @@ mod tests {
         // cut at the max, with the remainder as the tail — pinned by the Go
         // conformance corpus (zeros_20mib: 8 MiB + 8 MiB + 4 MiB).
         let zeros = vec![0_u8; 20 << 20];
-        let cuts: Vec<usize> = Chunking::FastCdcV1.cut(&zeros).iter().map(|c| c.len()).collect();
+        let cuts: Vec<usize> = Chunking::FastCdcV1
+            .cut(&zeros)
+            .iter()
+            .map(|c| c.len())
+            .collect();
         assert_eq!(cuts, [8 << 20, 8 << 20, 4 << 20]);
         let letters = vec![b'a'; 20 << 20];
         let mut total = 0_usize;
@@ -467,7 +488,9 @@ mod tests {
     fn mode_cut_semantics_match_the_go_cutter() {
         let data: Vec<u8> = (0_u8..10).collect();
         assert!(Chunking::Disabled.cut(&[]).is_empty());
-        assert!(Chunking::Fixed(NonZeroUsize::new(4).unwrap()).cut(&[]).is_empty());
+        assert!(Chunking::Fixed(NonZeroUsize::new(4).unwrap())
+            .cut(&[])
+            .is_empty());
         assert_eq!(Chunking::Disabled.cut(&data), vec![&data[..]]);
         assert_eq!(
             Chunking::Fixed(NonZeroUsize::new(4).unwrap()).cut(&data),

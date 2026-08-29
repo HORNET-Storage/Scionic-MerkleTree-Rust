@@ -1,8 +1,8 @@
 mod support;
 
 use scionic_merkletree::{
-    create_dag, create_dag_custom, create_dag_with_options, Dag, DagBuildOptions, Error,
-    LeafType, Metadata, DEFAULT_CHUNK_SIZE, MAX_IN_MEMORY_LEAF_BYTES,
+    create_dag, create_dag_custom, create_dag_with_options, Dag, DagBuildOptions, Error, LeafType,
+    Metadata, DEFAULT_CHUNK_SIZE, MAX_IN_MEMORY_LEAF_BYTES,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -338,7 +338,10 @@ fn timestamp_root_replaces_caller_metadata_once_and_only_on_the_root() {
     assert!(timestamp
         .chars()
         .enumerate()
-        .all(|(index, character)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || character.is_ascii_digit()));
+        .all(
+            |(index, character)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19)
+                || character.is_ascii_digit()
+        ));
     assert!(timestamped
         .leaves()
         .values()
@@ -361,8 +364,8 @@ fn timestamp_root_replaces_caller_metadata_once_and_only_on_the_root() {
 
 #[test]
 fn leaf_processor_runs_once_per_non_root_filesystem_entry_and_never_for_chunks() {
-    use std::path::Path;
     use std::cell::RefCell;
+    use std::path::Path;
     use std::rc::Rc;
 
     let temp = TempDir::new("leaf-processor").unwrap();
@@ -376,14 +379,17 @@ fn leaf_processor_runs_once_per_non_root_filesystem_entry_and_never_for_chunks()
     ));
     let processor_calls = Rc::clone(&calls);
     let processor = move |path: &Path,
-                     relative_path: &str,
-                     entry: &fs::DirEntry,
-                     is_root: bool,
-                     leaf_type: LeafType|
-     -> Option<Metadata> {
+                          relative_path: &str,
+                          entry: &fs::DirEntry,
+                          is_root: bool,
+                          leaf_type: LeafType|
+          -> Option<Metadata> {
         let metadata = entry.metadata().unwrap();
         assert_eq!(entry.file_name().to_str(), Some(relative_path));
-        assert_eq!(path.file_name().and_then(|name| name.to_str()), Some(relative_path));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(relative_path)
+        );
         processor_calls.borrow_mut().push((
             relative_path.to_owned(),
             is_root,
@@ -399,10 +405,7 @@ fn leaf_processor_runs_once_per_non_root_filesystem_entry_and_never_for_chunks()
     let options = DagBuildOptions::default()
         .with_chunk_size(64)
         .unwrap()
-        .with_root_metadata(Metadata::from([(
-            "root-only".to_owned(),
-            "yes".to_owned(),
-        )]));
+        .with_root_metadata(Metadata::from([("root-only".to_owned(), "yes".to_owned())]));
     let dag = create_dag_custom(&root, &options, Some(&processor)).unwrap();
     let recorded = calls.borrow();
     assert_eq!(recorded.len(), 4);
@@ -473,11 +476,7 @@ fn trailing_separator_uses_dot_root_name_without_changing_child_names() {
     fs::create_dir(&root).unwrap();
     write(root.join("child.txt"), b"child").unwrap();
     let ordinary = create_dag(&root).unwrap();
-    let with_separator = format!(
-        "{}{}",
-        root.to_str().unwrap(),
-        std::path::MAIN_SEPARATOR
-    );
+    let with_separator = format!("{}{}", root.to_str().unwrap(), std::path::MAIN_SEPARATOR);
     let trailing = create_dag(&with_separator).unwrap();
     assert_eq!(ordinary.root_leaf().item_name(), "input");
     assert_eq!(trailing.root_leaf().item_name(), ".");
@@ -505,15 +504,11 @@ fn allocation_limits_reject_oversized_chunk_requests_and_sparse_disabled_files()
     let temp = TempDir::new("sparse-over-limit").unwrap();
     let file = temp.path().join("oversized.bin");
     let handle = fs::File::create(&file).unwrap();
-    handle
-        .set_len(MAX_IN_MEMORY_LEAF_BYTES as u64 + 1)
-        .unwrap();
+    handle.set_len(MAX_IN_MEMORY_LEAF_BYTES as u64 + 1).unwrap();
     drop(handle);
-    let error = create_dag_with_options(
-        &file,
-        &DagBuildOptions::default().with_chunking_disabled(),
-    )
-    .unwrap_err();
+    let error =
+        create_dag_with_options(&file, &DagBuildOptions::default().with_chunking_disabled())
+            .unwrap_err();
     assert!(matches!(
         error,
         Error::InMemoryLimitExceeded {

@@ -228,4 +228,3 @@ fn io(path: &Path, error: std::io::Error) -> scionic_merkletree::Error {
         source: error,
     }
 }
-

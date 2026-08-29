@@ -18,15 +18,13 @@ use std::num::NonZeroUsize;
 
 pub const DEFAULT_BATCH_TARGET: usize = 4 * 1024 * 1024;
 
-static PACKET_LEAF: WireKey =
-    WireKey::new("TransmissionPacket.Leaf", "Leaf", &["Leaf", "leaf"]);
+static PACKET_LEAF: WireKey = WireKey::new("TransmissionPacket.Leaf", "Leaf", &["Leaf", "leaf"]);
 static PACKET_PARENT_HASH: WireKey = WireKey::new(
     "TransmissionPacket.ParentHash",
     "ParentHash",
     &["ParentHash", "parentHash"],
 );
-static PACKET_PROOFS: WireKey =
-    WireKey::new("TransmissionPacket.proofs", "proofs", &["proofs"]);
+static PACKET_PROOFS: WireKey = WireKey::new("TransmissionPacket.proofs", "proofs", &["proofs"]);
 static BATCH_LEAVES: WireKey = WireKey::new(
     "BatchedTransmissionPacket.Leaves",
     "Leaves",
@@ -47,8 +45,7 @@ static BATCH_TOTAL_PACKETS: WireKey = WireKey::new(
     "TotalPackets",
     &["TotalPackets", "totalPackets"],
 );
-static PACKET_LEAF_HASH: WireKey =
-    WireKey::new("DagLeaf.Hash", "Hash", &["Hash", "hash"]);
+static PACKET_LEAF_HASH: WireKey = WireKey::new("DagLeaf.Hash", "Hash", &["Hash", "hash"]);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransmissionPacket {
@@ -133,9 +130,7 @@ impl BatchedTransmissionPacket {
     }
 
     pub fn parent_for(&self, child: &Cid) -> Option<Option<&Cid>> {
-        self.relationships
-            .get(child)
-            .map(|parent| parent.as_ref())
+        self.relationships.get(child).map(|parent| parent.as_ref())
     }
 
     pub fn packet_index(&self) -> u64 {
@@ -164,7 +159,10 @@ impl BatchedTransmissionPacket {
     }
 
     pub fn to_cbor(&self) -> Result<Vec<u8>> {
-        Ok(cbor_encode(&batched_packet_wire_value(self, KeyOrder::Cbor)))
+        Ok(cbor_encode(&batched_packet_wire_value(
+            self,
+            KeyOrder::Cbor,
+        )))
     }
 
     pub fn from_cbor(input: &[u8]) -> Result<Self> {
@@ -200,7 +198,12 @@ impl TransmissionReceiver {
     }
 
     pub fn verify_transmission_packet(&self, packet: &TransmissionPacket) -> Result<()> {
-        verify_root_marker(self.root.as_ref(), None, packet.leaf.cid(), packet.is_root())?;
+        verify_root_marker(
+            self.root.as_ref(),
+            None,
+            packet.leaf.cid(),
+            packet.is_root(),
+        )?;
         verify_transmission_packet_against(&self.leaves, packet)
     }
 
@@ -231,6 +234,10 @@ pub struct BatchedDagReceiver {
     root: Option<Cid>,
     expected_root: Option<Cid>,
     leaves: BTreeMap<Cid, DagLeaf>,
+    /// `Some` once a packet has streamed through `apply_and_verify_streaming`:
+    /// the receiver then holds a content-free skeleton, and these are the size
+    /// totals `finish_verified` holds the root to in place of retained payloads.
+    streamed: Option<crate::operations::StreamedSizeTotals>,
 }
 
 impl BatchedDagReceiver {
@@ -243,6 +250,7 @@ impl BatchedDagReceiver {
             root: None,
             expected_root: Some(root),
             leaves: BTreeMap::new(),
+            streamed: None,
         }
     }
 
@@ -260,18 +268,68 @@ impl BatchedDagReceiver {
     }
 
     pub fn apply_packet(&mut self, packet: &BatchedTransmissionPacket) {
+        self.adopt_root(packet);
+        apply_batched_packet_to(&mut self.leaves, packet, false);
+    }
+
+    pub fn apply_and_verify(&mut self, packet: &BatchedTransmissionPacket) -> Result<()> {
+        if self.streamed.is_some() {
+            return Err(Error::Invariant {
+                detail: "a receiver that streams payloads cannot retain later packets",
+            });
+        }
+        self.verify_packet(packet)?;
+        self.apply_packet(packet);
+        Ok(())
+    }
+
+    /// `apply_and_verify` for a receiver that must not hold payloads.
+    ///
+    /// The packet passes exactly the checks `apply_and_verify` runs. Then every
+    /// leaf the receiver has not seen before hands its payload to `sink` and is
+    /// kept without it, so a payload reaches the sink only after its hash
+    /// matched the leaf's content hash and the leaf's place under the declared
+    /// root was proven for this packet. The receiver changes only once every
+    /// delivery succeeded: a failing sink leaves it exactly as it was.
+    /// `finish_verified` still holds the root's signed `ContentSize`/`DagSize`
+    /// to the payloads that streamed through, so a root that lies about its
+    /// sizes is refused whether or not the payloads were retained.
+    pub fn apply_and_verify_streaming<E: From<Error>>(
+        &mut self,
+        packet: &BatchedTransmissionPacket,
+        sink: &mut dyn FnMut(&DagLeaf, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        if self.streamed.is_none() && !self.leaves.is_empty() {
+            return Err(Error::Invariant {
+                detail: "streaming must begin with a receiver's first packet",
+            }
+            .into());
+        }
+        self.verify_packet(packet)?;
+        let mut totals = self.streamed.clone().unwrap_or_default();
+        let mut delivered = BTreeSet::new();
+        for leaf in &packet.leaves {
+            if self.leaves.contains_key(leaf.cid()) || !delivered.insert(leaf.cid().clone()) {
+                continue;
+            }
+            let is_root = packet.relationships.get(leaf.cid()) == Some(&None);
+            totals.record(leaf, is_root)?;
+            if let Some(content) = leaf.content() {
+                sink(leaf, content)?;
+            }
+        }
+        self.adopt_root(packet);
+        apply_batched_packet_to(&mut self.leaves, packet, true);
+        self.streamed = Some(totals);
+        Ok(())
+    }
+
+    fn adopt_root(&mut self, packet: &BatchedTransmissionPacket) {
         for leaf in &packet.leaves {
             if packet.relationships.get(leaf.cid()) == Some(&None) && self.root.is_none() {
                 self.root = Some(leaf.cid().clone());
             }
         }
-        apply_batched_packet_to(&mut self.leaves, packet);
-    }
-
-    pub fn apply_and_verify(&mut self, packet: &BatchedTransmissionPacket) -> Result<()> {
-        self.verify_packet(packet)?;
-        self.apply_packet(packet);
-        Ok(())
     }
 
     pub fn finish_verified(self) -> Result<Dag> {
@@ -288,6 +346,9 @@ impl BatchedDagReceiver {
         };
         let dag = Dag::from_parts(root, self.leaves)?;
         dag.verify()?;
+        if let Some(totals) = &self.streamed {
+            totals.verify(&dag)?;
+        }
         Ok(dag)
     }
 }
@@ -307,11 +368,9 @@ impl Dag {
         let mut queue = VecDeque::from([self.root().clone()]);
 
         while let Some(parent_cid) = queue.pop_front() {
-            let parent = self
-                .get(&parent_cid)
-                .ok_or_else(|| Error::MissingLeaf {
-                    cid: parent_cid.to_string(),
-                })?;
+            let parent = self.get(&parent_cid).ok_or_else(|| Error::MissingLeaf {
+                cid: parent_cid.to_string(),
+            })?;
             let mut children = parent.links().to_vec();
             children.sort_by(|left, right| left.as_str().cmp(right.as_str()));
             for child_cid in children {
@@ -422,11 +481,9 @@ impl Dag {
         let mut proof_cache: HashMap<Cid, BTreeMap<Cid, ClassicTreeBranch>> = HashMap::new();
 
         while let Some(parent_cid) = queue.pop_front() {
-            let parent = self
-                .get(&parent_cid)
-                .ok_or_else(|| Error::MissingLeaf {
-                    cid: parent_cid.to_string(),
-                })?;
+            let parent = self.get(&parent_cid).ok_or_else(|| Error::MissingLeaf {
+                cid: parent_cid.to_string(),
+            })?;
             let mut children = parent.links().to_vec();
             children.sort_by(|left, right| left.as_str().cmp(right.as_str()));
             for child_cid in children {
@@ -503,7 +560,7 @@ impl Dag {
     }
 
     pub fn apply_batched_transmission_packet(&mut self, packet: &BatchedTransmissionPacket) {
-        apply_batched_packet_to(&mut self.leaves, packet);
+        apply_batched_packet_to(&mut self.leaves, packet, false);
     }
 
     pub fn apply_and_verify_batched_transmission_packet(
@@ -575,10 +632,7 @@ impl Dag {
                     let mut proofs = BTreeMap::new();
                     for child in links {
                         let proof = tree.proof_for_key(child.as_str())?.clone();
-                        proofs.insert(
-                            child.clone(),
-                            ClassicTreeBranch::new(child, proof),
-                        );
+                        proofs.insert(child.clone(), ClassicTreeBranch::new(child, proof));
                     }
                     proof_cache.insert(parent_cid.clone(), proofs);
                 }
@@ -603,7 +657,7 @@ fn transmission_proof_for_child(
 fn verify_transmission_packet_against(
     leaves: &BTreeMap<Cid, DagLeaf>,
     packet: &TransmissionPacket,
- ) -> Result<()> {
+) -> Result<()> {
     if packet.is_root() {
         return verify_identity_as(&packet.leaf, IdentityRole::Root);
     }
@@ -622,13 +676,14 @@ fn verify_transmission_packet_against(
         // link; gating on links().len() would skip proof verification entirely for
         // exactly the case where a proof is the only thing binding the child.
         if parent.current_link_count() > 1 {
-            let branch = packet
-                .proofs
-                .get(packet.leaf.cid())
-                .ok_or_else(|| Error::MissingProof {
-                    parent: parent_cid.to_string(),
-                    child: packet.leaf.cid().to_string(),
-                })?;
+            let branch =
+                packet
+                    .proofs
+                    .get(packet.leaf.cid())
+                    .ok_or_else(|| Error::MissingProof {
+                        parent: parent_cid.to_string(),
+                        child: packet.leaf.cid().to_string(),
+                    })?;
             // Bind the branch to this packet's leaf. Looking the proof up by map
             // key is not sufficient, because verify_branch authenticates
             // branch.child(): a branch filed under key C but declaring Leaf = D
@@ -645,10 +700,7 @@ fn verify_transmission_packet_against(
     Ok(())
 }
 
-fn apply_transmission_packet_to(
-    leaves: &mut BTreeMap<Cid, DagLeaf>,
-    packet: TransmissionPacket,
- ) {
+fn apply_transmission_packet_to(leaves: &mut BTreeMap<Cid, DagLeaf>, packet: TransmissionPacket) {
     let child = packet.leaf.cid().clone();
     let parent = packet.parent_hash.clone();
     let proof = packet.proofs.get(&child).cloned();
@@ -668,7 +720,7 @@ fn apply_transmission_packet_to(
 fn verify_batched_packet_against(
     leaves: &BTreeMap<Cid, DagLeaf>,
     packet: &BatchedTransmissionPacket,
- ) -> Result<()> {
+) -> Result<()> {
     let batch_leaves = packet
         .leaves
         .iter()
@@ -676,12 +728,11 @@ fn verify_batched_packet_against(
         .collect::<BTreeMap<_, _>>();
     let mut verified_parents = BTreeSet::new();
     for child in &packet.leaves {
-        let parent = packet
-            .relationships
-            .get(child.cid())
-            .ok_or_else(|| Error::MissingTransmissionRelationship {
+        let parent = packet.relationships.get(child.cid()).ok_or_else(|| {
+            Error::MissingTransmissionRelationship {
                 child: child.cid().to_string(),
-            })?;
+            }
+        })?;
         let Some(parent_cid) = parent else {
             verify_identity_as(child, IdentityRole::Root)?;
             continue;
@@ -739,7 +790,8 @@ fn verify_batched_packet_against(
 fn apply_batched_packet_to(
     leaves: &mut BTreeMap<Cid, DagLeaf>,
     packet: &BatchedTransmissionPacket,
- ) {
+    without_content: bool,
+) {
     for incoming in &packet.leaves {
         let child = incoming.cid().clone();
         if let Some(existing) = leaves.get_mut(&child) {
@@ -751,6 +803,8 @@ fn apply_batched_packet_to(
             for (key, branch) in incoming.proofs() {
                 existing.proofs.insert(key.clone(), branch.clone());
             }
+        } else if without_content {
+            leaves.insert(child.clone(), incoming.without_content());
         } else {
             leaves.insert(child.clone(), incoming.clone());
         }
@@ -776,10 +830,9 @@ pub(crate) fn verify_identity_as(leaf: &DagLeaf, role: IdentityRole) -> Result<(
         .ok_or_else(|| Error::LeafCidMismatch {
             cid: leaf.cid().to_string(),
         })?;
-    let link_count =
-        u64::try_from(leaf.current_link_count()).map_err(|_| Error::SizeOverflow {
-            field: "CurrentLinkCount",
-        })?;
+    let link_count = u64::try_from(leaf.current_link_count()).map_err(|_| Error::SizeOverflow {
+        field: "CurrentLinkCount",
+    })?;
     let identity = match role {
         IdentityRole::Root => encode_root_identity(
             leaf.item_name(),
@@ -807,9 +860,11 @@ pub(crate) fn verify_identity_as(leaf: &DagLeaf, role: IdentityRole) -> Result<(
         });
     }
     if let Some(content) = leaf.content() {
-        let expected = leaf.content_hash().ok_or_else(|| Error::MissingContentHash {
-            cid: leaf.cid().to_string(),
-        })?;
+        let expected = leaf
+            .content_hash()
+            .ok_or_else(|| Error::MissingContentHash {
+                cid: leaf.cid().to_string(),
+            })?;
         if sha256(content) != *expected {
             return Err(Error::ContentHashMismatch {
                 cid: leaf.cid().to_string(),
@@ -837,17 +892,14 @@ pub(crate) fn verify_complete_classic_root(parent: &DagLeaf) -> Result<()> {
 }
 
 pub(crate) fn verify_branch(parent: &DagLeaf, branch: &ClassicTreeBranch) -> Result<()> {
-    let root: &Digest = parent
-        .classic_merkle_root()
-        .try_into()
-        .map_err(|_| Error::ClassicRootMismatch {
-            cid: parent.cid().to_string(),
-        })?;
-    ClassicMerkleTree::verify_against(
-        branch.child().as_str().as_bytes(),
-        branch.proof(),
-        root,
-    )
+    let root: &Digest =
+        parent
+            .classic_merkle_root()
+            .try_into()
+            .map_err(|_| Error::ClassicRootMismatch {
+                cid: parent.cid().to_string(),
+            })?;
+    ClassicMerkleTree::verify_against(branch.child().as_str().as_bytes(), branch.proof(), root)
 }
 
 fn verify_root_marker(
@@ -855,7 +907,7 @@ fn verify_root_marker(
     expected: Option<&Cid>,
     received: &Cid,
     is_root: bool,
- ) -> Result<()> {
+) -> Result<()> {
     if !is_root {
         return Ok(());
     }
@@ -874,7 +926,7 @@ fn verify_batched_root_markers(
     root: Option<&Cid>,
     expected: Option<&Cid>,
     packet: &BatchedTransmissionPacket,
- ) -> Result<()> {
+) -> Result<()> {
     let mut packet_root: Option<&Cid> = None;
     for leaf in &packet.leaves {
         if packet.relationships.get(leaf.cid()) != Some(&None) {
@@ -1046,10 +1098,8 @@ fn batched_packet_from_wire_value(value: &CborValue) -> Result<BatchedTransmissi
             .collect::<Result<Vec<_>>>()?,
         _ => return Err(invalid_data("batched packet Leaves is not an array")),
     };
-    let packet_index =
-        cbor_optional_unsigned(cbor_get(map, &BATCH_PACKET_INDEX)?)?.unwrap_or(0);
-    let total_packets =
-        cbor_optional_unsigned(cbor_get(map, &BATCH_TOTAL_PACKETS)?)?.unwrap_or(0);
+    let packet_index = cbor_optional_unsigned(cbor_get(map, &BATCH_PACKET_INDEX)?)?.unwrap_or(0);
+    let total_packets = cbor_optional_unsigned(cbor_get(map, &BATCH_TOTAL_PACKETS)?)?.unwrap_or(0);
     Ok(BatchedTransmissionPacket {
         leaves,
         relationships,
@@ -1067,9 +1117,7 @@ fn decode_packet_leaf(value: &CborValue) -> Result<DagLeaf> {
     decode_leaf(&hash, value, true)
 }
 
-fn decode_relationships(
-    value: Option<&CborValue>,
- ) -> Result<BTreeMap<Cid, Option<Cid>>> {
+fn decode_relationships(value: Option<&CborValue>) -> Result<BTreeMap<Cid, Option<Cid>>> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -1185,9 +1233,7 @@ fn json_proof_map_to_cbor(value: &JsonValue, field: &'static str) -> Result<Cbor
 fn json_unsigned(value: &JsonValue, field: &'static str) -> Result<CborValue> {
     match value {
         JsonValue::Number(number) => Ok(CborValue::Unsigned(*number)),
-        _ => Err(invalid_json(format!(
-            "{field} is not an unsigned integer"
-        ))),
+        _ => Err(invalid_json(format!("{field} is not an unsigned integer"))),
     }
 }
 
@@ -1206,5 +1252,233 @@ fn invalid_data(detail: impl Into<String>) -> Error {
 fn invalid_json(detail: impl Into<String>) -> Error {
     Error::InvalidJson {
         detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::dag::{DagStats, LeafBuilder, LeafType, Metadata};
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    /// A file DAG assembled in memory with the real builder: one root file
+    /// leaf over `chunks` chunk leaves of 64 bytes, so every CID, proof and
+    /// size total is genuine. `content_lie` and `dag_lie` are added to the
+    /// totals the root signs, to build a root that lies about its sizes.
+    fn chunked_dag(chunks: usize, content_lie: u64, dag_lie: u64) -> Dag {
+        let mut file = LeafBuilder::new("payload.bin", LeafType::File);
+        let mut leaves = BTreeMap::new();
+        let mut content_size = 0_u64;
+        let mut dag_size = 0_u64;
+        for index in 0..chunks {
+            let data = (0..64)
+                .map(|offset| b'A' + ((index * 64 + offset) % 26) as u8)
+                .collect::<Vec<u8>>();
+            let leaf = LeafBuilder::new(index.to_string(), LeafType::Chunk)
+                .with_data(data)
+                .build(None)
+                .unwrap();
+            content_size += 64;
+            dag_size += leaf.storage_size().unwrap();
+            file.add_link(leaf.cid().clone());
+            leaves.insert(leaf.cid().clone(), leaf);
+        }
+        let stats = DagStats::new(
+            chunks as u64,
+            content_size + content_lie,
+            dag_size + dag_lie,
+        );
+        let root = file
+            .build_root_with_stats(stats, Some(&Metadata::new()))
+            .unwrap();
+        let root_cid = root.cid().clone();
+        leaves.insert(root_cid.clone(), root);
+        Dag::from_parts(root_cid, leaves).unwrap()
+    }
+
+    fn packets(dag: &Dag) -> Vec<BatchedTransmissionPacket> {
+        let batches = dag
+            .batched_leaf_sequence_with(Batching::ApproximateBytes(NonZeroUsize::new(160).unwrap()))
+            .unwrap();
+        assert!(batches.len() > 2, "the fixture must span several packets");
+        batches
+    }
+
+    fn retained(packets: &[BatchedTransmissionPacket]) -> Result<Dag> {
+        let mut receiver = BatchedDagReceiver::new();
+        for packet in packets {
+            receiver.apply_and_verify(packet)?;
+        }
+        receiver.finish_verified()
+    }
+
+    fn streamed(packets: &[BatchedTransmissionPacket]) -> Result<(Dag, BTreeMap<Cid, Vec<u8>>)> {
+        let mut receiver = BatchedDagReceiver::new();
+        let mut delivered = BTreeMap::new();
+        for packet in packets {
+            receiver.apply_and_verify_streaming::<Error>(packet, &mut |leaf, bytes| {
+                assert!(
+                    delivered
+                        .insert(leaf.cid().clone(), bytes.to_vec())
+                        .is_none(),
+                    "a payload was delivered twice"
+                );
+                Ok(())
+            })?;
+        }
+        Ok((receiver.finish_verified()?, delivered))
+    }
+
+    /// Receivers attach each packet's transmission proof to the parent leaf
+    /// they verified it against, so a received DAG equals its source only
+    /// once those proofs are set aside.
+    fn without_proofs(dag: &Dag) -> Dag {
+        let leaves = dag
+            .leaves()
+            .iter()
+            .map(|(cid, leaf)| {
+                let mut leaf = leaf.clone();
+                leaf.proofs.clear();
+                (cid.clone(), leaf)
+            })
+            .collect();
+        Dag::from_parts(dag.root().clone(), leaves).unwrap()
+    }
+
+    #[test]
+    fn streaming_a_transfer_yields_the_retained_skeleton_and_every_payload_once() {
+        let source = chunked_dag(10, 0, 0);
+        source.verify().unwrap();
+        let packets = packets(&source);
+        let full = retained(&packets).unwrap();
+        assert_eq!(without_proofs(&full), source);
+
+        let (skeleton, delivered) = streamed(&packets).unwrap();
+        let mut stripped = full.clone();
+        stripped.remove_all_content();
+        assert_eq!(skeleton, stripped);
+        assert!(!skeleton.is_partial());
+        assert!(skeleton
+            .leaves()
+            .values()
+            .all(|leaf| leaf.content().is_none()));
+        assert_eq!(delivered.len(), 10);
+        for (cid, bytes) in &delivered {
+            assert_eq!(source.get(cid).unwrap().content(), Some(bytes.as_slice()));
+        }
+    }
+
+    #[test]
+    fn streaming_refuses_exactly_what_retaining_refuses() {
+        // A root whose signed totals do not match the payloads that streamed.
+        for (content_lie, dag_lie) in [(1, 0), (0, 1)] {
+            let liar = chunked_dag(10, content_lie, dag_lie);
+            let direct = liar.verify().unwrap_err();
+            let packets = packets(&liar);
+            let retained_error = retained(&packets).unwrap_err();
+            let streamed_error = streamed(&packets).unwrap_err();
+            assert_eq!(format!("{retained_error:?}"), format!("{direct:?}"));
+            assert_eq!(format!("{streamed_error:?}"), format!("{retained_error:?}"));
+            if content_lie > 0 {
+                assert!(matches!(streamed_error, Error::ContentSizeMismatch { .. }));
+            } else {
+                assert!(matches!(streamed_error, Error::DagSizeMismatch { .. }));
+            }
+        }
+
+        // A payload that does not hash to its leaf's content hash.
+        let source = chunked_dag(10, 0, 0);
+        let packets = packets(&source);
+        let mut tampered = packets[1].clone();
+        let victim = tampered
+            .leaves
+            .iter_mut()
+            .find(|leaf| leaf.content().is_some())
+            .expect("the second packet carries a payload");
+        victim.content = Some(Arc::new(b"tampered".to_vec()));
+        let mut retaining = BatchedDagReceiver::new();
+        retaining.apply_and_verify(&packets[0]).unwrap();
+        let retained_error = retaining.apply_and_verify(&tampered).unwrap_err();
+        let mut streaming = BatchedDagReceiver::new();
+        streaming
+            .apply_and_verify_streaming::<Error>(&packets[0], &mut |_, _| Ok(()))
+            .unwrap();
+        let before = streaming.clone();
+        let streamed_error = streaming
+            .apply_and_verify_streaming::<Error>(&tampered, &mut |_, _| {
+                panic!("a tampered payload must never reach the sink")
+            })
+            .unwrap_err();
+        assert!(matches!(streamed_error, Error::ContentHashMismatch { .. }));
+        assert_eq!(format!("{streamed_error:?}"), format!("{retained_error:?}"));
+        assert_eq!(streaming, before);
+
+        // A packet whose parent the receiver has not seen.
+        let mut fresh = BatchedDagReceiver::new();
+        let retained_error = fresh.apply_and_verify(&packets[1]).unwrap_err();
+        let mut streaming = BatchedDagReceiver::new();
+        let streamed_error = streaming
+            .apply_and_verify_streaming::<Error>(&packets[1], &mut |_, _| {
+                panic!("an orphan payload must never reach the sink")
+            })
+            .unwrap_err();
+        assert!(matches!(
+            streamed_error,
+            Error::UnavailableTransmissionParent { .. }
+        ));
+        assert_eq!(format!("{streamed_error:?}"), format!("{retained_error:?}"));
+        assert_eq!(streaming, BatchedDagReceiver::new());
+    }
+
+    #[test]
+    fn a_failing_sink_leaves_the_receiver_untouched_and_modes_never_mix() {
+        let source = chunked_dag(10, 0, 0);
+        let packets = packets(&source);
+        let mut receiver = BatchedDagReceiver::new();
+        receiver
+            .apply_and_verify_streaming::<Error>(&packets[0], &mut |_, _| Ok(()))
+            .unwrap();
+        let before = receiver.clone();
+        let error = receiver
+            .apply_and_verify_streaming::<Error>(&packets[1], &mut |_, _| {
+                Err(Error::Invariant {
+                    detail: "sink refused",
+                })
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Invariant {
+                detail: "sink refused"
+            }
+        ));
+        assert_eq!(receiver, before);
+
+        // Retaining after streaming, and streaming after retaining, are both
+        // refused without touching the receiver.
+        assert!(matches!(
+            receiver.apply_and_verify(&packets[1]),
+            Err(Error::Invariant { .. })
+        ));
+        assert_eq!(receiver, before);
+        let mut mixed = BatchedDagReceiver::new();
+        mixed.apply_and_verify(&packets[0]).unwrap();
+        let mixed_before = mixed.clone();
+        assert!(matches!(
+            mixed.apply_and_verify_streaming::<Error>(&packets[1], &mut |_, _| Ok(())),
+            Err(Error::Invariant { .. })
+        ));
+        assert_eq!(mixed, mixed_before);
+
+        // The same packet streams through once the sink accepts it.
+        for packet in &packets[1..] {
+            receiver
+                .apply_and_verify_streaming::<Error>(packet, &mut |_, _| Ok(()))
+                .unwrap();
+        }
+        let skeleton = receiver.finish_verified().unwrap();
+        assert_eq!(skeleton.root(), source.root());
+        assert!(!skeleton.is_partial());
     }
 }

@@ -17,8 +17,8 @@ mod support;
 
 use scionic_merkletree::encoding::{cbor_decode, sha256, CborValue};
 use scionic_merkletree::{
-    create_dag_with_options, Chunking, DagBuildOptions, LeafType, Metadata,
-    CHUNKING_FASTCDC_V1, CHUNKING_TAG_KEY, DEFAULT_CHUNK_SIZE,
+    create_dag_with_options, Chunking, DagBuildOptions, LeafType, Metadata, CHUNKING_FASTCDC_V1,
+    CHUNKING_TAG_KEY, DEFAULT_CHUNK_SIZE,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -178,12 +178,20 @@ fn fastcdc_vector_chunks_match() {
     for case in all {
         let name = text(field(case, "name"));
         let data = materialize(case, all);
-        assert_eq!(data.len(), number(field(case, "length")), "{name}: input length");
+        assert_eq!(
+            data.len(),
+            number(field(case, "length")),
+            "{name}: input length"
+        );
         let chunks = Chunking::FastCdcV1.cut(&data);
-        let expected_boundaries: Vec<usize> =
-            items(field(case, "boundaries")).iter().map(number).collect();
-        let expected_hashes: Vec<&str> =
-            items(field(case, "chunk_sha256")).iter().map(text).collect();
+        let expected_boundaries: Vec<usize> = items(field(case, "boundaries"))
+            .iter()
+            .map(number)
+            .collect();
+        let expected_hashes: Vec<&str> = items(field(case, "chunk_sha256"))
+            .iter()
+            .map(text)
+            .collect();
         let mut end = 0_usize;
         let mut boundaries = Vec::with_capacity(chunks.len());
         let mut hashes = Vec::with_capacity(chunks.len());
@@ -218,8 +226,7 @@ fn fastcdc_vector_edit_reuse_partitions() {
             .iter()
             .map(|chunk| hex_encode(&sha256(chunk)))
             .collect();
-        let expected_reused: Vec<bool> =
-            items(field(case, "reused")).iter().map(boolean).collect();
+        let expected_reused: Vec<bool> = items(field(case, "reused")).iter().map(boolean).collect();
         let edited = materialize(case, all);
         let reused: Vec<bool> = Chunking::FastCdcV1
             .cut(&edited)
@@ -228,7 +235,10 @@ fn fastcdc_vector_edit_reuse_partitions() {
             .collect();
         assert_eq!(reused, expected_reused, "{name}: reused-vs-new partition");
         let fresh = reused.iter().filter(|flag| !**flag).count();
-        assert!(fresh >= 1, "{name}: an edit must produce at least one new chunk");
+        assert!(
+            fresh >= 1,
+            "{name}: an edit must produce at least one new chunk"
+        );
         assert!(
             fresh <= 4,
             "{name}: {fresh} unseen chunks; the delta property regressed"
@@ -260,7 +270,11 @@ fn fastcdc_vector_dag_roots_rebuild() {
             text(field(case, "root_hash")),
             "{name}: root CID"
         );
-        assert_eq!(dag.len(), number(field(case, "leaf_count")), "{name}: leaf count");
+        assert_eq!(
+            dag.len(),
+            number(field(case, "leaf_count")),
+            "{name}: leaf count"
+        );
         let chunk_leaves = dag
             .leaves()
             .values()
@@ -272,13 +286,19 @@ fn fastcdc_vector_dag_roots_rebuild() {
             "{name}: chunk leaves"
         );
         assert_eq!(
-            dag.root_leaf().additional_data().get(CHUNKING_TAG_KEY).map(String::as_str),
+            dag.root_leaf()
+                .additional_data()
+                .get(CHUNKING_TAG_KEY)
+                .map(String::as_str),
             Some(CHUNKING_FASTCDC_V1),
             "{name}: root chunking tag"
         );
         let cut_count = Chunking::FastCdcV1.cut(&data).len();
         if cut_count <= 1 {
-            assert_eq!(chunk_leaves, 0, "{name}: single-chunk files store data on the file leaf");
+            assert_eq!(
+                chunk_leaves, 0,
+                "{name}: single-chunk files store data on the file leaf"
+            );
         }
     }
 }
@@ -331,11 +351,17 @@ fn fastcdc_root_tag_semantics() {
         .additional_data()
         .contains_key(CHUNKING_TAG_KEY));
 
-    let timestamped =
-        create_dag_with_options(&input, &DagBuildOptions::default().with_timestamp_root(true))
-            .unwrap();
+    let timestamped = create_dag_with_options(
+        &input,
+        &DagBuildOptions::default().with_timestamp_root(true),
+    )
+    .unwrap();
     let generated = timestamped.root_leaf().additional_data();
-    assert_eq!(generated.len(), 2, "timestamped fastcdc roots carry exactly timestamp + tag");
+    assert_eq!(
+        generated.len(),
+        2,
+        "timestamped fastcdc roots carry exactly timestamp + tag"
+    );
     assert!(generated.contains_key("timestamp"));
     assert_eq!(
         generated.get(CHUNKING_TAG_KEY).map(String::as_str),

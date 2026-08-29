@@ -124,9 +124,7 @@ fn seven_default_batches_and_size_one_compatibility_match_go_vectors() {
 
     let source = single_small.unwrap();
     let size_one = source
-        .batched_leaf_sequence_with(Batching::ApproximateBytes(
-            NonZeroUsize::new(1).unwrap(),
-        ))
+        .batched_leaf_sequence_with(Batching::ApproximateBytes(NonZeroUsize::new(1).unwrap()))
         .unwrap();
     assert_eq!(size_one.len(), 2);
     for (index, packet) in size_one.iter().enumerate() {
@@ -136,8 +134,7 @@ fn seven_default_batches_and_size_one_compatibility_match_go_vectors() {
             read_vector(format!("{base}.json"))
         );
         assert_eq!(
-            BatchedTransmissionPacket::from_cbor(&read_vector(format!("{base}.cbor")))
-                .unwrap(),
+            BatchedTransmissionPacket::from_cbor(&read_vector(format!("{base}.cbor"))).unwrap(),
             *packet
         );
     }
@@ -191,16 +188,13 @@ fn go_packet_probes_pin_wire_null_empty_omission_and_manifest_policy() {
     assert!(!nil_json.contains("stored_proofs"));
     assert!(!nil_json.contains("\"proofs\""));
 
-    let empty_json = String::from_utf8(read_vector(
-        "probes/transmission-empty-content.json",
-    ))
-    .unwrap();
+    let empty_json =
+        String::from_utf8(read_vector("probes/transmission-empty-content.json")).unwrap();
     assert!(empty_json.contains("\"Content\": \"\""));
 
-    let nil_cbor = scionic_merkletree::encoding::cbor_decode(&read_vector(
-        "probes/transmission-nil.cbor",
-    ))
-    .unwrap();
+    let nil_cbor =
+        scionic_merkletree::encoding::cbor_decode(&read_vector("probes/transmission-nil.cbor"))
+            .unwrap();
     let packet = map(&nil_cbor, "packet");
     let leaf = map(field(packet, "Leaf").unwrap(), "leaf");
     assert_eq!(field(leaf, "ContentHash"), Some(&CborValue::Null));
@@ -209,10 +203,7 @@ fn go_packet_probes_pin_wire_null_empty_omission_and_manifest_policy() {
         field(leaf, "ClassicMerkleRoot"),
         Some(&CborValue::Bytes(Vec::new()))
     );
-    assert_eq!(
-        field(leaf, "Links"),
-        Some(&CborValue::Array(Vec::new()))
-    );
+    assert_eq!(field(leaf, "Links"), Some(&CborValue::Array(Vec::new())));
     assert!(field(leaf, "stored_proofs").is_none());
     assert!(field(packet, "proofs").is_none());
 

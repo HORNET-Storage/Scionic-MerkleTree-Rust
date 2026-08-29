@@ -40,8 +40,7 @@ static LEAF_CONTENT_HASH: WireKey = WireKey::new(
     "ContentHash",
     &["ContentHash", "contentHash"],
 );
-static LEAF_CONTENT: WireKey =
-    WireKey::new("DagLeaf.Content", "Content", &["Content", "content"]);
+static LEAF_CONTENT: WireKey = WireKey::new("DagLeaf.Content", "Content", &["Content", "content"]);
 static LEAF_CLASSIC_ROOT: WireKey = WireKey::new(
     "DagLeaf.ClassicMerkleRoot",
     "ClassicMerkleRoot",
@@ -52,15 +51,17 @@ static LEAF_CURRENT_LINK_COUNT: WireKey = WireKey::new(
     "CurrentLinkCount",
     &["CurrentLinkCount", "currentLinkCount"],
 );
-static LEAF_COUNT: WireKey =
-    WireKey::new("DagLeaf.LeafCount", "LeafCount", &["LeafCount", "leafCount"]);
+static LEAF_COUNT: WireKey = WireKey::new(
+    "DagLeaf.LeafCount",
+    "LeafCount",
+    &["LeafCount", "leafCount"],
+);
 static LEAF_CONTENT_SIZE: WireKey = WireKey::new(
     "DagLeaf.ContentSize",
     "ContentSize",
     &["ContentSize", "contentSize"],
 );
-static LEAF_DAG_SIZE: WireKey =
-    WireKey::new("DagLeaf.DagSize", "DagSize", &["DagSize", "dagSize"]);
+static LEAF_DAG_SIZE: WireKey = WireKey::new("DagLeaf.DagSize", "DagSize", &["DagSize", "dagSize"]);
 static LEAF_LINKS: WireKey = WireKey::new("DagLeaf.Links", "Links", &["Links", "links"]);
 static LEAF_ADDITIONAL_DATA: WireKey = WireKey::new(
     "DagLeaf.AdditionalData",
@@ -72,23 +73,15 @@ static LEAF_STORED_PROOFS: WireKey = WireKey::new(
     "stored_proofs",
     &["stored_proofs", "storedProofs"],
 );
-static BRANCH_LEAF: WireKey = WireKey::new(
-    "ClassicTreeBranch.Leaf",
-    "Leaf",
-    &["Leaf", "leaf"],
-);
-static BRANCH_PROOF: WireKey = WireKey::new(
-    "ClassicTreeBranch.Proof",
-    "Proof",
-    &["Proof", "proof"],
-);
+static BRANCH_LEAF: WireKey = WireKey::new("ClassicTreeBranch.Leaf", "Leaf", &["Leaf", "leaf"]);
+static BRANCH_PROOF: WireKey =
+    WireKey::new("ClassicTreeBranch.Proof", "Proof", &["Proof", "proof"]);
 static PROOF_SIBLINGS: WireKey = WireKey::new(
     "MerkleProof.Siblings",
     "Siblings",
     &["Siblings", "siblings"],
 );
-static PROOF_PATH: WireKey =
-    WireKey::new("MerkleProof.Path", "Path", &["Path", "path"]);
+static PROOF_PATH: WireKey = WireKey::new("MerkleProof.Path", "Path", &["Path", "path"]);
 
 #[cfg(test)]
 static ALL_WIRE_KEYS: [&WireKey; 19] = [
@@ -209,10 +202,7 @@ pub(crate) fn leaf_wire_value(leaf: &DagLeaf, order: KeyOrder) -> CborValue {
             "ContentSize".to_owned(),
             CborValue::Unsigned(leaf.content_size()),
         ),
-        (
-            "DagSize".to_owned(),
-            CborValue::Unsigned(leaf.dag_size()),
-        ),
+        ("DagSize".to_owned(), CborValue::Unsigned(leaf.dag_size())),
         (
             "Links".to_owned(),
             CborValue::Array(
@@ -339,20 +329,18 @@ pub(crate) fn decode_leaf(
         None => None,
     };
     let content = cbor_optional_shared_bytes(cbor_get(map, &LEAF_CONTENT)?)?;
-    let classic_merkle_root = cbor_optional_bytes(cbor_get(map, &LEAF_CLASSIC_ROOT)?)?
-        .map(<[u8]>::to_vec);
+    let classic_merkle_root =
+        cbor_optional_bytes(cbor_get(map, &LEAF_CLASSIC_ROOT)?)?.map(<[u8]>::to_vec);
     let current_link_count = usize::try_from(
         cbor_optional_unsigned(cbor_get(map, &LEAF_CURRENT_LINK_COUNT)?)?.unwrap_or(0),
     )
     .map_err(|_| Error::SizeOverflow {
         field: "CurrentLinkCount",
     })?;
-    let wire_leaf_count =
-        cbor_optional_unsigned(cbor_get(map, &LEAF_COUNT)?)?.unwrap_or(0);
+    let wire_leaf_count = cbor_optional_unsigned(cbor_get(map, &LEAF_COUNT)?)?.unwrap_or(0);
     let wire_content_size =
         cbor_optional_unsigned(cbor_get(map, &LEAF_CONTENT_SIZE)?)?.unwrap_or(0);
-    let wire_dag_size =
-        cbor_optional_unsigned(cbor_get(map, &LEAF_DAG_SIZE)?)?.unwrap_or(0);
+    let wire_dag_size = cbor_optional_unsigned(cbor_get(map, &LEAF_DAG_SIZE)?)?.unwrap_or(0);
     let links = decode_links(cbor_get(map, &LEAF_LINKS)?)?;
     let additional_data = decode_metadata(cbor_get(map, &LEAF_ADDITIONAL_DATA)?)?;
     let proofs = decode_proofs(cbor_get(map, &LEAF_STORED_PROOFS)?, true)?;
@@ -364,8 +352,16 @@ pub(crate) fn decode_leaf(
         content,
         classic_merkle_root,
         current_link_count,
-        if preserve_counters { wire_leaf_count } else { 0 },
-        if preserve_counters { wire_content_size } else { 0 },
+        if preserve_counters {
+            wire_leaf_count
+        } else {
+            0
+        },
+        if preserve_counters {
+            wire_content_size
+        } else {
+            0
+        },
         if preserve_counters { wire_dag_size } else { 0 },
         links,
         additional_data,
@@ -432,10 +428,9 @@ pub(crate) fn decode_proofs(
             None => branch_map,
         };
         let siblings = decode_siblings(cbor_get(proof_map, &PROOF_SIBLINGS)?)?;
-        let path = u32::try_from(
-            cbor_optional_unsigned(cbor_get(proof_map, &PROOF_PATH)?)?.unwrap_or(0),
-        )
-        .map_err(|_| invalid("proof Path exceeds u32"))?;
+        let path =
+            u32::try_from(cbor_optional_unsigned(cbor_get(proof_map, &PROOF_PATH)?)?.unwrap_or(0))
+                .map_err(|_| invalid("proof Path exceeds u32"))?;
         let proof = MerkleProof::from_parts(siblings, path)?;
         proofs.insert(key, ClassicTreeBranch::new(child, proof));
     }
@@ -460,11 +455,9 @@ fn decode_siblings(value: Option<&CborValue>) -> Result<Vec<Digest>> {
 }
 
 fn digest_from_bytes(bytes: &[u8], field: &'static str) -> Result<Digest> {
-    bytes
-        .try_into()
-        .map_err(|_| Error::InvalidData {
-            detail: format!("{field} must contain exactly 32 bytes"),
-        })
+    bytes.try_into().map_err(|_| Error::InvalidData {
+        detail: format!("{field} must contain exactly 32 bytes"),
+    })
 }
 
 pub(crate) fn cbor_map<'a>(
@@ -651,9 +644,7 @@ pub(crate) fn json_leaf_to_cbor(value: &JsonValue) -> Result<CborValue> {
                     .map(|(key, value)| {
                         Ok((
                             key.clone(),
-                            CborValue::Text(
-                                json_string(value, "metadata value")?.to_owned(),
-                            ),
+                            CborValue::Text(json_string(value, "metadata value")?.to_owned()),
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -728,10 +719,7 @@ fn copy_json_text(
                 JsonValue::Null => CborValue::Null,
                 JsonValue::String(text) => CborValue::Text(text.clone()),
                 _ => {
-                    return Err(invalid_json(format!(
-                        "{} is not text",
-                        key.canonical
-                    )));
+                    return Err(invalid_json(format!("{} is not text", key.canonical)));
                 }
             },
         ));
@@ -749,9 +737,7 @@ fn copy_json_bytes(
             key.canonical.to_owned(),
             match value {
                 JsonValue::Null => CborValue::Null,
-                JsonValue::String(text) => {
-                    CborValue::Bytes(base64_standard_decode(text)?)
-                }
+                JsonValue::String(text) => CborValue::Bytes(base64_standard_decode(text)?),
                 _ => {
                     return Err(invalid_json(format!(
                         "{} is not base64 text",
@@ -804,10 +790,7 @@ pub(crate) fn json_get<'a>(
     lookup_unique(object, key)
 }
 
-pub(crate) fn json_string<'a>(
-    value: &'a JsonValue,
-    field: &'static str,
-) -> Result<&'a str> {
+pub(crate) fn json_string<'a>(value: &'a JsonValue, field: &'static str) -> Result<&'a str> {
     match value {
         JsonValue::String(text) => Ok(text),
         _ => Err(invalid_json(format!("{field} is not text"))),
@@ -1033,7 +1016,9 @@ impl<'a> JsonParser<'a> {
         self.expect_byte(b'"')?;
         let mut bytes = Vec::new();
         loop {
-            let byte = self.take().ok_or_else(|| invalid_json("truncated string"))?;
+            let byte = self
+                .take()
+                .ok_or_else(|| invalid_json("truncated string"))?;
             match byte {
                 b'"' => {
                     return String::from_utf8(bytes)
@@ -1070,9 +1055,7 @@ impl<'a> JsonParser<'a> {
                             let character = char::from_u32(scalar)
                                 .ok_or_else(|| invalid_json("invalid Unicode scalar"))?;
                             let mut encoded = [0_u8; 4];
-                            bytes.extend_from_slice(
-                                character.encode_utf8(&mut encoded).as_bytes(),
-                            );
+                            bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
                         }
                         _ => return Err(invalid_json("invalid string escape")),
                     }
@@ -1151,25 +1134,13 @@ mod tests {
     #[test]
     fn every_wire_key_rejects_equal_or_unequal_alias_coexistence_in_both_orders() {
         for key in ALL_WIRE_KEYS {
-            let canonical_cbor = vec![(
-                key.canonical.to_owned(),
-                CborValue::Unsigned(1),
-            )];
-            let alias_cbor = vec![(
-                key.spellings[1].to_owned(),
-                CborValue::Unsigned(2),
-            )];
+            let canonical_cbor = vec![(key.canonical.to_owned(), CborValue::Unsigned(1))];
+            let alias_cbor = vec![(key.spellings[1].to_owned(), CborValue::Unsigned(2))];
             assert!(cbor_get(&canonical_cbor, key).unwrap().is_some());
             assert!(cbor_get(&alias_cbor, key).unwrap().is_some());
 
-            let canonical_json = vec![(
-                key.canonical.to_owned(),
-                JsonValue::Number(1),
-            )];
-            let alias_json = vec![(
-                key.spellings[1].to_owned(),
-                JsonValue::Number(2),
-            )];
+            let canonical_json = vec![(key.canonical.to_owned(), JsonValue::Number(1))];
+            let alias_json = vec![(key.spellings[1].to_owned(), JsonValue::Number(2))];
             assert!(json_get(&canonical_json, key).unwrap().is_some());
             assert!(json_get(&alias_json, key).unwrap().is_some());
 

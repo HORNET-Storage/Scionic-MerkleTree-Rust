@@ -43,7 +43,9 @@ fn batched_receiver_rejects_a_foreign_child_claiming_a_single_link_parent() {
     let foreign = create_dag_with_options(&foreign_input, &options_4096()).unwrap();
 
     // One leaf per packet keeps the forgery to a single relationship edit.
-    let foreign_packets = foreign.batched_leaf_sequence_with(Batching::Disabled).unwrap();
+    let foreign_packets = foreign
+        .batched_leaf_sequence_with(Batching::Disabled)
+        .unwrap();
     let foreign_packet = foreign_packets
         .iter()
         .find(|packet| {
@@ -143,4 +145,3 @@ fn single_packet_decode_rejects_a_proof_filed_under_another_child() {
         "a proof whose declared child differs from its map key must be rejected at decode, got {result:?}"
     );
 }
-

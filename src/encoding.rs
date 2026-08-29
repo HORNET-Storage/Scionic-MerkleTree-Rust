@@ -528,9 +528,13 @@ impl CborReader<'_> {
     }
 
     fn read_byte(&mut self) -> Result<u8> {
-        let byte = self.input.get(self.cursor).copied().ok_or(Error::InvalidCbor {
-            detail: "truncated input",
-        })?;
+        let byte = self
+            .input
+            .get(self.cursor)
+            .copied()
+            .ok_or(Error::InvalidCbor {
+                detail: "truncated input",
+            })?;
         self.cursor += 1;
         Ok(byte)
     }
@@ -660,8 +664,7 @@ pub(crate) fn base32_lower_decode(input: &str) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn base64_standard(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let first = chunk[0];

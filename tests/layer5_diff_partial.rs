@@ -1,8 +1,6 @@
 mod support;
 
-use scionic_merkletree::{
-    create_dag_with_options, diff, diff_from_new_leaves, LeafType,
-};
+use scionic_merkletree::{create_dag_with_options, diff, diff_from_new_leaves, LeafType};
 use support::{create_fixture, options_4096, write, TempDir};
 
 #[test]
