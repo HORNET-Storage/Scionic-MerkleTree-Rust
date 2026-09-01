@@ -100,7 +100,7 @@ fn all_45_single_packets_match_go_json_bytes_and_go_cbor_semantics() {
 }
 
 #[test]
-fn seven_default_batches_and_size_one_compatibility_match_go_vectors() {
+fn seven_default_batches_and_missing_counter_go_zero_values_match_vectors() {
     let temp = TempDir::new("go-batched-packet-vectors").unwrap();
     let mut flat = None;
     let mut single_small = None;
@@ -139,15 +139,15 @@ fn seven_default_batches_and_size_one_compatibility_match_go_vectors() {
         );
     }
 
-    let legacy_json = read_vector("batched/compat/legacy-no-counters.json");
-    let legacy_cbor = read_vector("batched/compat/legacy-no-counters.cbor");
-    let legacy_from_json = BatchedTransmissionPacket::from_json(&legacy_json).unwrap();
-    let legacy_from_cbor = BatchedTransmissionPacket::from_cbor(&legacy_cbor).unwrap();
-    assert_eq!(legacy_from_json, legacy_from_cbor);
+    let missing_json = read_vector("batched/compat/missing-counters-go-zero-value.json");
+    let missing_cbor = read_vector("batched/compat/missing-counters-go-zero-value.cbor");
+    let missing_from_json = BatchedTransmissionPacket::from_json(&missing_json).unwrap();
+    let missing_from_cbor = BatchedTransmissionPacket::from_cbor(&missing_cbor).unwrap();
+    assert_eq!(missing_from_json, missing_from_cbor);
     assert_eq!(
         (
-            legacy_from_json.packet_index(),
-            legacy_from_json.total_packets()
+            missing_from_json.packet_index(),
+            missing_from_json.total_packets()
         ),
         (0, 0)
     );
@@ -158,7 +158,7 @@ fn seven_default_batches_and_size_one_compatibility_match_go_vectors() {
     .unwrap();
     let mut receiver = BatchedDagReceiver::new();
     receiver.apply_and_verify(&first).unwrap();
-    receiver.apply_and_verify(&legacy_from_cbor).unwrap();
+    receiver.apply_and_verify(&missing_from_cbor).unwrap();
     let reconstructed = receiver.finish_verified().unwrap();
     assert_eq!(reconstructed.root(), source.root());
     assert_eq!(reconstructed.len(), source.len());

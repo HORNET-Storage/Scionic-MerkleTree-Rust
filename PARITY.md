@@ -1,11 +1,8 @@
-# Cross-Language Parity: Go, Swift, Rust
+# Rust Scionic format contract and historical cross-language evidence
 
-Three implementations of the Scionic Merkle Tree exist at `v2.4.1`: the
-[Go reference](https://github.com/HORNET-Storage/Scionic-Merkle-Tree), the
-[Swift port](https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift), and this
-Rust crate. They agree on every hashed byte and on every serialized byte.
+The Rust crate is authoritative for the active Scionic Merkle Tree format and security invariants. Earlier Go and Swift implementations and their committed vectors are retained as historical byte evidence; they are not compatibility authorities, rollout dependencies, or grounds for weakening a Rust decoder.
 
-This document is the contract that makes that true, and the evidence that it holds.
+The comparisons below record where the three implementations agreed on hashed and serialized bytes. The Rust rules stated here are the current contract. Historical fixtures remain useful regression evidence only when they satisfy those rules.
 
 ---
 
@@ -37,21 +34,22 @@ ever be unified:
 | CBOR wire map | the five maps in §2.2 | length-first, then bytewise over encoded UTF-8 |
 | JSON wire map | the same five maps | plain bytewise over encoded UTF-8, no length term |
 
-All three agree on uniform-length keys — which is exactly how two of them drifted
+All three historical implementations agree on uniform-length keys — which is exactly how two of them drifted
 apart without any test noticing. The preimage comparator is frozen into every CID
-ever minted; the other two are frozen into deployed peers.
+ever minted; the other two are frozen into the canonical Rust wire format, with
+historical peer bytes retained as evidence.
 
 ---
 
 ## 2. The wire envelope
 
-Three rules define the serialized form. All three ports implement all three.
+Three rules define the serialized form. Rust implements all three; the historical
+ports and their vectors show that the selected bytes were exercised elsewhere.
 
 ### 2.1 Struct fields ride in declaration order
 
-Every serialized type emits its fields in declaration order. This is the shape
-deployed peers produce and expect, and it is pinned against golden bytes captured
-from a real deployed build.
+Every serialized type emits its fields in declaration order. This is the canonical
+Rust shape and is pinned against committed golden bytes captured from historical builds.
 
 | Type | Key order |
 |---|---|
@@ -79,10 +77,10 @@ for text keys. For text keys this reduces exactly to sorting by encoded bytes,
 because the encoded head grows monotonically with length (`0x60+len` below 24,
 `0x78` for 24–255, `0x79` for 256–65535).
 
-*JSON* sorts **plain bytewise, with no length term**. Go reaches JSON through
-`encoding/json`, which sorts map keys with a straight string compare, and Go is
-the reference — so every port must reproduce that rule and not the CBOR one. The
-two agree on every pair of equal-length keys and disagree otherwise:
+*JSON* sorts **plain bytewise, with no length term**. This comparator is frozen in
+the Rust format. Historical Go `encoding/json` output is supporting evidence for
+the selected bytes, not the source of current authority. The two comparators agree
+on every pair of equal-length keys and disagree otherwise:
 
 ```text
 keys: zz-probe (8), aaa-probe (9)
@@ -93,11 +91,11 @@ JSON: aaa-probe, zz-probe
 Section 2.1 is unaffected by the format: struct fields ride in declaration order
 in both. Only these five maps re-sort, and only they switch comparator.
 
-Each language expresses the same scoping differently. Go declares those fields as
-a `sortedMap[T]` type that sorts inside its own `MarshalCBOR`; Swift and Rust
-cannot distinguish a struct from a map at the CBOR layer — both are just maps — so
-they apply `CBOREncoder.sortedWireMap` / `sorted_wire_map`, each taking an
-explicit key-order argument, at exactly those five call sites and nowhere else.
+The historical implementations expressed the same scoping differently. Go declared
+those fields as a `sortedMap[T]` type that sorted inside its own `MarshalCBOR`;
+Swift and Rust treated structs and maps alike at the CBOR layer, so they used
+`CBOREncoder.sortedWireMap` / `sorted_wire_map` with an explicit key-order argument
+at exactly those five call sites and nowhere else.
 
 ### 2.3 Empty proof maps are omitted, not emitted empty
 
@@ -127,7 +125,7 @@ The axis is now pinned three ways:
 |---|---|---|
 | 20-byte CBOR ordering vector | `dag/sortedmap_test.go`, `src/encoding.rs`, `WireMapOrderingTests.swift` | the CBOR comparator alone |
 | Both comparators, side by side | `src/encoding.rs`, `WireMapOrderingTests.swift` | that the two rules produce *different* orders |
-| `json_metadata_probe` corpus case | `spec/vectors`, asserted by all three ports | both comparators, end to end, against committed Go bytes |
+| `json_metadata_probe` corpus case | `spec/vectors`, historically asserted by all three ports | both comparators, end to end, against the committed historical bytes |
 
 The 20-byte vector:
 
@@ -162,7 +160,7 @@ through which the original can be modified would not merely produce wrong data; 
 would silently invalidate identity, surfacing later as a verification failure
 somewhere else entirely.
 
-The three languages reach the same guarantee by different means:
+The following historical comparison shows how each implementation reached the same guarantee:
 
 | | Go | Swift | Rust |
 |---|---|---|---|
@@ -197,34 +195,40 @@ the lock.
 
 ## 4. Standing invariants
 
-Behavioural rules all three ports obey. Each exists because the alternative is
-silently wrong rather than loudly wrong.
+These are canonical Rust behavioral rules. Historical ports matched them, but their
+behavior cannot override a Rust invariant. Each rule exists because the alternative
+is silently wrong rather than loudly wrong.
 
 | Invariant | Why |
 |---|---|
 | A shared leaf resolves to the **lowest** parent CID | A content-identical chunk can hang under several parents. Resolving in map order makes proofs depend on hash-map iteration order, so the same DAG yields different proofs on different runs. Every path derives it through one function. |
 | Links sort lexicographically **only for directory leaves** | File chunk order is reassembly order and must be preserved. |
-| Chunk reassembly orders by **numeric** `ItemName` | Lexical order puts chunk 10 before chunk 2. Legacy path-prefixed names (`file/0`, `file\0`) are accepted with either separator regardless of host, so a Windows-authored DAG reads correctly on Unix. |
+| Chunk reassembly orders by **numeric** `ItemName` | Lexical order puts chunk 10 before chunk 2. Path-prefixed names (`file/0`, `file\0`) are accepted with either separator regardless of host, so a Windows-authored DAG reads correctly on Unix. |
 | Chunk names are bare indices, never joined paths | The chunk `ItemName` is hashed, so joining a platform path separator into it makes every chunked-file CID depend on the OS that built the DAG. |
 | `nil` and empty are distinct | The distinction is hash-visible: a nil `ClassicMerkleRoot` serializes as CBOR `0xf6`, a zero-length one as `0x40`. |
+| Branch proofs are nested exactly once | CBOR and JSON accept `{Leaf, Proof:{Siblings, Path}}` only. Flat `{Leaf, Siblings, Path}` input is rejected, matching both current encoders. |
 | `ParentHash` is context, never evidence | It is not hashed and not serialized, so a peer can claim anything. Verification checks links and Merkle proofs instead. |
 | A separate content store actually separates | The payload belongs in exactly one place; writing it to both stores doubles the footprint and defeats the reason the second store exists. |
-| Verification is chunking-agnostic | No verifier re-chunks content, so trees cut by fastcdc-v1 and by the legacy fixed mode verify identically everywhere. How a tree was cut is recorded by the library, never the caller: fastcdc-v1 roots carry `"chunking": "fastcdc-v1"` in `AdditionalData` (absent ⇒ legacy fixed-2m), stamped after any timestamp replacement. Root metadata is hashed into the root CID, so the stamping order itself is cross-language normative. |
+| Verification is chunking-agnostic | No verifier re-chunks content, so trees cut by fastcdc-v1 and by fixed-size mode verify identically everywhere. How a tree was cut is recorded by the library, never the caller: fastcdc-v1 roots carry `"chunking": "fastcdc-v1"` in `AdditionalData` (absent ⇒ fixed-2m), stamped after any timestamp replacement. Root metadata is hashed into the root CID, so the stamping order itself is cross-language normative. |
 
 ---
 
-## 5. Test suites
+## 5. Test evidence
 
-| Port | Suite | Result | Static analysis |
+Rust gates are the current release evidence. The Go and Swift rows are historical
+snapshots retained to explain the provenance of the shared corpus; they are not
+required current gates.
+
+| Port | Suite | Recorded result | Static analysis |
 |---|---|---|---|
-| Go | `go test -count=1 ./...` | 141 tests across 4 packages | `go vet ./...` clean |
-| Swift | `swift test` | 294 tests, **0 skips** | — |
+| Historical Go | `go test -count=1 ./...` | 141 tests across 4 packages | `go vet ./...` clean |
+| Historical Swift | `swift test` | 294 tests, **0 skips** | — |
 | Rust | `cargo test` | 132 tests | `cargo clippy --all-targets -- -D warnings` clean |
 
 ### 5.1 Shared guards
 
-Each port carries the same guard set, so no single implementation is the only one
-watching a given contract:
+The Rust suite carries every required guard. Historical ports also exercised the
+same guard set, providing independent evidence for the selected bytes:
 
 | Guard | Pins |
 |---|---|
@@ -235,13 +239,13 @@ watching a given contract:
 | Wire map ordering | The 20-byte length-first vector from §2.4, and the two comparators asserted against each other |
 | Mixed-length map keys | The `json_metadata_probe` corpus case from §2.4 — the only vector able to tell the two comparators apart |
 | Batch splitting | At least one corpus case splits across multiple batches, so the splitting path cannot go untested while looking tested |
-| fastcdc-v1 conformance vectors | The frozen content-defined chunking algorithm: 11 cases under `spec/fastcdc-vectors` pin boundary offsets, chunk digests, edit-reuse partitions, rebuilt DAG roots and the root `chunking` tag. Generated by the Go repository's `tools/fastcdcvectors`, committed inputs-free (the corpus regenerates from seeds); asserted by all three ports |
+| fastcdc-v1 conformance vectors | The frozen content-defined chunking algorithm: 11 cases under `spec/fastcdc-vectors` pin boundary offsets, chunk digests, edit-reuse partitions, rebuilt DAG roots, and the root `chunking` tag. The historical Go generator produced the committed input-free seed corpus; Rust asserts it as regression evidence |
 
-The corpus is generated by the Go repository's `tools/specvectors` and committed
-into all three repositories. A missing corpus fails loudly in each; it never
-skips. Regeneration is bit-for-bit reproducible, and the three committed copies
-are identical — 226 files each, compared by digesting every relative path and its
-contents in sorted order.
+The historical corpus was generated by the Go repository's `tools/specvectors` and
+committed into all three repositories. Rust treats its local committed copy as
+regression evidence and fails loudly when it is missing. The recorded generation was
+bit-for-bit reproducible, and the three historical copies contained 226 identical
+files when relative paths and contents were digested in sorted order.
 
 ### 5.2 Guards are mutation-tested
 
@@ -263,7 +267,7 @@ did not.
 
 ---
 
-## 6. Byte-parity evidence
+## 6. Historical byte-parity evidence
 
 | Evidence | Result |
 |---|---|
@@ -273,7 +277,7 @@ did not.
 | CBOR comparison method | byte-for-byte — each port re-encodes the committed corpus to identical bytes |
 | JSON comparison method | byte-for-byte, both directions — JSON→JSON and JSON→CBOR |
 | Committed corpus, three repositories | identical — 226 files each, digested path-and-contents in sorted order |
-| Deployed wire shape | unchanged — pinned against golden bytes from a deployed build |
+| Frozen Rust wire shape | pinned against committed golden bytes from a historical deployed build |
 | fastcdc-v1 vector roots | identical — Rust and Swift each rebuild the committed Go `root_hash` for all 11 conformance cases, boundary offsets and chunk digests included |
 
 The two size rows are the weakest lines in that table and are there for
@@ -285,9 +289,10 @@ byte-for-byte rows are what carry the claim.
 
 ## 7. Performance
 
-Same corpus, same chunk size, all three harnesses run back to back in one session.
-Rust is faster on four workloads, at parity on three, and slower on two. The full
-table, method, and the two remaining gaps are in [`README.md`](README.md).
+The historical performance comparison used the same corpus and chunk size with all
+three harnesses run back to back in one session. Rust was faster on four workloads,
+at parity on three, and slower on two. The recorded table, method, and gaps are in
+[`README.md`](README.md); they are benchmark history, not a compatibility gate.
 
 Only same-session ratios are meaningful: the machine drifts by roughly the
 run-to-run variance (±5%) between sessions.

@@ -224,8 +224,8 @@ fn chunk_content_order_survives_batched_packet_replay() {
 }
 
 #[test]
-fn legacy_batched_cbor_without_counters_defaults_to_zero_and_reencodes_current_shape() {
-    let temp = TempDir::new("legacy-batched-counters").unwrap();
+fn batched_cbor_without_counters_defaults_to_zero_and_reencodes_current_shape() {
+    let temp = TempDir::new("missing-batched-counters").unwrap();
     let input = create_fixture(temp.path(), "single_small_file").unwrap();
     let source = create_dag_with_options(&input, &options_4096()).unwrap();
     let current = source
@@ -239,10 +239,10 @@ fn legacy_batched_cbor_without_counters_defaults_to_zero_and_reencodes_current_s
         panic!("current batch is not a map");
     };
     pairs.retain(|(key, _)| matches!(key.as_str(), "Leaves" | "Relationships"));
-    let legacy = scionic_merkletree::encoding::cbor_encode(
+    let missing_counters = scionic_merkletree::encoding::cbor_encode(
         &scionic_merkletree::encoding::CborValue::Map(pairs),
     );
-    let restored = BatchedTransmissionPacket::from_cbor(&legacy).unwrap();
+    let restored = BatchedTransmissionPacket::from_cbor(&missing_counters).unwrap();
     assert_eq!((restored.packet_index(), restored.total_packets()), (0, 0));
     let reencoded =
         scionic_merkletree::encoding::cbor_decode(&restored.to_cbor().unwrap()).unwrap();

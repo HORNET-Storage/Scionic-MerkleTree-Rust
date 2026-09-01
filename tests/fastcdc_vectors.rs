@@ -305,7 +305,7 @@ fn fastcdc_vector_dag_roots_rebuild() {
 
 /// The root tag contract, mirrored from the Go library: fastcdc roots carry
 /// the tag, the library owns the key (a caller-supplied value is
-/// overwritten), legacy fixed and disabled modes stamp nothing, and the tag
+/// overwritten), fixed and disabled modes stamp nothing, and the tag
 /// survives — and coexists with — timestamp_root's metadata replacement.
 #[test]
 fn fastcdc_root_tag_semantics() {
@@ -340,7 +340,7 @@ fn fastcdc_root_tag_semantics() {
     assert_eq!(
         fixed_dag.root_leaf().additional_data(),
         &Metadata::from([("keep".to_owned(), "x".to_owned())]),
-        "legacy fixed mode must stamp nothing"
+        "fixed mode must stamp nothing"
     );
 
     let disabled_dag =

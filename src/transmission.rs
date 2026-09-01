@@ -229,6 +229,8 @@ impl TransmissionReceiver {
     }
 }
 
+pub type StreamingLeafSink<'a, E> = dyn FnMut(&DagLeaf, &[u8]) -> std::result::Result<(), E> + 'a;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BatchedDagReceiver {
     root: Option<Cid>,
@@ -297,7 +299,7 @@ impl BatchedDagReceiver {
     pub fn apply_and_verify_streaming<E: From<Error>>(
         &mut self,
         packet: &BatchedTransmissionPacket,
-        sink: &mut dyn FnMut(&DagLeaf, &[u8]) -> std::result::Result<(), E>,
+        sink: &mut StreamingLeafSink<'_, E>,
     ) -> std::result::Result<(), E> {
         if self.streamed.is_none() && !self.leaves.is_empty() {
             return Err(Error::Invariant {

@@ -290,8 +290,8 @@ fn disabled_chunking_hashes_an_explicit_empty_buffer() {
 }
 
 #[test]
-fn legacy_fixed_default_chunk_size_is_two_mib_and_streams_a_plus_one_file() {
-    // Pinned to the legacy fixed mode: the DEFAULT chunking is fastcdc-v1
+fn fixed_default_chunk_size_is_two_mib_and_streams_a_plus_one_file() {
+    // Pinned to explicit fixed mode: the DEFAULT chunking is fastcdc-v1
     // now, and this test's link-count assertion is a fixed-mode contract.
     assert_eq!(DEFAULT_CHUNK_SIZE, 2 * 1024 * 1024);
     let temp = TempDir::new("default-chunk-size").unwrap();
@@ -316,7 +316,7 @@ fn timestamp_root_replaces_caller_metadata_once_and_only_on_the_root() {
         ("timestamp".to_owned(), "caller".to_owned()),
         ("keep".to_owned(), "x".to_owned()),
     ]);
-    // Pinned to the legacy fixed mode so the exact-metadata assertions
+    // Pinned to fixed mode so the exact-metadata assertions
     // below stay byte-precise: the fastcdc-v1 default additionally stamps
     // the "chunking" root tag (covered by tests/fastcdc_vectors.rs).
     let enabled_options = DagBuildOptions::default()

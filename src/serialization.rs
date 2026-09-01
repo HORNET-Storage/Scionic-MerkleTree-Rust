@@ -422,11 +422,9 @@ pub(crate) fn decode_proofs(
                 child: child.to_string(),
             });
         }
-        let proof_value = cbor_get(branch_map, &BRANCH_PROOF)?;
-        let proof_map = match proof_value {
-            Some(value) => cbor_map(value, "Proof")?,
-            None => branch_map,
-        };
+        let proof_value = cbor_get(branch_map, &BRANCH_PROOF)?
+            .ok_or_else(|| invalid("stored proof is missing Proof"))?;
+        let proof_map = cbor_map(proof_value, "Proof")?;
         let siblings = decode_siblings(cbor_get(proof_map, &PROOF_SIBLINGS)?)?;
         let path =
             u32::try_from(cbor_optional_unsigned(cbor_get(proof_map, &PROOF_PATH)?)?.unwrap_or(0))
@@ -673,10 +671,9 @@ pub(crate) fn json_leaf_to_cbor(value: &JsonValue) -> Result<CborValue> {
 pub(crate) fn json_proof_to_cbor(value: &JsonValue) -> Result<CborValue> {
     let object = json_object(value, "stored proof")?;
     let child = json_required_string(json_get(object, &BRANCH_LEAF)?, "Leaf")?;
-    let proof_object = match json_get(object, &BRANCH_PROOF)? {
-        Some(value) => json_object(value, "Proof")?,
-        None => object,
-    };
+    let proof_value = json_get(object, &BRANCH_PROOF)?
+        .ok_or_else(|| invalid_json("stored proof is missing Proof"))?;
+    let proof_object = json_object(proof_value, "Proof")?;
     let siblings = match json_get(proof_object, &PROOF_SIBLINGS)? {
         None | Some(JsonValue::Null) => Vec::new(),
         Some(JsonValue::Array(values)) => values
@@ -1183,6 +1180,49 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn flat_cbor_proof_objects_are_rejected() {
+        let child = Cid::from_cbor(b"flat CBOR proof child");
+        for (siblings_key, path_key) in [("Siblings", "Path"), ("siblings", "path")] {
+            let flat = CborValue::Map(vec![(
+                child.to_string(),
+                CborValue::Map(vec![
+                    ("Leaf".to_owned(), CborValue::Text(child.to_string())),
+                    (siblings_key.to_owned(), CborValue::Array(Vec::new())),
+                    (path_key.to_owned(), CborValue::Unsigned(0)),
+                ]),
+            )]);
+            let error = match decode_proofs(Some(&flat), true) {
+                Ok(_) => panic!("flat CBOR proof was accepted"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                Error::InvalidData { detail } if detail == "stored proof is missing Proof"
+            ));
+        }
+    }
+
+    #[test]
+    fn flat_json_proof_objects_are_rejected() {
+        let child = Cid::from_cbor(b"flat JSON proof child");
+        for (siblings_key, path_key) in [("Siblings", "Path"), ("siblings", "path")] {
+            let flat = JsonValue::Object(vec![
+                ("Leaf".to_owned(), JsonValue::String(child.to_string())),
+                (siblings_key.to_owned(), JsonValue::Array(Vec::new())),
+                (path_key.to_owned(), JsonValue::Number(0)),
+            ]);
+            let error = match json_proof_to_cbor(&flat) {
+                Ok(_) => panic!("flat JSON proof was accepted"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                Error::InvalidJson { detail } if detail == "stored proof is missing Proof"
+            ));
         }
     }
 

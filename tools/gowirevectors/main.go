@@ -265,7 +265,7 @@ func main() {
 	manifest.TransmissionPackets += emitTransmissionCase(outDir, partialCase, partial, manifest)
 	manifest.DefaultBatches += emitDefaultBatches(outDir, partialCase, partial, manifest)
 
-	emitCompatibilityVectors(outDir, builtByName["single_small_file"], manifest)
+	emitZeroValueCounterVector(outDir, builtByName["single_small_file"], manifest)
 	emitSerializerProbes(outDir, manifest)
 
 	if manifest.TransmissionPackets != 45 {
@@ -311,7 +311,7 @@ type artifactRecord struct {
 	MapCardinalities map[string]int `json:"map_cardinalities"`
 	MultiEntryMaps  []string       `json:"multi_entry_maps"`
 	Synthetic       bool           `json:"synthetic"`
-	LegacyCounters  bool           `json:"legacy_counters,omitempty"`
+	GoZeroValueCounters bool        `json:"go_zero_value_counters,omitempty"`
 }
 
 type packetManifest struct {
@@ -427,7 +427,7 @@ func emitPartialDag(outDir string, partial *scionic.Dag, manifest *packetManifes
 	})
 }
 
-func emitCompatibilityVectors(outDir string, source *scionic.Dag, manifest *packetManifest) {
+func emitZeroValueCounterVector(outDir string, source *scionic.Dag, manifest *packetManifest) {
 	var batches []*scionic.BatchedTransmissionPacket
 	func() {
 		scionic.SetBatchSize(1)
@@ -435,38 +435,37 @@ func emitCompatibilityVectors(outDir string, source *scionic.Dag, manifest *pack
 		batches = source.GetBatchedLeafSequence()
 	}()
 	if len(batches) != 2 || batches[1].PacketIndex != 1 || batches[1].TotalPackets != 2 {
-		panic("unexpected size-1 compatibility batches")
+		panic("unexpected size-1 batches")
 	}
 	payloads := emitBatchSequence(outDir, filepath.Join("packets", "batched", "size-1", "single_small_file"), "single_small_file", "batched-size-1", source, batches, manifest)
 
 	serial := batches[1].ToSerializable()
-	legacy := struct {
+	missingCounters := struct {
 		Leaves        []*scionic.SerializableDagLeaf
 		Relationships map[string]string
 	}{Leaves: serial.Leaves, Relationships: serial.Relationships}
-	legacyJSON, err := json.MarshalIndent(legacy, "", "  ")
+	missingJSON, err := json.MarshalIndent(missingCounters, "", "  ")
 	must(err)
-	legacyCBOR, err := cbor.Marshal(legacy)
+	missingCBOR, err := cbor.Marshal(missingCounters)
 	must(err)
-	decodedJSON, err := scionic.BatchedTransmissionPacketFromJSON(legacyJSON)
+	decodedJSON, err := scionic.BatchedTransmissionPacketFromJSON(missingJSON)
 	must(err)
-	decodedCBOR, err := scionic.BatchedTransmissionPacketFromCBOR(legacyCBOR)
+	decodedCBOR, err := scionic.BatchedTransmissionPacketFromCBOR(missingCBOR)
 	must(err)
 	if decodedJSON.PacketIndex != 0 || decodedJSON.TotalPackets != 0 || decodedCBOR.PacketIndex != 0 || decodedCBOR.TotalPackets != 0 {
-		panic("legacy counters must decode to zero")
+		panic("missing counters must decode as Go zero values")
 	}
-	assertCounterKeyPresence(payloads[1].json, payloads[1].cbor, legacyJSON, legacyCBOR)
-	base := "packets/batched/compat/legacy-no-counters"
-	writePair(outDir, base, legacyJSON, legacyCBOR)
-	// These bytes are hand-marshalled from an anonymous struct that drops the
-	// counter fields; they are not emitted by the library's own encoder. That is
-	// synthetic provenance no matter how faithfully they mimic an older peer, and
-	// labelling them library output would let a future reader treat a fabricated
-	// shape as evidence of what Go actually produces.
-	record := batchRecord(base, "single_small_file", "batched-legacy-probe", 1, decodedJSON, true, true)
+	assertCounterKeyPresence(payloads[1].json, payloads[1].cbor, missingJSON, missingCBOR)
+	base := "packets/batched/compat/missing-counters-go-zero-value"
+	writePair(outDir, base, missingJSON, missingCBOR)
+	// These bytes are hand-marshalled from an anonymous struct that omits the
+	// counter fields; they are not emitted by the library's encoder. The
+	// synthetic vector proves Go zero-value decoding without claiming that a
+	// historical deployed peer emitted this shape.
+	record := batchRecord(base, "single_small_file", "batched-go-zero-value-probe", 1, decodedJSON, true, true)
 	manifest.Artifacts = append(manifest.Artifacts, record)
 
-	mixedJSON := []encodedPair{payloads[0], {json: legacyJSON, cbor: legacyCBOR}}
+	mixedJSON := []encodedPair{payloads[0], {json: missingJSON, cbor: missingCBOR}}
 	replayBatches(source, mixedJSON, true)
 	replayBatches(source, mixedJSON, false)
 }
@@ -579,22 +578,22 @@ func replayBatches(source *scionic.Dag, payloads []encodedPair, useJSON bool) {
 	}
 }
 
-func assertCounterKeyPresence(currentJSON, currentCBOR, legacyJSON, legacyCBOR []byte) {
+func assertCounterKeyPresence(currentJSON, currentCBOR, missingJSON, missingCBOR []byte) {
 	var currentJSONMap map[string]json.RawMessage
-	var legacyJSONMap map[string]json.RawMessage
+	var missingJSONMap map[string]json.RawMessage
 	must(json.Unmarshal(currentJSON, &currentJSONMap))
-	must(json.Unmarshal(legacyJSON, &legacyJSONMap))
-	if currentJSONMap["PacketIndex"] == nil || currentJSONMap["TotalPackets"] == nil || legacyJSONMap["PacketIndex"] != nil || legacyJSONMap["TotalPackets"] != nil {
+	must(json.Unmarshal(missingJSON, &missingJSONMap))
+	if currentJSONMap["PacketIndex"] == nil || currentJSONMap["TotalPackets"] == nil || missingJSONMap["PacketIndex"] != nil || missingJSONMap["TotalPackets"] != nil {
 		panic("JSON counter key presence mismatch")
 	}
 	var currentCBORMap map[string]any
-	var legacyCBORMap map[string]any
+	var missingCBORMap map[string]any
 	must(cbor.Unmarshal(currentCBOR, &currentCBORMap))
-	must(cbor.Unmarshal(legacyCBOR, &legacyCBORMap))
+	must(cbor.Unmarshal(missingCBOR, &missingCBORMap))
 	if _, ok := currentCBORMap["PacketIndex"]; !ok { panic("current CBOR missing PacketIndex") }
 	if _, ok := currentCBORMap["TotalPackets"]; !ok { panic("current CBOR missing TotalPackets") }
-	if _, ok := legacyCBORMap["PacketIndex"]; ok { panic("legacy CBOR has PacketIndex") }
-	if _, ok := legacyCBORMap["TotalPackets"]; ok { panic("legacy CBOR has TotalPackets") }
+	if _, ok := missingCBORMap["PacketIndex"]; ok { panic("zero-value CBOR has PacketIndex") }
+	if _, ok := missingCBORMap["TotalPackets"]; ok { panic("zero-value CBOR has TotalPackets") }
 }
 
 func packetRecord(base, caseName, kind string, index int, packet *scionic.TransmissionPacket, synthetic bool) artifactRecord {
@@ -613,7 +612,7 @@ func packetRecord(base, caseName, kind string, index int, packet *scionic.Transm
 	}
 }
 
-func batchRecord(base, caseName, kind string, index int, packet *scionic.BatchedTransmissionPacket, synthetic, legacy bool) artifactRecord {
+func batchRecord(base, caseName, kind string, index int, packet *scionic.BatchedTransmissionPacket, synthetic, goZeroValueCounters bool) artifactRecord {
 	serial := packet.ToSerializable()
 	cardinalities := map[string]int{"Relationships": len(serial.Relationships)}
 	leafHashes := make([]string, len(serial.Leaves))
@@ -626,7 +625,7 @@ func batchRecord(base, caseName, kind string, index int, packet *scionic.Batched
 		BasePath: base, Case: caseName, Kind: kind, Index: index, LeafHashes: leafHashes,
 		Relationships: serial.Relationships, PacketIndex: packet.PacketIndex, TotalPackets: packet.TotalPackets,
 		JSONCompare: "bytes", CBORCompare: "decoded", MapCardinalities: cardinalities,
-		MultiEntryMaps: multiEntryMapNames(cardinalities), Synthetic: synthetic, LegacyCounters: legacy,
+		MultiEntryMaps: multiEntryMapNames(cardinalities), Synthetic: synthetic, GoZeroValueCounters: goZeroValueCounters,
 	}
 }
 

@@ -1,10 +1,10 @@
 //! fastcdc-v1 — content-defined chunking (FastCDC, Xia et al. 2016), the
-//! DEFAULT chunking mode for all new trees. Normative spec: the Go repo's
-//! `docs/fastcdc-v1.md`; this file is a line-for-line port of its
-//! `dag/fastcdc.go` and must stay bit-identical to it.
+//! DEFAULT chunking mode for all new trees. The normative specification is
+//! this repository's `docs/fastcdc-v1.md`; this implementation and the
+//! committed conformance vectors define its frozen byte contract.
 //!
 //! Fixed-size chunking ([`Chunking::Fixed`] / [`Chunking::Disabled`]) remains
-//! available as the legacy mode; the committed spec-vector corpus and older
+//! available as an explicit current mode; the committed spec-vector corpus and
 //! callers pin it explicitly. Verification is chunking-agnostic — no verifier
 //! re-chunks — so trees cut by either mode verify identically everywhere.
 //!
@@ -29,7 +29,7 @@ pub const FASTCDC_MIN_SIZE: usize = 512 * 1024;
 
 /// Normalization switch: the strict mask judges positions before it, the
 /// loose mask after it, squeezing the chunk-size distribution toward the
-/// target. It matches the legacy fixed default (`DEFAULT_CHUNK_SIZE`), so
+/// target. It matches the fixed-mode default (`DEFAULT_CHUNK_SIZE`), so
 /// leaf counts and stats stay in the same ballpark across the mode change.
 pub const FASTCDC_TARGET_SIZE: usize = 2048 * 1024;
 
@@ -71,11 +71,9 @@ pub const CHUNKING_FIXED_2M: &str = "fixed-2m";
 // A forced-cut chunk must always fit the crate's in-memory leaf budget.
 const _: () = assert!(FASTCDC_MAX_SIZE <= MAX_IN_MEMORY_LEAF_BYTES);
 
-/// The frozen fastcdc-v1 gear table, derived from
-/// [`FASTCDC_GEAR_SEED_PREFIX`] exactly as the Go repo's
-/// `tools/geargen` derives its `fastcdc_gear.go`. Committed as literals so
-/// the runtime needs no hashing; the seed-derivation unit test is the
-/// regeneration check.
+/// The frozen fastcdc-v1 gear table, derived exactly from
+/// [`FASTCDC_GEAR_SEED_PREFIX`]. It is committed as literals so the runtime
+/// needs no hashing; the seed-derivation unit test is the regeneration check.
 #[rustfmt::skip]
 pub(crate) static FASTCDC_GEAR: [u64; 256] = [
     0x947e4e1b8bedab5d, 0xd7d7f340329c706e, 0x24b4933c9d4b8dbc, 0x55c3cff8b195ba49,
@@ -182,10 +180,9 @@ impl Chunking {
     /// empty vector.
     ///
     /// This is the public cutter for producers that hold content in memory:
-    /// cutting through the library is what keeps every producer slicing
-    /// identical content into identical chunks — per-workload chunking
-    /// would silently break cross-context dedup. It mirrors the Go repo's
-    /// mode-aware `dag.CutChunks`.
+    /// cutting through the library keeps every producer slicing identical
+    /// content into identical chunks. Per-workload chunking would silently
+    /// break cross-context dedup.
     pub fn cut(self, data: &[u8]) -> Vec<&[u8]> {
         if data.is_empty() {
             return Vec::new();
@@ -435,8 +432,8 @@ mod tests {
     #[test]
     fn constant_bytes_stay_bounded() {
         // 20 MiB of zeros never matches either mask: every chunk is a forced
-        // cut at the max, with the remainder as the tail — pinned by the Go
-        // conformance corpus (zeros_20mib: 8 MiB + 8 MiB + 4 MiB).
+        // cut at the max, with the remainder as the tail. The committed
+        // conformance corpus pins zeros_20mib as 8 MiB + 8 MiB + 4 MiB.
         let zeros = vec![0_u8; 20 << 20];
         let cuts: Vec<usize> = Chunking::FastCdcV1
             .cut(&zeros)

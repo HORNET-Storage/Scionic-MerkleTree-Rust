@@ -15,9 +15,9 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Legacy fixed-mode chunk size (2 MiB). New trees default to fastcdc-v1
+/// Fixed-mode chunk size (2 MiB). New trees default to fastcdc-v1
 /// content-defined chunking ([`Chunking::FastCdcV1`]), which targets this
-/// same size per chunk; `with_chunk_size` selects the legacy fixed mode.
+/// same size per chunk; `with_chunk_size` selects explicit fixed mode.
 pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 pub const MAX_IN_MEMORY_LEAF_BYTES: usize = 64 * 1024 * 1024;
 pub type Metadata = BTreeMap<String, String>;
@@ -32,10 +32,9 @@ pub struct Cid {
     ///
     /// A CID is copied constantly -- as a map key, a link, a queue entry, a
     /// visited-set member -- and `DagLeaf::clone` clones a whole `Vec<Cid>` of
-    /// links, so a 73-chunk file leaf used to cost 73 string allocations per
-    /// clone. Go's `string` is immutable and shares its backing array, making
-    /// the same copy free; `Arc<str>` is the equivalent, and the text is
-    /// derived from `bytes` so it is immutable by construction.
+    /// links. Sharing the immutable text through `Arc<str>` keeps those copies
+    /// allocation-free. The text is derived from `bytes`, so it is immutable by
+    /// construction.
     text: Arc<str>,
     bytes: [u8; 36],
 }
@@ -170,13 +169,11 @@ impl DagStats {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Chunking {
-    /// fastcdc-v1 content-defined chunking (the Go repo's normative
-    /// `docs/fastcdc-v1.md`): 512 KiB min / 2 MiB target / 8 MiB max,
-    /// gear-hash boundaries. The DEFAULT for new trees; roots built under
-    /// it carry the `"chunking": "fastcdc-v1"` tag in their additional
-    /// data.
+    /// fastcdc-v1 content-defined chunking: 512 KiB minimum, 2 MiB target,
+    /// 8 MiB maximum, with gear-hash boundaries. This is the default for new
+    /// trees; roots carry the `"chunking": "fastcdc-v1"` tag in additional data.
     FastCdcV1,
-    /// Legacy fixed-size slabs (the pre-fastcdc default cut 2 MiB slabs).
+    /// Explicit fixed-size slabs (2 MiB when `DEFAULT_CHUNK_SIZE` is selected).
     Fixed(NonZeroUsize),
     /// One whole-file leaf regardless of size (bounded by the in-memory
     /// limit).
@@ -228,8 +225,7 @@ impl DagBuildOptions {
         self
     }
 
-    /// Restore the default content-defined chunking (fastcdc-v1) — the
-    /// mirror of the Go library's `SetDefaultChunkSize`.
+    /// Restore the default fastcdc-v1 content-defined chunking.
     pub fn with_fastcdc(mut self) -> Self {
         self.chunking = Chunking::FastCdcV1;
         self
@@ -358,38 +354,22 @@ impl ClassicTreeBranch {
 #[derive(Clone, Debug)]
 pub struct DagLeaf {
     pub(crate) cid: Cid,
-    /// The leaf's name, shared rather than owned.
+    /// The leaf's immutable name, shared rather than owned.
     ///
-    /// For the same reason `content` and `Cid::text` are shared: a chunk leaf's
-    /// other fields are all empty (no links, no proofs, no metadata), so this
-    /// `String` was the single heap allocation every `DagLeaf::clone` paid.
-    /// Measured on a 141-leaf DAG, cloning leaves cost 20.3 us of a 102 us
-    /// batched-sequence run -- a fifth of the whole workload -- and Go pays none
-    /// of it because its `Clone()` copies an immutable string header.
-    ///
-    /// Sharing is safe because a leaf's name is immutable: the CID commits to
-    /// `ItemName` through the identity CBOR, so mutating it in place would
-    /// invalidate the leaf's identity. `Arc<str>` hands out no `&mut`, and the
-    /// name is only ever replaced wholesale when a new leaf is built.
+    /// A chunk leaf's other fields are empty, so allocating a fresh `String`
+    /// for every `DagLeaf::clone` is needless overhead. `Arc<str>` keeps clones
+    /// allocation-free. The CID commits to `ItemName`, so the name can only be
+    /// replaced wholesale when a new leaf is built.
     pub(crate) item_name: Arc<str>,
     pub(crate) leaf_type: LeafType,
     pub(crate) content_hash: Option<Digest>,
-    /// The leaf payload, shared rather than owned.
+    /// The immutable leaf payload, shared rather than owned.
     ///
-    /// `DagLeaf` is cloned constantly -- every transmission packet, every store
-    /// read, every batch -- and with a plain `Vec<u8>` each of those clones
-    /// memcpy'd the whole payload. Measured on a 20 MiB corpus that single copy
-    /// was the entire gap against Go: strip content and Rust's leaf sequence
-    /// already beat Go's, so the deficit was memory traffic, not algorithms.
-    ///
-    /// Sharing is safe here because leaf content is immutable: a leaf's CID
-    /// commits to `sha256(content)`, so mutating the bytes in place would
-    /// invalidate its identity. Nothing mutates through this handle -- the
-    /// payload is only ever replaced wholesale (`content = None`, or a fresh
-    /// `Arc` from a content store), which repoints the handle instead of
-    /// writing through it. That is the same discipline Go's `Clone()` documents
-    /// for its shared `Content` slice, except Rust enforces it: `Arc<Vec<u8>>`
-    /// hands out no `&mut` while a second owner exists.
+    /// `DagLeaf` is cloned for transmission packets, store reads, and batches.
+    /// Keeping content behind `Arc<Vec<u8>>` avoids copying the full payload on
+    /// each clone. The CID commits to `sha256(content)`, and payload replacement
+    /// repoints the handle instead of writing through it; shared owners receive no
+    /// mutable access.
     pub(crate) content: Option<Arc<Vec<u8>>>,
     pub(crate) classic_merkle_root: Option<Vec<u8>>,
     pub(crate) current_link_count: usize,
@@ -401,13 +381,10 @@ pub struct DagLeaf {
     pub(crate) proofs: BTreeMap<Cid, ClassicTreeBranch>,
     /// Which parent this leaf was reached through.
     ///
-    /// Derived context, never identity. It is absent from the identity CBOR,
-    /// from the storage projection, and from the wire shape, exactly as Go keeps
-    /// `DagLeaf.ParentHash` out of `SerializableDagLeaf`. A content-identical
-    /// chunk can hang under several parents at once, so this records only the one
-    /// a given reconstruction attributed it to -- always the lowest parent CID --
-    /// and carries no authority: verification must never trust it in place of a
-    /// real link or proof.
+    /// Derived context, never identity. It is absent from identity CBOR, the
+    /// storage projection, and the wire shape. A content-identical chunk can
+    /// appear under several parents, so reconstruction records only the lowest
+    /// parent CID. Authorization and verification must use real links or proofs.
     pub(crate) parent_hash: Option<Cid>,
 }
 
@@ -497,7 +474,9 @@ impl DagLeaf {
         self.classic_merkle_root.as_deref().unwrap_or_default()
     }
 
-    pub(crate) fn classic_merkle_root_wire(&self) -> Option<&[u8]> {
+    /// Return the exact optional wire value. Unlike `classic_merkle_root`, this
+    /// preserves the distinction between an absent CBOR value and empty bytes.
+    pub fn classic_merkle_root_wire(&self) -> Option<&[u8]> {
         self.classic_merkle_root.as_deref()
     }
 
@@ -564,7 +543,7 @@ impl DagLeaf {
 
     /// Returns the encoded length of the leaf's storage/accounting projection.
     ///
-    /// This projection is used only for Go-compatible `DagSize` accounting and is
+    /// This projection is used only for canonical `DagSize` accounting and is
     /// intentionally distinct from the JSON/CBOR wire representation.
     pub fn storage_size(&self) -> Result<u64> {
         storage_shape_len(self)
@@ -644,13 +623,12 @@ impl DagLeaf {
         }
     }
 
-    /// The parent this leaf was reached through, when a reconstruction recorded
-    /// one. Absent on freshly built leaves, matching Go, where only
-    /// `FromSerializable` and `UpdateParentHashesStreaming` populate it.
+    /// The parent this leaf was reached through, when reconstruction recorded
+    /// one. Freshly built leaves leave it absent; decoding and streaming
+    /// reconstruction populate it.
     ///
-    /// This is context, not evidence. It is never hashed and never serialized, so
-    /// a peer can claim anything it likes here; check links and Merkle proofs
-    /// instead when deciding whether an edge is real.
+    /// This is context, not evidence. It is never hashed or serialized, so
+    /// authorization must check links and Merkle proofs instead.
     pub fn parent_hash(&self) -> Option<&Cid> {
         self.parent_hash.as_ref()
     }
@@ -978,11 +956,9 @@ impl Dag {
             labels: Labels::new(),
         };
         // A DAG assembled from parts -- decoded, received, or diff-applied --
-        // derives each leaf's parent, the way Go's FromSerializable does.
-        // minimum_parent_index resolves a shared chunk's several parents to the
-        // lowest parent CID, so decoding the same bytes twice attributes the same
-        // parent to every leaf. Resolving in map order instead is precisely the
-        // nondeterminism that made Go's verification fail about one run in thirty.
+        // derives each leaf's parent. `minimum_parent_index` resolves a shared
+        // chunk's several parents to the lowest parent CID, so decoding identical
+        // bytes always attributes the same parent instead of depending on map order.
         let parents = dag.build_parent_index();
         for (cid, parent) in parents {
             if let Some(leaf) = dag.leaves.get_mut(&cid) {
@@ -1233,12 +1209,11 @@ where
         options.root_metadata().clone()
     };
     // The library owns the chunking tag: a root cut with fastcdc-v1 records
-    // it in its additional data (overwriting any caller-supplied value),
-    // because a tag that does not reflect how the tree was actually cut
-    // breaks delta tooling. Legacy fixed/disabled modes stamp nothing
-    // (absent tag ⇒ fixed-2m). Stamped AFTER the timestamp replacement
-    // above, matching the Go library's order exactly — root metadata is
-    // hashed into the root CID, so the order is cross-language normative.
+    // it in additional data, replacing any caller-supplied value, because the
+    // tag must reflect how the tree was actually cut. Fixed and disabled modes
+    // stamp nothing (an absent tag means fixed-2m). Stamp it after timestamp
+    // replacement; root metadata is hashed into the root CID, so this order is
+    // part of the Rust format contract.
     if options.chunking() == Chunking::FastCdcV1 {
         effective_root_metadata.insert(CHUNKING_TAG_KEY.to_owned(), CHUNKING_FASTCDC_V1.to_owned());
     }
@@ -2271,11 +2246,9 @@ mod tests {
 
     /// Cloning a leaf must share its payload rather than copy it.
     ///
-    /// This is the change that closed the benchmark gap against Go:
-    /// `batched_sequence` went from 24.9x slower to 2x and `leaf_sequence` from
-    /// 1.79x to parity, purely by not memcpy'ing content on every clone. A deep
-    /// copy would still pass every correctness test in this crate while quietly
-    /// undoing that, so the sharing itself is pinned rather than assumed.
+    /// Sharing removed the full-payload memcpy from every clone. A deep copy
+    /// would still pass correctness tests while silently restoring that cost,
+    /// so the allocation-sharing invariant is pinned directly.
     #[test]
     fn cloning_a_leaf_shares_its_payload_instead_of_copying_it() {
         let leaf = LeafBuilder::new("0", LeafType::Chunk)
@@ -2288,8 +2261,7 @@ mod tests {
         let copied = copy.content_arc().expect("a clone keeps its payload");
         assert!(
             Arc::ptr_eq(&original, &copied),
-            "a clone must share the payload; deep-copying here is exactly what made \
-             batched_sequence 24.9x slower than Go"
+            "a clone must share the payload instead of deep-copying it"
         );
 
         // Sharing is only sound because nothing can write through the handle, so
@@ -2301,11 +2273,9 @@ mod tests {
 
     /// Stripping content from a copy of a DAG must not strip the original.
     ///
-    /// With payloads shared between a DAG and its clone, this is the operation
-    /// that would corrupt the source if it ever wrote through the shared buffer
-    /// instead of repointing each leaf's handle. Go documents the same hazard for
-    /// its aliased `Content` slice; here the type system forbids the bad version,
-    /// and this test proves the good one is what actually ships.
+    /// With payloads shared between a DAG and its clone, this operation would
+    /// corrupt the source if it wrote through the shared buffer. The type system
+    /// forbids that mutation, and this test pins the shipped behavior.
     #[test]
     fn removing_content_from_a_cloned_dag_leaves_the_source_intact() {
         let graph = shared_graph();
@@ -2850,7 +2820,7 @@ mod tests {
         assert_eq!(compare_chunk_item_names("z/0", "a/x"), Ordering::Greater);
 
         const PERMUTATION: [usize; 12] = [10, 2, 11, 0, 9, 1, 8, 3, 7, 4, 6, 5];
-        for prefix in ["", "legacy/", "legacy\\"] {
+        for prefix in ["", "nested/", "nested\\"] {
             let chunks: Vec<DagLeaf> = (0..12)
                 .map(|index| {
                     LeafBuilder::new(format!("{prefix}{index}"), LeafType::Chunk)

@@ -1343,9 +1343,9 @@
       "synthetic": false
     },
     {
-      "base_path": "packets/batched/compat/legacy-no-counters",
+      "base_path": "packets/batched/compat/missing-counters-go-zero-value",
       "case": "single_small_file",
-      "kind": "batched-legacy-probe",
+      "kind": "batched-go-zero-value-probe",
       "index": 1,
       "leaf_hashes": [
         "bafireihbiqi52zqwzotl5inpq2lmhduvurg7x2jmcejht2kedqijyorari"
@@ -1364,7 +1364,7 @@
       },
       "multi_entry_maps": [],
       "synthetic": true,
-      "legacy_counters": true
+      "go_zero_value_counters": true
     },
     {
       "base_path": "packets/probes/transmission-nil",
