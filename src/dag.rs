@@ -1612,20 +1612,20 @@ fn root_item_name(path: &Path) -> Result<String> {
     let raw = path.to_str().ok_or_else(|| Error::NonUtf8FileName {
         path: path.to_path_buf(),
     })?;
-    let parent = go_dir(raw);
-    go_rel(&parent, raw).ok_or(Error::Invariant {
+    let parent = lexical_dir(raw);
+    lexical_rel(&parent, raw).ok_or(Error::Invariant {
         detail: "root path cannot be made relative to its lexical parent",
     })
 }
 
-fn go_dir(path: &str) -> String {
-    let volume_len = go_volume_name_len(path);
+fn lexical_dir(path: &str) -> String {
+    let volume_len = volume_name_len(path);
     let bytes = path.as_bytes();
     let mut end = bytes.len();
-    while end > volume_len && !is_go_separator(bytes[end - 1]) {
+    while end > volume_len && !is_path_separator(bytes[end - 1]) {
         end -= 1;
     }
-    let cleaned = go_clean(&path[..end]);
+    let cleaned = lexical_clean(&path[..end]);
     if cleaned == "." && volume_len > 2 {
         path[..volume_len].to_owned()
     } else {
@@ -1633,17 +1633,17 @@ fn go_dir(path: &str) -> String {
     }
 }
 
-fn go_clean(path: &str) -> String {
-    let volume_len = go_volume_name_len(path);
+fn lexical_clean(path: &str) -> String {
+    let volume_len = volume_name_len(path);
     let volume = &path[..volume_len];
     let remainder = &path[volume_len..];
     let rooted = remainder
         .as_bytes()
         .first()
-        .is_some_and(|byte| is_go_separator(*byte))
+        .is_some_and(|byte| is_path_separator(*byte))
         || cfg!(windows) && volume_len > 2;
     let mut components = Vec::<&str>::new();
-    for component in remainder.split(is_go_separator_char) {
+    for component in remainder.split(is_path_separator_char) {
         match component {
             "" | "." => {}
             ".." => {
@@ -1677,7 +1677,7 @@ fn go_clean(path: &str) -> String {
         && !output
             .as_bytes()
             .last()
-            .is_some_and(|byte| is_go_separator(*byte))
+            .is_some_and(|byte| is_path_separator(*byte))
     {
         output.push(separator);
     }
@@ -1702,17 +1702,17 @@ fn go_clean(path: &str) -> String {
     output
 }
 
-fn go_rel(base_path: &str, target_path: &str) -> Option<String> {
-    let base = go_clean(base_path);
-    let target = go_clean(target_path);
-    if go_same_word(&base, &target) {
+fn lexical_rel(base_path: &str, target_path: &str) -> Option<String> {
+    let base = lexical_clean(base_path);
+    let target = lexical_clean(target_path);
+    if same_path_word(&base, &target) {
         return Some(".".to_owned());
     }
-    let base_volume_len = go_volume_name_len(&base);
-    let target_volume_len = go_volume_name_len(&target);
+    let base_volume_len = volume_name_len(&base);
+    let target_volume_len = volume_name_len(&target);
     let base_volume = &base[..base_volume_len];
     let target_volume = &target[..target_volume_len];
-    if !go_same_word(base_volume, target_volume) {
+    if !same_path_word(base_volume, target_volume) {
         return None;
     }
     let mut base_remainder = &base[base_volume_len..];
@@ -1723,32 +1723,32 @@ fn go_rel(base_path: &str, target_path: &str) -> Option<String> {
     let base_rooted = base_remainder
         .as_bytes()
         .first()
-        .is_some_and(|byte| is_go_separator(*byte))
+        .is_some_and(|byte| is_path_separator(*byte))
         || cfg!(windows) && base_volume_len > 2;
     let target_rooted = target_remainder
         .as_bytes()
         .first()
-        .is_some_and(|byte| is_go_separator(*byte))
+        .is_some_and(|byte| is_path_separator(*byte))
         || cfg!(windows) && target_volume_len > 2;
     if base_rooted != target_rooted {
         return None;
     }
-    base_remainder = base_remainder.trim_start_matches(is_go_separator_char);
-    target_remainder = target_remainder.trim_start_matches(is_go_separator_char);
+    base_remainder = base_remainder.trim_start_matches(is_path_separator_char);
+    target_remainder = target_remainder.trim_start_matches(is_path_separator_char);
     let base_components: Vec<&str> = if base_remainder.is_empty() {
         Vec::new()
     } else {
-        base_remainder.split(is_go_separator_char).collect()
+        base_remainder.split(is_path_separator_char).collect()
     };
     let target_components: Vec<&str> = if target_remainder.is_empty() {
         Vec::new()
     } else {
-        target_remainder.split(is_go_separator_char).collect()
+        target_remainder.split(is_path_separator_char).collect()
     };
     let mut common = 0;
     while common < base_components.len()
         && common < target_components.len()
-        && go_same_word(base_components[common], target_components[common])
+        && same_path_word(base_components[common], target_components[common])
     {
         common += 1;
     }
@@ -1765,15 +1765,15 @@ fn go_rel(base_path: &str, target_path: &str) -> Option<String> {
     }
 }
 
-fn is_go_separator(byte: u8) -> bool {
+fn is_path_separator(byte: u8) -> bool {
     byte == b'/' || cfg!(windows) && byte == b'\\'
 }
 
-fn is_go_separator_char(character: char) -> bool {
+fn is_path_separator_char(character: char) -> bool {
     character == '/' || cfg!(windows) && character == '\\'
 }
 
-fn go_same_word(left: &str, right: &str) -> bool {
+fn same_path_word(left: &str, right: &str) -> bool {
     if cfg!(windows) {
         left.eq_ignore_ascii_case(right)
     } else {
@@ -1782,22 +1782,22 @@ fn go_same_word(left: &str, right: &str) -> bool {
 }
 
 #[cfg(not(windows))]
-fn go_volume_name_len(_path: &str) -> usize {
+fn volume_name_len(_path: &str) -> usize {
     0
 }
 
 #[cfg(windows)]
-fn go_volume_name_len(path: &str) -> usize {
+fn volume_name_len(path: &str) -> usize {
     let bytes = path.as_bytes();
     if bytes.len() >= 2 && bytes[1] == b':' {
         return 2;
     }
-    if bytes.len() < 2 || !is_go_separator(bytes[0]) || !is_go_separator(bytes[1]) {
+    if bytes.len() < 2 || !is_path_separator(bytes[0]) || !is_path_separator(bytes[1]) {
         return 0;
     }
     let mut cursor = 2;
     let server_start = cursor;
-    while cursor < bytes.len() && !is_go_separator(bytes[cursor]) {
+    while cursor < bytes.len() && !is_path_separator(bytes[cursor]) {
         cursor += 1;
     }
     if cursor == server_start || cursor == bytes.len() {
@@ -1805,7 +1805,7 @@ fn go_volume_name_len(path: &str) -> usize {
     }
     cursor += 1;
     let share_start = cursor;
-    while cursor < bytes.len() && !is_go_separator(bytes[cursor]) {
+    while cursor < bytes.len() && !is_path_separator(bytes[cursor]) {
         cursor += 1;
     }
     if cursor == share_start {
@@ -2895,7 +2895,7 @@ mod tests {
     }
 
     #[test]
-    fn root_item_name_matches_go_dir_then_rel_rules() {
+    fn root_item_name_matches_canonical_lexical_path_rules() {
         let separator = std::path::MAIN_SEPARATOR;
         assert_eq!(root_item_name(Path::new("name")).unwrap(), "name");
         assert_eq!(root_item_name(Path::new(".")).unwrap(), ".");
@@ -2929,7 +2929,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_formatter_is_go_rfc3339_utc_to_whole_seconds() {
+    fn timestamp_formatter_is_rfc3339_utc_to_whole_seconds() {
         for (seconds, expected) in [
             (0, "1970-01-01T00:00:00Z"),
             (951_782_400, "2000-02-29T00:00:00Z"),

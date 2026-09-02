@@ -8,111 +8,70 @@ use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+const MAX_JSON_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_JSON_NESTING_DEPTH: usize = 32;
+const MAX_JSON_COLLECTION_ITEMS: usize = 65_536;
+const MAX_JSON_NODES: usize = 131_072;
+
 #[derive(Clone, Copy)]
 pub(crate) struct WireKey {
-    pub(crate) field: &'static str,
     pub(crate) canonical: &'static str,
-    pub(crate) spellings: &'static [&'static str],
 }
 
 impl WireKey {
-    pub(crate) const fn new(
-        field: &'static str,
-        canonical: &'static str,
-        spellings: &'static [&'static str],
-    ) -> Self {
-        Self {
-            field,
-            canonical,
-            spellings,
-        }
+    pub(crate) const fn new(canonical: &'static str) -> Self {
+        Self { canonical }
     }
 }
 
-static DAG_ROOT: WireKey = WireKey::new("DAG.Root", "Root", &["Root", "root"]);
-static DAG_LEAFS: WireKey = WireKey::new("DAG.Leafs", "Leafs", &["Leafs", "leafs"]);
-static LEAF_HASH: WireKey = WireKey::new("DagLeaf.Hash", "Hash", &["Hash", "hash"]);
-static LEAF_ITEM_NAME: WireKey =
-    WireKey::new("DagLeaf.ItemName", "ItemName", &["ItemName", "itemName"]);
-static LEAF_TYPE: WireKey = WireKey::new("DagLeaf.Type", "Type", &["Type", "type"]);
-static LEAF_CONTENT_HASH: WireKey = WireKey::new(
-    "DagLeaf.ContentHash",
-    "ContentHash",
-    &["ContentHash", "contentHash"],
-);
-static LEAF_CONTENT: WireKey = WireKey::new("DagLeaf.Content", "Content", &["Content", "content"]);
-static LEAF_CLASSIC_ROOT: WireKey = WireKey::new(
-    "DagLeaf.ClassicMerkleRoot",
-    "ClassicMerkleRoot",
-    &["ClassicMerkleRoot", "classicMerkleRoot"],
-);
-static LEAF_CURRENT_LINK_COUNT: WireKey = WireKey::new(
-    "DagLeaf.CurrentLinkCount",
-    "CurrentLinkCount",
-    &["CurrentLinkCount", "currentLinkCount"],
-);
-static LEAF_COUNT: WireKey = WireKey::new(
-    "DagLeaf.LeafCount",
-    "LeafCount",
-    &["LeafCount", "leafCount"],
-);
-static LEAF_CONTENT_SIZE: WireKey = WireKey::new(
-    "DagLeaf.ContentSize",
-    "ContentSize",
-    &["ContentSize", "contentSize"],
-);
-static LEAF_DAG_SIZE: WireKey = WireKey::new("DagLeaf.DagSize", "DagSize", &["DagSize", "dagSize"]);
-static LEAF_LINKS: WireKey = WireKey::new("DagLeaf.Links", "Links", &["Links", "links"]);
-static LEAF_ADDITIONAL_DATA: WireKey = WireKey::new(
-    "DagLeaf.AdditionalData",
-    "AdditionalData",
-    &["AdditionalData", "additionalData"],
-);
-static LEAF_STORED_PROOFS: WireKey = WireKey::new(
-    "DagLeaf.stored_proofs",
-    "stored_proofs",
-    &["stored_proofs", "storedProofs"],
-);
-static BRANCH_LEAF: WireKey = WireKey::new("ClassicTreeBranch.Leaf", "Leaf", &["Leaf", "leaf"]);
-static BRANCH_PROOF: WireKey =
-    WireKey::new("ClassicTreeBranch.Proof", "Proof", &["Proof", "proof"]);
-static PROOF_SIBLINGS: WireKey = WireKey::new(
-    "MerkleProof.Siblings",
-    "Siblings",
-    &["Siblings", "siblings"],
-);
-static PROOF_PATH: WireKey = WireKey::new("MerkleProof.Path", "Path", &["Path", "path"]);
+static DAG_ROOT: WireKey = WireKey::new("Root");
+static DAG_LEAFS: WireKey = WireKey::new("Leafs");
+static LEAF_HASH: WireKey = WireKey::new("Hash");
+static LEAF_ITEM_NAME: WireKey = WireKey::new("ItemName");
+static LEAF_TYPE: WireKey = WireKey::new("Type");
+static LEAF_CONTENT_HASH: WireKey = WireKey::new("ContentHash");
+static LEAF_CONTENT: WireKey = WireKey::new("Content");
+static LEAF_CLASSIC_ROOT: WireKey = WireKey::new("ClassicMerkleRoot");
+static LEAF_CURRENT_LINK_COUNT: WireKey = WireKey::new("CurrentLinkCount");
+static LEAF_COUNT: WireKey = WireKey::new("LeafCount");
+static LEAF_CONTENT_SIZE: WireKey = WireKey::new("ContentSize");
+static LEAF_DAG_SIZE: WireKey = WireKey::new("DagSize");
+static LEAF_LINKS: WireKey = WireKey::new("Links");
+static LEAF_ADDITIONAL_DATA: WireKey = WireKey::new("AdditionalData");
+static LEAF_STORED_PROOFS: WireKey = WireKey::new("stored_proofs");
+static BRANCH_LEAF: WireKey = WireKey::new("Leaf");
+static BRANCH_PROOF: WireKey = WireKey::new("Proof");
+static PROOF_SIBLINGS: WireKey = WireKey::new("Siblings");
+static PROOF_PATH: WireKey = WireKey::new("Path");
 
 #[cfg(test)]
-static ALL_WIRE_KEYS: [&WireKey; 19] = [
-    &DAG_ROOT,
-    &DAG_LEAFS,
-    &LEAF_HASH,
-    &LEAF_ITEM_NAME,
-    &LEAF_TYPE,
-    &LEAF_CONTENT_HASH,
-    &LEAF_CONTENT,
-    &LEAF_CLASSIC_ROOT,
-    &LEAF_CURRENT_LINK_COUNT,
-    &LEAF_COUNT,
-    &LEAF_CONTENT_SIZE,
-    &LEAF_DAG_SIZE,
-    &LEAF_LINKS,
-    &LEAF_ADDITIONAL_DATA,
-    &LEAF_STORED_PROOFS,
-    &BRANCH_LEAF,
-    &BRANCH_PROOF,
-    &PROOF_SIBLINGS,
-    &PROOF_PATH,
+static HISTORICAL_WIRE_ALIASES: [(&WireKey, &str); 19] = [
+    (&DAG_ROOT, "root"),
+    (&DAG_LEAFS, "leafs"),
+    (&LEAF_HASH, "hash"),
+    (&LEAF_ITEM_NAME, "itemName"),
+    (&LEAF_TYPE, "type"),
+    (&LEAF_CONTENT_HASH, "contentHash"),
+    (&LEAF_CONTENT, "content"),
+    (&LEAF_CLASSIC_ROOT, "classicMerkleRoot"),
+    (&LEAF_CURRENT_LINK_COUNT, "currentLinkCount"),
+    (&LEAF_COUNT, "leafCount"),
+    (&LEAF_CONTENT_SIZE, "contentSize"),
+    (&LEAF_DAG_SIZE, "dagSize"),
+    (&LEAF_LINKS, "links"),
+    (&LEAF_ADDITIONAL_DATA, "additionalData"),
+    (&LEAF_STORED_PROOFS, "storedProofs"),
+    (&BRANCH_LEAF, "leaf"),
+    (&BRANCH_PROOF, "proof"),
+    (&PROOF_SIBLINGS, "siblings"),
+    (&PROOF_PATH, "path"),
 ];
 
 impl Dag {
     pub fn to_json(&self) -> Result<Vec<u8>> {
-        // JSON is not CBOR with different punctuation. Go reaches it through
-        // encoding/json, which sorts map keys bytewise with no length term, so
-        // the dynamic maps have to be rebuilt under KeyOrder::Json instead of
-        // reusing the CBOR-ordered tree. Everything else about the two trees --
-        // key names, struct field order, which values are null -- is identical.
+        // JSON and CBOR use distinct canonical key comparators, so dynamic maps
+        // must be rebuilt under KeyOrder::Json. Field names, field order, and
+        // nullability remain identical across the two canonical encodings.
         let mut output = String::new();
         write_json(&dag_wire_value(self, KeyOrder::Json), &mut output, 0)?;
         Ok(output.into_bytes())
@@ -159,8 +118,8 @@ fn dag_wire_value(dag: &Dag, order: KeyOrder) -> CborValue {
         .collect();
     CborValue::Map(vec![
         ("Root".to_owned(), CborValue::Text(dag.root().to_string())),
-        // Leafs is a genuine dynamic map (Go: SerializableDag.Leafs), so it
-        // sorts. The two pairs around it are struct fields and must not.
+        // `Leafs` is a genuine dynamic map and therefore sorts. The surrounding
+        // pairs are struct-shaped fields and retain declaration order.
         ("Leafs".to_owned(), sorted_wire_map(leaves, order)),
     ])
 }
@@ -275,15 +234,15 @@ fn optional_bytes(value: Option<&[u8]>) -> CborValue {
 
 /// Wire form of an optional shared payload.
 ///
-/// `None` and `Some(empty)` stay distinct -- the first encodes as CBOR null and
-/// the second as a zero-length byte string -- because that distinction is
-/// hash-visible and Go draws it too.
+/// `None` and `Some(empty)` stay distinct: the first encodes as CBOR null and
+/// the second as a zero-length byte string because that distinction is hash-visible.
 fn optional_shared_bytes(value: Option<Arc<Vec<u8>>>) -> CborValue {
     value.map_or(CborValue::Null, CborValue::SharedBytes)
 }
 
 fn dag_from_wire_value(value: &CborValue) -> Result<Dag> {
     let map = cbor_map(value, "DAG")?;
+    ensure_cbor_fields(map, &[&DAG_ROOT, &DAG_LEAFS], &[], "DAG")?;
     let root_text = cbor_required_text(cbor_get(map, &DAG_ROOT)?, "Root")?;
     let root = Cid::parse(root_text)?;
     let leaf_map = cbor_map(
@@ -311,6 +270,25 @@ pub(crate) fn decode_leaf(
     preserve_counters: bool,
 ) -> Result<DagLeaf> {
     let map = cbor_map(value, "leaf")?;
+    ensure_cbor_fields(
+        map,
+        &[
+            &LEAF_HASH,
+            &LEAF_ITEM_NAME,
+            &LEAF_TYPE,
+            &LEAF_CONTENT_HASH,
+            &LEAF_CONTENT,
+            &LEAF_CLASSIC_ROOT,
+            &LEAF_CURRENT_LINK_COUNT,
+            &LEAF_COUNT,
+            &LEAF_CONTENT_SIZE,
+            &LEAF_DAG_SIZE,
+            &LEAF_LINKS,
+            &LEAF_ADDITIONAL_DATA,
+        ],
+        &[&LEAF_STORED_PROOFS],
+        "leaf",
+    )?;
     let hash = Cid::parse(cbor_required_text(cbor_get(map, &LEAF_HASH)?, "Hash")?)?;
     if &hash != key {
         return Err(Error::CidKeyMismatch {
@@ -318,12 +296,8 @@ pub(crate) fn decode_leaf(
             cid: hash.to_string(),
         });
     }
-    let item_name = cbor_optional_text(cbor_get(map, &LEAF_ITEM_NAME)?)?
-        .unwrap_or_default()
-        .to_owned();
-    let leaf_type = cbor_optional_text(cbor_get(map, &LEAF_TYPE)?)?
-        .unwrap_or("file")
-        .parse()?;
+    let item_name = cbor_required_text(cbor_get(map, &LEAF_ITEM_NAME)?, "ItemName")?.to_owned();
+    let leaf_type = cbor_required_text(cbor_get(map, &LEAF_TYPE)?, "Type")?.parse()?;
     let content_hash = match cbor_optional_bytes(cbor_get(map, &LEAF_CONTENT_HASH)?)? {
         Some(bytes) => Some(digest_from_bytes(bytes, "ContentHash")?),
         None => None,
@@ -331,16 +305,21 @@ pub(crate) fn decode_leaf(
     let content = cbor_optional_shared_bytes(cbor_get(map, &LEAF_CONTENT)?)?;
     let classic_merkle_root =
         cbor_optional_bytes(cbor_get(map, &LEAF_CLASSIC_ROOT)?)?.map(<[u8]>::to_vec);
-    let current_link_count = usize::try_from(
-        cbor_optional_unsigned(cbor_get(map, &LEAF_CURRENT_LINK_COUNT)?)?.unwrap_or(0),
-    )
+    let current_link_count = usize::try_from(cbor_required_unsigned(
+        cbor_get(map, &LEAF_CURRENT_LINK_COUNT)?,
+        "CurrentLinkCount",
+    )?)
     .map_err(|_| Error::SizeOverflow {
         field: "CurrentLinkCount",
     })?;
-    let wire_leaf_count = cbor_optional_unsigned(cbor_get(map, &LEAF_COUNT)?)?.unwrap_or(0);
+    let wire_leaf_count = cbor_required_unsigned(cbor_get(map, &LEAF_COUNT)?, "LeafCount")?;
     let wire_content_size =
-        cbor_optional_unsigned(cbor_get(map, &LEAF_CONTENT_SIZE)?)?.unwrap_or(0);
-    let wire_dag_size = cbor_optional_unsigned(cbor_get(map, &LEAF_DAG_SIZE)?)?.unwrap_or(0);
+        cbor_required_unsigned(cbor_get(map, &LEAF_CONTENT_SIZE)?, "ContentSize")?;
+    let wire_dag_size = cbor_required_unsigned(cbor_get(map, &LEAF_DAG_SIZE)?, "DagSize")?;
+    if !preserve_counters && (wire_leaf_count != 0 || wire_content_size != 0 || wire_dag_size != 0)
+    {
+        return Err(invalid("non-root leaf counters must be zero"));
+    }
     let links = decode_links(cbor_get(map, &LEAF_LINKS)?)?;
     let additional_data = decode_metadata(cbor_get(map, &LEAF_ADDITIONAL_DATA)?)?;
     let proofs = decode_proofs(cbor_get(map, &LEAF_STORED_PROOFS)?, true)?;
@@ -370,12 +349,7 @@ pub(crate) fn decode_leaf(
 }
 
 fn decode_links(value: Option<&CborValue>) -> Result<Vec<Cid>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    if matches!(value, CborValue::Null) {
-        return Ok(Vec::new());
-    }
+    let value = value.ok_or_else(|| invalid("missing Links"))?;
     let CborValue::Array(values) = value else {
         return Err(invalid("Links is not an array"));
     };
@@ -386,12 +360,7 @@ fn decode_links(value: Option<&CborValue>) -> Result<Vec<Cid>> {
 }
 
 fn decode_metadata(value: Option<&CborValue>) -> Result<Metadata> {
-    let Some(value) = value else {
-        return Ok(Metadata::new());
-    };
-    if matches!(value, CborValue::Null) {
-        return Ok(Metadata::new());
-    }
+    let value = value.ok_or_else(|| invalid("missing AdditionalData"))?;
     cbor_map(value, "AdditionalData")?
         .iter()
         .map(|(key, value)| Ok((key.clone(), cbor_text(value, "metadata value")?.to_owned())))
@@ -405,13 +374,16 @@ pub(crate) fn decode_proofs(
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
-    if matches!(value, CborValue::Null) {
-        return Ok(BTreeMap::new());
-    }
     let mut proofs = BTreeMap::new();
     for (key_text, branch_value) in cbor_map(value, "stored_proofs")? {
         let key = Cid::parse(key_text)?;
         let branch_map = cbor_map(branch_value, "stored proof")?;
+        ensure_cbor_fields(
+            branch_map,
+            &[&BRANCH_LEAF, &BRANCH_PROOF],
+            &[],
+            "stored proof",
+        )?;
         let child = Cid::parse(cbor_required_text(
             cbor_get(branch_map, &BRANCH_LEAF)?,
             "stored proof Leaf",
@@ -425,10 +397,13 @@ pub(crate) fn decode_proofs(
         let proof_value = cbor_get(branch_map, &BRANCH_PROOF)?
             .ok_or_else(|| invalid("stored proof is missing Proof"))?;
         let proof_map = cbor_map(proof_value, "Proof")?;
+        ensure_cbor_fields(proof_map, &[&PROOF_SIBLINGS, &PROOF_PATH], &[], "Proof")?;
         let siblings = decode_siblings(cbor_get(proof_map, &PROOF_SIBLINGS)?)?;
-        let path =
-            u32::try_from(cbor_optional_unsigned(cbor_get(proof_map, &PROOF_PATH)?)?.unwrap_or(0))
-                .map_err(|_| invalid("proof Path exceeds u32"))?;
+        let path = u32::try_from(cbor_required_unsigned(
+            cbor_get(proof_map, &PROOF_PATH)?,
+            "proof Path",
+        )?)
+        .map_err(|_| invalid("proof Path exceeds u32"))?;
         let proof = MerkleProof::from_parts(siblings, path)?;
         proofs.insert(key, ClassicTreeBranch::new(child, proof));
     }
@@ -436,9 +411,7 @@ pub(crate) fn decode_proofs(
 }
 
 fn decode_siblings(value: Option<&CborValue>) -> Result<Vec<Digest>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
+    let value = value.ok_or_else(|| invalid("proof is missing Siblings"))?;
     let CborValue::Array(values) = value else {
         return Err(invalid("proof Siblings is not an array"));
     };
@@ -462,32 +435,56 @@ pub(crate) fn cbor_map<'a>(
     value: &'a CborValue,
     field: &'static str,
 ) -> Result<&'a [(String, CborValue)]> {
-    match value {
-        CborValue::Map(pairs) => Ok(pairs),
-        _ => Err(Error::InvalidData {
+    let CborValue::Map(pairs) = value else {
+        return Err(Error::InvalidData {
             detail: format!("{field} is not a map"),
-        }),
+        });
+    };
+    let mut keys = BTreeSet::new();
+    for (key, _) in pairs {
+        if !keys.insert(key.as_str()) {
+            return Err(Error::DuplicateKey { key: key.clone() });
+        }
     }
+    Ok(pairs)
+}
+
+pub(crate) fn ensure_cbor_fields(
+    pairs: &[(String, CborValue)],
+    required: &[&WireKey],
+    optional: &[&WireKey],
+    context: &str,
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for (raw, _) in pairs {
+        if !seen.insert(raw.as_str()) {
+            return Err(Error::DuplicateKey { key: raw.clone() });
+        }
+    }
+    for key in required {
+        if !seen.contains(key.canonical) {
+            return Err(invalid(format!("{context} is missing {}", key.canonical)));
+        }
+    }
+    for raw in seen {
+        if !required
+            .iter()
+            .chain(optional.iter())
+            .any(|key| raw == key.canonical)
+        {
+            return Err(invalid(format!("{context} contains unknown field {raw}")));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn lookup_unique<'a, T>(
     pairs: &'a [(String, T)],
     key: &WireKey,
 ) -> Result<Option<&'a T>> {
-    let mut found: Option<(&str, &T)> = None;
-    for (raw, value) in pairs {
-        if key.spellings.iter().any(|spelling| raw == spelling) {
-            if let Some((first, _)) = found {
-                return Err(Error::AmbiguousFieldSpellings {
-                    field: key.field,
-                    first: first.to_owned(),
-                    second: raw.clone(),
-                });
-            }
-            found = Some((raw, value));
-        }
-    }
-    Ok(found.map(|(_, value)| value))
+    Ok(pairs
+        .iter()
+        .find_map(|(raw, value)| (raw == key.canonical).then_some(value)))
 }
 
 pub(crate) fn cbor_get<'a>(
@@ -518,14 +515,6 @@ pub(crate) fn cbor_required_text<'a>(
     )
 }
 
-pub(crate) fn cbor_optional_text(value: Option<&CborValue>) -> Result<Option<&str>> {
-    match value {
-        None | Some(CborValue::Null) => Ok(None),
-        Some(CborValue::Text(text)) => Ok(Some(text)),
-        _ => Err(invalid("expected text or null")),
-    }
-}
-
 pub(crate) fn cbor_optional_bytes(value: Option<&CborValue>) -> Result<Option<&[u8]>> {
     match value {
         None | Some(CborValue::Null) => Ok(None),
@@ -552,11 +541,14 @@ pub(crate) fn cbor_optional_shared_bytes(
     }
 }
 
-pub(crate) fn cbor_optional_unsigned(value: Option<&CborValue>) -> Result<Option<u64>> {
+pub(crate) fn cbor_required_unsigned(
+    value: Option<&CborValue>,
+    field: &'static str,
+) -> Result<u64> {
     match value {
-        None | Some(CborValue::Null) => Ok(None),
-        Some(CborValue::Unsigned(number)) => Ok(Some(*number)),
-        _ => Err(invalid("expected an unsigned integer")),
+        Some(CborValue::Unsigned(number)) => Ok(*number),
+        Some(_) => Err(invalid(format!("{field} is not an unsigned integer"))),
+        None => Err(invalid(format!("missing {field}"))),
     }
 }
 
@@ -577,11 +569,17 @@ pub(crate) enum JsonValue {
 }
 
 pub(crate) fn parse_json(input: &[u8]) -> Result<JsonValue> {
+    if input.len() > MAX_JSON_INPUT_BYTES {
+        return Err(invalid_json(format!(
+            "input exceeds {MAX_JSON_INPUT_BYTES} bytes"
+        )));
+    }
     JsonParser::new(input).parse()
 }
 
 fn json_dag_to_cbor(value: &JsonValue) -> Result<CborValue> {
     let object = json_object(value, "DAG")?;
+    ensure_json_fields(object, &[&DAG_ROOT, &DAG_LEAFS], &[], "DAG")?;
     let root = json_required_string(json_get(object, &DAG_ROOT)?, "Root")?;
     let leaves = json_object(
         json_get(object, &DAG_LEAFS)?.ok_or_else(|| invalid_json("missing Leafs"))?,
@@ -603,6 +601,25 @@ fn json_dag_to_cbor(value: &JsonValue) -> Result<CborValue> {
 
 pub(crate) fn json_leaf_to_cbor(value: &JsonValue) -> Result<CborValue> {
     let object = json_object(value, "leaf")?;
+    ensure_json_fields(
+        object,
+        &[
+            &LEAF_HASH,
+            &LEAF_ITEM_NAME,
+            &LEAF_TYPE,
+            &LEAF_CONTENT_HASH,
+            &LEAF_CONTENT,
+            &LEAF_CLASSIC_ROOT,
+            &LEAF_CURRENT_LINK_COUNT,
+            &LEAF_COUNT,
+            &LEAF_CONTENT_SIZE,
+            &LEAF_DAG_SIZE,
+            &LEAF_LINKS,
+            &LEAF_ADDITIONAL_DATA,
+        ],
+        &[&LEAF_STORED_PROOFS],
+        "leaf",
+    )?;
     let mut pairs = Vec::new();
     copy_json_text(object, &LEAF_HASH, &mut pairs)?;
     copy_json_text(object, &LEAF_ITEM_NAME, &mut pairs)?;
@@ -615,54 +632,49 @@ pub(crate) fn json_leaf_to_cbor(value: &JsonValue) -> Result<CborValue> {
     copy_json_number(object, &LEAF_CONTENT_SIZE, &mut pairs)?;
     copy_json_number(object, &LEAF_DAG_SIZE, &mut pairs)?;
 
-    if let Some(value) = json_get(object, &LEAF_LINKS)? {
-        let converted = match value {
-            JsonValue::Null => CborValue::Null,
-            JsonValue::Array(values) => CborValue::Array(
-                values
-                    .iter()
-                    .map(|value| {
-                        Ok(CborValue::Text(
-                            json_string(value, "Links entry")?.to_owned(),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            _ => return Err(invalid_json("Links is not an array")),
-        };
-        pairs.push((LEAF_LINKS.canonical.to_owned(), converted));
-    }
+    let links = match json_get(object, &LEAF_LINKS)?.ok_or_else(|| invalid_json("missing Links"))? {
+        JsonValue::Array(values) => CborValue::Array(
+            values
+                .iter()
+                .map(|value| {
+                    Ok(CborValue::Text(
+                        json_string(value, "Links entry")?.to_owned(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        _ => return Err(invalid_json("Links is not an array")),
+    };
+    pairs.push((LEAF_LINKS.canonical.to_owned(), links));
 
-    if let Some(value) = json_get(object, &LEAF_ADDITIONAL_DATA)? {
-        let converted = match value {
-            JsonValue::Null => CborValue::Null,
-            JsonValue::Object(values) => CborValue::Map(
-                values
-                    .iter()
-                    .map(|(key, value)| {
-                        Ok((
-                            key.clone(),
-                            CborValue::Text(json_string(value, "metadata value")?.to_owned()),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            _ => return Err(invalid_json("AdditionalData is not an object")),
-        };
-        pairs.push((LEAF_ADDITIONAL_DATA.canonical.to_owned(), converted));
-    }
+    let additional_data = match json_get(object, &LEAF_ADDITIONAL_DATA)?
+        .ok_or_else(|| invalid_json("missing AdditionalData"))?
+    {
+        JsonValue::Object(values) => CborValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.clone(),
+                        CborValue::Text(json_string(value, "metadata value")?.to_owned()),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        _ => return Err(invalid_json("AdditionalData is not an object")),
+    };
+    pairs.push((LEAF_ADDITIONAL_DATA.canonical.to_owned(), additional_data));
 
     if let Some(value) = json_get(object, &LEAF_STORED_PROOFS)? {
-        let converted = match value {
-            JsonValue::Null => CborValue::Null,
-            JsonValue::Object(values) => CborValue::Map(
-                values
-                    .iter()
-                    .map(|(key, value)| Ok((key.clone(), json_proof_to_cbor(value)?)))
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            _ => return Err(invalid_json("stored_proofs is not an object")),
+        let JsonValue::Object(values) = value else {
+            return Err(invalid_json("stored_proofs is not an object"));
         };
+        let converted = CborValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), json_proof_to_cbor(value)?)))
+                .collect::<Result<Vec<_>>>()?,
+        );
         pairs.push((LEAF_STORED_PROOFS.canonical.to_owned(), converted));
     }
     Ok(CborValue::Map(pairs))
@@ -670,13 +682,16 @@ pub(crate) fn json_leaf_to_cbor(value: &JsonValue) -> Result<CborValue> {
 
 pub(crate) fn json_proof_to_cbor(value: &JsonValue) -> Result<CborValue> {
     let object = json_object(value, "stored proof")?;
+    ensure_json_fields(object, &[&BRANCH_LEAF, &BRANCH_PROOF], &[], "stored proof")?;
     let child = json_required_string(json_get(object, &BRANCH_LEAF)?, "Leaf")?;
     let proof_value = json_get(object, &BRANCH_PROOF)?
         .ok_or_else(|| invalid_json("stored proof is missing Proof"))?;
     let proof_object = json_object(proof_value, "Proof")?;
-    let siblings = match json_get(proof_object, &PROOF_SIBLINGS)? {
-        None | Some(JsonValue::Null) => Vec::new(),
-        Some(JsonValue::Array(values)) => values
+    ensure_json_fields(proof_object, &[&PROOF_SIBLINGS, &PROOF_PATH], &[], "Proof")?;
+    let siblings = match json_get(proof_object, &PROOF_SIBLINGS)?
+        .ok_or_else(|| invalid_json("proof is missing Siblings"))?
+    {
+        JsonValue::Array(values) => values
             .iter()
             .map(|value| {
                 Ok(CborValue::Bytes(base64_standard_decode(json_string(
@@ -687,9 +702,10 @@ pub(crate) fn json_proof_to_cbor(value: &JsonValue) -> Result<CborValue> {
             .collect::<Result<Vec<_>>>()?,
         _ => return Err(invalid_json("proof Siblings is not an array")),
     };
-    let path = match json_get(proof_object, &PROOF_PATH)? {
-        None | Some(JsonValue::Null) => 0,
-        Some(JsonValue::Number(value)) => *value,
+    let path = match json_get(proof_object, &PROOF_PATH)?
+        .ok_or_else(|| invalid_json("proof is missing Path"))?
+    {
+        JsonValue::Number(value) => *value,
         _ => return Err(invalid_json("proof Path is not an unsigned integer")),
     };
     Ok(CborValue::Map(vec![
@@ -709,18 +725,8 @@ fn copy_json_text(
     key: &WireKey,
     output: &mut Vec<(String, CborValue)>,
 ) -> Result<()> {
-    if let Some(value) = json_get(object, key)? {
-        output.push((
-            key.canonical.to_owned(),
-            match value {
-                JsonValue::Null => CborValue::Null,
-                JsonValue::String(text) => CborValue::Text(text.clone()),
-                _ => {
-                    return Err(invalid_json(format!("{} is not text", key.canonical)));
-                }
-            },
-        ));
-    }
+    let value = json_required_string(json_get(object, key)?, key.canonical)?;
+    output.push((key.canonical.to_owned(), CborValue::Text(value.to_owned())));
     Ok(())
 }
 
@@ -729,21 +735,21 @@ fn copy_json_bytes(
     key: &WireKey,
     output: &mut Vec<(String, CborValue)>,
 ) -> Result<()> {
-    if let Some(value) = json_get(object, key)? {
-        output.push((
-            key.canonical.to_owned(),
-            match value {
-                JsonValue::Null => CborValue::Null,
-                JsonValue::String(text) => CborValue::Bytes(base64_standard_decode(text)?),
-                _ => {
-                    return Err(invalid_json(format!(
-                        "{} is not base64 text",
-                        key.canonical
-                    )));
-                }
-            },
-        ));
-    }
+    let value =
+        json_get(object, key)?.ok_or_else(|| invalid_json(format!("missing {}", key.canonical)))?;
+    output.push((
+        key.canonical.to_owned(),
+        match value {
+            JsonValue::Null => CborValue::Null,
+            JsonValue::String(text) => CborValue::Bytes(base64_standard_decode(text)?),
+            _ => {
+                return Err(invalid_json(format!(
+                    "{} is not base64 text or null",
+                    key.canonical
+                )));
+            }
+        },
+    ));
     Ok(())
 }
 
@@ -752,21 +758,15 @@ fn copy_json_number(
     key: &WireKey,
     output: &mut Vec<(String, CborValue)>,
 ) -> Result<()> {
-    if let Some(value) = json_get(object, key)? {
-        output.push((
-            key.canonical.to_owned(),
-            match value {
-                JsonValue::Null => CborValue::Null,
-                JsonValue::Number(number) => CborValue::Unsigned(*number),
-                _ => {
-                    return Err(invalid_json(format!(
-                        "{} is not an unsigned integer",
-                        key.canonical
-                    )));
-                }
-            },
-        ));
-    }
+    let value =
+        json_get(object, key)?.ok_or_else(|| invalid_json(format!("missing {}", key.canonical)))?;
+    let JsonValue::Number(number) = value else {
+        return Err(invalid_json(format!(
+            "{} is not an unsigned integer",
+            key.canonical
+        )));
+    };
+    output.push((key.canonical.to_owned(), CborValue::Unsigned(*number)));
     Ok(())
 }
 
@@ -778,6 +778,40 @@ pub(crate) fn json_object<'a>(
         JsonValue::Object(values) => Ok(values),
         _ => Err(invalid_json(format!("{field} is not an object"))),
     }
+}
+
+pub(crate) fn ensure_json_fields(
+    object: &[(String, JsonValue)],
+    required: &[&WireKey],
+    optional: &[&WireKey],
+    context: &str,
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for (raw, _) in object {
+        if !seen.insert(raw.as_str()) {
+            return Err(Error::DuplicateKey { key: raw.clone() });
+        }
+    }
+    for key in required {
+        if !seen.contains(key.canonical) {
+            return Err(invalid_json(format!(
+                "{context} is missing {}",
+                key.canonical
+            )));
+        }
+    }
+    for raw in seen {
+        if !required
+            .iter()
+            .chain(optional.iter())
+            .any(|key| raw == key.canonical)
+        {
+            return Err(invalid_json(format!(
+                "{context} contains unknown field {raw}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn json_get<'a>(
@@ -895,11 +929,16 @@ fn write_json_string(value: &str, output: &mut String) {
 struct JsonParser<'a> {
     input: &'a [u8],
     cursor: usize,
+    remaining_nodes: usize,
 }
 
 impl<'a> JsonParser<'a> {
     fn new(input: &'a [u8]) -> Self {
-        Self { input, cursor: 0 }
+        Self {
+            input,
+            cursor: 0,
+            remaining_nodes: MAX_JSON_NODES,
+        }
     }
 
     fn parse(mut self) -> Result<JsonValue> {
@@ -913,9 +952,13 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_value(&mut self, depth: usize) -> Result<JsonValue> {
-        if depth > 256 {
+        if depth > MAX_JSON_NESTING_DEPTH {
             return Err(invalid_json("maximum nesting depth exceeded"));
         }
+        self.remaining_nodes = self
+            .remaining_nodes
+            .checked_sub(1)
+            .ok_or_else(|| invalid_json("maximum decoded node count exceeded"))?;
         self.skip_whitespace();
         match self.peek() {
             Some(b'n') => {
@@ -947,6 +990,9 @@ impl<'a> JsonParser<'a> {
             return Ok(JsonValue::Array(values));
         }
         loop {
+            if values.len() >= MAX_JSON_COLLECTION_ITEMS {
+                return Err(invalid_json("maximum array length exceeded"));
+            }
             values.push(self.parse_value(depth)?);
             self.skip_whitespace();
             if self.consume(b']') {
@@ -966,6 +1012,9 @@ impl<'a> JsonParser<'a> {
             return Ok(JsonValue::Object(values));
         }
         loop {
+            if values.len() >= MAX_JSON_COLLECTION_ITEMS {
+                return Err(invalid_json("maximum object length exceeded"));
+            }
             self.skip_whitespace();
             let key = self.parse_string()?;
             if !keys.insert(key.clone()) {
@@ -1129,57 +1178,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_wire_key_rejects_equal_or_unequal_alias_coexistence_in_both_orders() {
-        for key in ALL_WIRE_KEYS {
+    fn cbor_maps_reject_duplicate_text_keys_before_semantic_lookup() {
+        let duplicate = CborValue::Map(vec![
+            ("duplicate".to_owned(), CborValue::Null),
+            ("duplicate".to_owned(), CborValue::Unsigned(1)),
+        ]);
+        assert!(matches!(
+            cbor_map(&duplicate, "test"),
+            Err(Error::DuplicateKey { key }) if key == "duplicate"
+        ));
+    }
+
+    #[test]
+    fn canonical_lookup_rejects_historical_aliases() {
+        for (key, alias) in HISTORICAL_WIRE_ALIASES {
             let canonical_cbor = vec![(key.canonical.to_owned(), CborValue::Unsigned(1))];
-            let alias_cbor = vec![(key.spellings[1].to_owned(), CborValue::Unsigned(2))];
+            let alias_cbor = vec![(alias.to_owned(), CborValue::Unsigned(1))];
             assert!(cbor_get(&canonical_cbor, key).unwrap().is_some());
-            assert!(cbor_get(&alias_cbor, key).unwrap().is_some());
+            assert!(cbor_get(&alias_cbor, key).unwrap().is_none());
+            assert!(ensure_cbor_fields(&canonical_cbor, &[key], &[], "test").is_ok());
+            assert!(ensure_cbor_fields(&alias_cbor, &[key], &[], "test").is_err());
 
             let canonical_json = vec![(key.canonical.to_owned(), JsonValue::Number(1))];
-            let alias_json = vec![(key.spellings[1].to_owned(), JsonValue::Number(2))];
+            let alias_json = vec![(alias.to_owned(), JsonValue::Number(1))];
             assert!(json_get(&canonical_json, key).unwrap().is_some());
-            assert!(json_get(&alias_json, key).unwrap().is_some());
-
-            for reverse in [false, true] {
-                for equal in [false, true] {
-                    let mut cbor_pairs = vec![
-                        (key.canonical.to_owned(), CborValue::Unsigned(1)),
-                        (
-                            key.spellings[1].to_owned(),
-                            CborValue::Unsigned(if equal { 1 } else { 2 }),
-                        ),
-                    ];
-                    let mut json_pairs = vec![
-                        (key.canonical.to_owned(), JsonValue::Number(1)),
-                        (
-                            key.spellings[1].to_owned(),
-                            JsonValue::Number(if equal { 1 } else { 2 }),
-                        ),
-                    ];
-                    if reverse {
-                        cbor_pairs.reverse();
-                        json_pairs.reverse();
-                    }
-                    for error in [
-                        cbor_get(&cbor_pairs, key).unwrap_err(),
-                        json_get(&json_pairs, key).unwrap_err(),
-                    ] {
-                        match error {
-                            Error::AmbiguousFieldSpellings {
-                                field,
-                                first,
-                                second,
-                            } => {
-                                assert_eq!(field, key.field);
-                                assert_eq!(first, cbor_pairs[0].0);
-                                assert_eq!(second, cbor_pairs[1].0);
-                            }
-                            other => panic!("unexpected ambiguity error: {other}"),
-                        }
-                    }
-                }
-            }
+            assert!(json_get(&alias_json, key).unwrap().is_none());
+            assert!(ensure_json_fields(&canonical_json, &[key], &[], "test").is_ok());
+            assert!(ensure_json_fields(&alias_json, &[key], &[], "test").is_err());
         }
     }
 
@@ -1224,6 +1249,29 @@ mod tests {
                 Error::InvalidJson { detail } if detail == "stored proof is missing Proof"
             ));
         }
+    }
+
+    #[test]
+    fn json_parser_enforces_depth_collection_and_node_budgets() {
+        let nesting = MAX_JSON_NESTING_DEPTH + 1;
+        let too_deep = format!("{}0{}", "[".repeat(nesting), "]".repeat(nesting));
+        assert!(matches!(
+            parse_json(too_deep.as_bytes()),
+            Err(Error::InvalidJson { detail }) if detail.contains("nesting depth")
+        ));
+
+        let too_many_items = format!("[{}]", vec!["0"; MAX_JSON_COLLECTION_ITEMS + 1].join(","));
+        assert!(matches!(
+            parse_json(too_many_items.as_bytes()),
+            Err(Error::InvalidJson { detail }) if detail.contains("array length")
+        ));
+
+        let full_child = format!("[{}]", vec!["0"; MAX_JSON_COLLECTION_ITEMS].join(","));
+        let too_many_nodes = format!("[{full_child},{full_child}]");
+        assert!(matches!(
+            parse_json(too_many_nodes.as_bytes()),
+            Err(Error::InvalidJson { detail }) if detail.contains("node count")
+        ));
     }
 
     #[test]

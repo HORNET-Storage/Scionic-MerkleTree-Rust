@@ -482,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_cut_semantics_match_the_go_cutter() {
+    fn mode_cut_semantics_are_canonical() {
         let data: Vec<u8> = (0_u8..10).collect();
         assert!(Chunking::Disabled.cut(&[]).is_empty());
         assert!(Chunking::Fixed(NonZeroUsize::new(4).unwrap())

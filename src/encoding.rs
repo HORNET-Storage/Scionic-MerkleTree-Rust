@@ -7,19 +7,11 @@ use std::sync::Arc;
 mod wire_map_ordering_tests {
     use super::{cbor_encode, sorted_wire_map, CborValue, KeyOrder};
 
-    /// Pins the CBOR wire map comparator across all three ports.
+    /// Pin the canonical CBOR wire-map comparator with mixed-length keys.
     ///
-    /// Every map key the spec-vector corpus exercises is a CID of uniform length,
-    /// where length-first and plain-lexicographic ordering coincide -- so the
-    /// corpus cannot tell the two apart. AdditionalData is the one wire map with
-    /// arbitrary, mixed-length keys, and it is empty in every corpus case.
-    ///
-    /// This vector is the only thing standing between the three ports and a silent
-    /// divergence on that axis. The identical bytes are asserted in Go
-    /// (dag/sortedmap_test.go) and Swift (WireMapOrderingTests.swift).
-    ///
-    /// Keys sort length-first, then bytewise: mm, zz, aaaaaa -- carrying values
-    /// 2, 1, 3 respectively. Plain lexicographic would give aaaaaa, mm, zz.
+    /// The main spec vectors use uniform-length CID keys, where length-first and
+    /// bytewise ordering coincide. `AdditionalData` accepts arbitrary key lengths,
+    /// so this vector makes the distinction observable: `mm`, `zz`, `aaaaaa`.
     const EXPECTED: &str = "a3626d6d6132627a7a6131666161616161616133";
 
     #[test]
@@ -35,7 +27,7 @@ mod wire_map_ordering_tests {
         let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex, EXPECTED,
-            "wire map ordering drifted from the bytes Go and Swift pin"
+            "wire map ordering drifted from the canonical bytes"
         );
     }
 
@@ -60,21 +52,18 @@ mod wire_map_ordering_tests {
         assert_eq!(forward, reverse);
     }
 
-    /// Pins the JSON comparator, which is deliberately NOT the CBOR one.
+    /// Pin the JSON comparator, which deliberately differs from CBOR.
     ///
-    /// Go reaches JSON through `encoding/json`, which sorts map keys with a
-    /// plain bytewise compare and no length term. On these same three keys the
-    /// two rules disagree completely:
+    /// JSON dynamic-map keys use plain bytewise order, while canonical CBOR uses
+    /// encoded-key order. Mixed-length keys expose the difference:
     ///
     /// ```text
     /// CBOR (length-first): mm, zz, aaaaaa
     /// JSON (bytewise):     aaaaaa, mm, zz
     /// ```
     ///
-    /// Rust emitted the CBOR order into JSON until this was caught, and nothing
-    /// in the cross-port machinery could see it: tools/govectors compares CBOR
-    /// only, and the one wire map with mixed-length keys (AdditionalData) is
-    /// empty in every spec vector and every benchmark-corpus leaf.
+    /// Keeping this independent test prevents either output format from silently
+    /// inheriting the other format's comparator.
     #[test]
     fn json_wire_maps_sort_bytewise_and_cbor_maps_do_not() {
         fn keys(order: KeyOrder) -> Vec<String> {
@@ -98,6 +87,10 @@ mod wire_map_ordering_tests {
 
 const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const MAX_CBOR_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CBOR_DEPTH: usize = 32;
+const MAX_CBOR_COLLECTION_ITEMS: u64 = 65_536;
+const MAX_CBOR_NODES: usize = 131_072;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CborNegative {
@@ -139,8 +132,7 @@ pub enum CborValue {
     /// representation choice, never a wire choice. It exists because leaf
     /// content already lives behind an `Arc`, and wrapping it in `Bytes` meant
     /// copying the whole payload into the value tree and then copying it again
-    /// into the output buffer -- two passes over every byte where Go's encoder
-    /// makes one.
+    /// into the output buffer. The shared representation keeps this to one pass.
     ///
     /// The decoder produces this variant too, for the mirror-image reason: it
     /// allocates each byte string once while reading, and handing that same
@@ -237,66 +229,31 @@ pub fn cbor_encode(value: &CborValue) -> Vec<u8> {
     output
 }
 
-/// Which comparator a dynamic wire map's keys sort by.
+/// Select the canonical comparator for a dynamic wire map.
 ///
-/// CBOR and JSON do not agree on map key order, and never did. Both rules are
-/// deterministic; they are simply different rules, so the choice belongs to the
-/// output format rather than to the tree the formats share:
+/// CBOR and JSON use different deterministic rules:
 ///
-/// * `Cbor` is RFC 8949 core-deterministic ordering -- keys sort by their
-///   ENCODED bytes, which for text keys reduces exactly to length-first, then
-///   bytewise. See [`sorted_wire_map`] for why that reduction is exact.
-/// * `Json` is what Go's `encoding/json` does to a map: a plain bytewise
-///   compare over the key string, with no length term at all.
+/// * `Cbor` follows RFC 8949 encoded-key ordering, which for text keys reduces
+///   exactly to length-first and then bytewise.
+/// * `Json` uses plain bytewise key ordering with no length term.
 ///
-/// The two agree on every pair of equal-length keys, which is precisely why
-/// this divergence went unnoticed for so long. Four of the five dynamic wire
-/// maps are keyed by CIDs, which are fixed width. `AdditionalData` is the one
-/// keyed by arbitrary caller-chosen strings, and it is empty in every spec
-/// vector and every benchmark-corpus leaf -- so no map any cross-port check has
-/// ever compared held two keys of different lengths.
+/// Equal-length keys hide this distinction, so mixed-length vectors pin both paths.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KeyOrder {
     Cbor,
     Json,
 }
 
-/// Builds a wire map whose keys are ordered by `order`.
+/// Build a dynamic wire map whose keys follow the selected output comparator.
 ///
-/// This is deliberately applied PER MAP, at the few sites that build a genuinely
-/// dynamic map, rather than as a blanket pass over the whole encoded tree. The
-/// distinction is not cosmetic -- it is the difference between two wire formats:
+/// Sorting is applied only to genuine dynamic maps: `Leafs`, `AdditionalData`,
+/// `stored_proofs`, `proofs`, and `Relationships`. Struct-shaped field maps keep
+/// their canonical declaration order. Applying a blanket sort would change packet
+/// field order and therefore the wire bytes.
 ///
-/// * Go's wire types are structs with map FIELDS. fxamacker emits struct fields
-///   in declaration order and only randomizes map iteration, so only the maps
-///   were ever nondeterministic. Sorting everything reorders the struct fields
-///   too, which silently rewrites the shape deployed v2.2.6 peers produce.
-/// * Rust has no such distinction at the CBOR layer: a struct and a map are both
-///   `CborValue::Map`. So the scoping Go gets from its type system has to be
-///   expressed here by choosing which maps to sort.
-///
-/// The blanket version of this function shipped briefly and was caught by the
-/// Swift port's CrossCompatWireTests, which pins the packet key order against
-/// golden bytes captured from a real deployed build:
-///
-/// ```text
-/// expected [Leaves, Relationships, PacketIndex, TotalPackets]  (declaration)
-/// got      [Leaves, PacketIndex, TotalPackets, Relationships]  (sorted)
-/// ```
-///
-/// The five maps that DO need this -- `Leafs`, `AdditionalData`, `stored_proofs`,
-/// `proofs`, `Relationships` -- are exactly the five map fields on Go's wire
-/// structs, so the ports agree map for map. That same five-way scoping is what
-/// makes [`KeyOrder`] safe to vary: only these maps see the JSON comparator, and
-/// the struct-shaped maps around them stay in declaration order for both formats.
-///
-/// RFC 8949 orders map keys by their ENCODED bytes, bytewise. For text keys that
-/// reduces to length-first, then bytewise on the UTF-8 -- and it reduces exactly,
-/// at every boundary, because the encoded head grows monotonically with length:
-/// a key shorter than 24 bytes starts with `0x60 + len` (at most `0x77`), a key of
-/// 24..=255 bytes starts with `0x78`, and one of 256..=65535 starts with `0x79`.
-/// A shorter key therefore always has a smaller leading byte, so comparing
-/// `(len, bytes)` and comparing the encoded forms never disagree.
+/// RFC 8949 compares encoded map keys bytewise. For text keys, the encoded head
+/// grows monotonically with length, so `(length, UTF-8 bytes)` is exactly the same
+/// ordering without allocating temporary encoded keys.
 pub(crate) fn sorted_wire_map(mut pairs: Vec<(String, CborValue)>, order: KeyOrder) -> CborValue {
     match order {
         KeyOrder::Cbor => {
@@ -372,7 +329,18 @@ pub fn cbor_decode(input: &[u8]) -> Result<CborValue> {
 /// Crate-internal on purpose: the only callers are the ones that hand the
 /// allocation straight to a leaf, which is the entire reason it exists.
 pub(crate) fn cbor_decode_shared(input: &[u8]) -> Result<CborValue> {
-    let mut reader = CborReader { input, cursor: 0 };
+    if input.len() > MAX_CBOR_INPUT_BYTES {
+        return Err(Error::InMemoryLimitExceeded {
+            resource: "CBOR input",
+            requested: input.len() as u64,
+            limit: MAX_CBOR_INPUT_BYTES as u64,
+        });
+    }
+    let mut reader = CborReader {
+        input,
+        cursor: 0,
+        remaining_nodes: MAX_CBOR_NODES,
+    };
     let value = reader.read_value(0)?;
     if reader.cursor != input.len() {
         return Err(Error::InvalidCbor {
@@ -410,15 +378,22 @@ fn own_shared_bytes(value: CborValue) -> CborValue {
 struct CborReader<'a> {
     input: &'a [u8],
     cursor: usize,
+    remaining_nodes: usize,
 }
 
 impl CborReader<'_> {
     fn read_value(&mut self, depth: usize) -> Result<CborValue> {
-        if depth > 256 {
+        if depth > MAX_CBOR_DEPTH {
             return Err(Error::InvalidCbor {
                 detail: "maximum nesting depth exceeded",
             });
         }
+        self.remaining_nodes = self
+            .remaining_nodes
+            .checked_sub(1)
+            .ok_or(Error::InvalidCbor {
+                detail: "maximum decoded node count exceeded",
+            })?;
         let initial = self.read_byte()?;
         let major = initial >> 5;
         let additional = initial & 0x1f;
@@ -429,8 +404,6 @@ impl CborReader<'_> {
             })),
             2 => {
                 let length = self.read_length(additional)?;
-                // Shared, not owned: this allocation is handed straight to the
-                // leaf, so a decoded payload is copied once rather than twice.
                 Ok(CborValue::SharedBytes(Arc::new(
                     self.read_exact(length)?.to_vec(),
                 )))
@@ -444,10 +417,10 @@ impl CborReader<'_> {
                 Ok(CborValue::Text(text.to_owned()))
             }
             4 => {
-                let length = self.read_length(additional)?;
+                let length = self.read_collection_length(additional)?;
                 let mut values = Vec::new();
                 values
-                    .try_reserve_exact(length)
+                    .try_reserve(length.min(16))
                     .map_err(|_| Error::AllocationFailed {
                         resource: "CBOR array",
                         requested: length as u64,
@@ -458,10 +431,10 @@ impl CborReader<'_> {
                 Ok(CborValue::Array(values))
             }
             5 => {
-                let length = self.read_length(additional)?;
+                let length = self.read_collection_length(additional)?;
                 let mut pairs = Vec::new();
                 pairs
-                    .try_reserve_exact(length)
+                    .try_reserve(length.min(16))
                     .map_err(|_| Error::AllocationFailed {
                         resource: "CBOR map",
                         requested: length as u64,
@@ -499,29 +472,59 @@ impl CborReader<'_> {
     }
 
     fn read_argument(&mut self, additional: u8) -> Result<u64> {
-        match additional {
-            0..=23 => Ok(u64::from(additional)),
-            24 => Ok(u64::from(self.read_byte()?)),
+        let value = match additional {
+            0..=23 => return Ok(u64::from(additional)),
+            24 => u64::from(self.read_byte()?),
             25 => {
-                let bytes: [u8; 2] = self.read_exact(2)?.try_into().expect("two bytes");
-                Ok(u64::from(u16::from_be_bytes(bytes)))
+                let mut bytes = [0_u8; 2];
+                bytes.copy_from_slice(self.read_exact(2)?);
+                u64::from(u16::from_be_bytes(bytes))
             }
             26 => {
-                let bytes: [u8; 4] = self.read_exact(4)?.try_into().expect("four bytes");
-                Ok(u64::from(u32::from_be_bytes(bytes)))
+                let mut bytes = [0_u8; 4];
+                bytes.copy_from_slice(self.read_exact(4)?);
+                u64::from(u32::from_be_bytes(bytes))
             }
             27 => {
-                let bytes: [u8; 8] = self.read_exact(8)?.try_into().expect("eight bytes");
-                Ok(u64::from_be_bytes(bytes))
+                let mut bytes = [0_u8; 8];
+                bytes.copy_from_slice(self.read_exact(8)?);
+                u64::from_be_bytes(bytes)
             }
-            _ => Err(Error::InvalidCbor {
-                detail: "indefinite or reserved argument encoding",
-            }),
+            _ => {
+                return Err(Error::InvalidCbor {
+                    detail: "indefinite or reserved argument encoding",
+                })
+            }
+        };
+        let minimum = match additional {
+            24 => 24,
+            25 => 1 << 8,
+            26 => 1 << 16,
+            27 => 1 << 32,
+            _ => unreachable!(),
+        };
+        if value < minimum {
+            return Err(Error::InvalidCbor {
+                detail: "non-canonical argument width",
+            });
         }
+        Ok(value)
     }
 
     fn read_length(&mut self, additional: u8) -> Result<usize> {
         let length = self.read_argument(additional)?;
+        usize::try_from(length).map_err(|_| Error::InvalidCbor {
+            detail: "byte string length exceeds usize",
+        })
+    }
+
+    fn read_collection_length(&mut self, additional: u8) -> Result<usize> {
+        let length = self.read_argument(additional)?;
+        if length > MAX_CBOR_COLLECTION_ITEMS {
+            return Err(Error::InvalidCbor {
+                detail: "maximum collection item count exceeded",
+            });
+        }
         usize::try_from(length).map_err(|_| Error::InvalidCbor {
             detail: "collection length exceeds usize",
         })
@@ -548,6 +551,31 @@ impl CborReader<'_> {
         })?;
         self.cursor = end;
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod cbor_decoder_bound_tests {
+    use super::*;
+
+    #[test]
+    fn decoder_rejects_oversized_collections_and_noncanonical_arguments() {
+        let oversized_array = [0x9a, 0x00, 0x01, 0x00, 0x01];
+        assert!(cbor_decode(&oversized_array).is_err());
+        assert!(cbor_decode(&[0x18, 0x17]).is_err());
+    }
+
+    #[test]
+    fn decoder_rejects_excessive_depth_and_aggregate_nodes() {
+        let mut nested = vec![0x81; MAX_CBOR_DEPTH + 1];
+        nested.push(0xf6);
+        assert!(cbor_decode(&nested).is_err());
+
+        let mut nodes = vec![0x82, 0x9a, 0x00, 0x01, 0x00, 0x00];
+        nodes.extend(std::iter::repeat_n(0xf6, 65_536));
+        nodes.extend_from_slice(&[0x9a, 0x00, 0x01, 0x00, 0x00]);
+        nodes.extend(std::iter::repeat_n(0xf6, 65_536));
+        assert!(cbor_decode(&nodes).is_err());
     }
 }
 

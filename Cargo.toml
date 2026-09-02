@@ -4,7 +4,7 @@ version = "2.4.3"
 edition = "2021"
 rust-version = "1.85"
 publish = false
-description = "Byte-compatible Rust implementation of the Scionic Merkle Tree: layers 1-5, parallel DAG creation, and the store-backed DAG operations"
+description = "Authoritative Scionic Merkle Tree implementation: layers 1-5, parallel DAG creation, and store-backed DAG operations"
 license = "MIT"
 
 [dependencies]

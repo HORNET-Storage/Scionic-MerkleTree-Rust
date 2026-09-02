@@ -224,7 +224,7 @@ fn chunk_content_order_survives_batched_packet_replay() {
 }
 
 #[test]
-fn batched_cbor_without_counters_defaults_to_zero_and_reencodes_current_shape() {
+fn batched_cbor_without_counters_is_rejected() {
     let temp = TempDir::new("missing-batched-counters").unwrap();
     let input = create_fixture(temp.path(), "single_small_file").unwrap();
     let source = create_dag_with_options(&input, &options_4096()).unwrap();
@@ -242,19 +242,15 @@ fn batched_cbor_without_counters_defaults_to_zero_and_reencodes_current_shape() 
     let missing_counters = scionic_merkletree::encoding::cbor_encode(
         &scionic_merkletree::encoding::CborValue::Map(pairs),
     );
-    let restored = BatchedTransmissionPacket::from_cbor(&missing_counters).unwrap();
-    assert_eq!((restored.packet_index(), restored.total_packets()), (0, 0));
-    let reencoded =
-        scionic_merkletree::encoding::cbor_decode(&restored.to_cbor().unwrap()).unwrap();
-    let scionic_merkletree::encoding::CborValue::Map(pairs) = reencoded else {
-        panic!("restored batch is not a map");
-    };
-    assert!(pairs.iter().any(|(key, _)| key == "PacketIndex"));
-    assert!(pairs.iter().any(|(key, _)| key == "TotalPackets"));
+    assert!(matches!(
+        BatchedTransmissionPacket::from_cbor(&missing_counters),
+        Err(scionic_merkletree::Error::InvalidData { detail })
+            if detail == "batched transmission packet is missing PacketIndex"
+    ));
 }
 
 #[test]
-fn transmission_decoders_reject_outer_alias_coexistence() {
+fn transmission_decoders_reject_noncanonical_outer_aliases() {
     let temp = TempDir::new("transmission-aliases").unwrap();
     let input = create_fixture(temp.path(), "single_small_file").unwrap();
     let source = create_dag_with_options(&input, &options_4096()).unwrap();
@@ -263,7 +259,8 @@ fn transmission_decoders_reject_outer_alias_coexistence() {
     let ambiguous = json.replacen("\"Leaf\":", "\"leaf\": null,\n  \"Leaf\":", 1);
     assert!(matches!(
         TransmissionPacket::from_json(ambiguous.as_bytes()),
-        Err(scionic_merkletree::Error::AmbiguousFieldSpellings { .. })
+        Err(scionic_merkletree::Error::InvalidJson { detail })
+            if detail == "transmission packet contains unknown field leaf"
     ));
 }
 
@@ -299,6 +296,13 @@ fn receivers_pin_root_conflicts_missing_parents_and_single_unknown_parent_behavi
         .batched_leaf_sequence_with(Batching::Disabled)
         .unwrap()
         .remove(1);
+    let child_json = String::from_utf8(child_batch.to_json().unwrap()).unwrap();
+    let positioned_json = child_json.replace(
+        &format!("\"PacketIndex\": {}", child_batch.packet_index()),
+        "\"PacketIndex\": 0",
+    );
+    let child_batch = BatchedTransmissionPacket::from_json(positioned_json.as_bytes())
+        .expect("position-adjusted child batch remains structurally valid");
     let mut batched_receiver = BatchedDagReceiver::new();
     let before_missing_parent = batched_receiver.clone();
     assert!(matches!(

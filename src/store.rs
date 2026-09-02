@@ -7,11 +7,10 @@
 //! traversal, content assembly and directory recreation all pull one leaf at a
 //! time, which is what makes a multi-gigabyte repository bundle tractable.
 //!
-//! Go models the optional store capabilities (batch writes, counting, enumeration,
-//! cached relationships) as separate interfaces discovered by type assertion. The
-//! Rust equivalent is default trait methods that report "not supported": an
-//! implementor overrides what it can do cheaply, and every caller has the same
-//! fallback Go takes when the assertion fails.
+//! Optional store capabilities—batch writes, counting, enumeration, and cached
+//! relationships—are default trait methods that report `not supported`.
+//! Implementors override the operations they can provide efficiently, while
+//! callers retain correct bounded fallbacks.
 
 use crate::dag::{
     compare_chunk_item_names, minimum_parent_index, safe_join, Cid, Dag, DagLeaf, Labels, LeafType,
@@ -28,10 +27,8 @@ use std::sync::{Arc, RwLock};
 
 /// Storage for leaf metadata.
 ///
-/// The four required methods are the whole contract. The rest are optional
-/// accelerations with correct-but-slower defaults, mirroring Go's optional
-/// `BatchLeafStore`, `LeafCounter`, `LeafEnumerator` and `RelationshipCache`
-/// interfaces.
+/// The four required methods are the whole contract. Remaining methods are
+/// optional accelerations with correct, slower defaults.
 pub trait LeafStore: Send + Sync {
     fn store_leaf(&self, leaf: DagLeaf) -> Result<()>;
     fn retrieve_leaf(&self, cid: &Cid) -> Result<Option<DagLeaf>>;
@@ -350,11 +347,10 @@ impl DagStore {
     /// Retrieve a leaf exactly as the leaf store holds it, without re-attaching
     /// separately stored content.
     ///
-    /// With a content store configured this yields metadata only, which is what
-    /// makes streaming verification cheap. Without one the leaf store *is* the
-    /// whole leaf, so the payload comes back too -- the same asymmetry Go has, and
-    /// the reason [`Self::update_parent_hashes_streaming`] can write leaves back
-    /// without erasing content.
+    /// With a content store configured this yields metadata only, keeping streaming
+    /// verification cheap. Without one, the leaf store owns the whole leaf and the
+    /// payload is returned too; this lets `update_parent_hashes_streaming` write
+    /// leaves back without erasing inline content.
     pub fn retrieve_leaf_without_content(&self, cid: &Cid) -> Result<Option<DagLeaf>> {
         self.leaf_store.retrieve_leaf(cid)
     }
@@ -527,8 +523,8 @@ impl DagStore {
 
     /// Record one leaf's place in the index while streaming an upload.
     ///
-    /// Re-adding a CID is a no-op, matching Go, so a shared chunk announced by two
-    /// parents keeps the first parent it was indexed under instead of flipping.
+    /// Re-adding a CID is a no-op, so a shared chunk announced by two parents
+    /// retains the first indexed parent.
     pub fn add_to_index(&mut self, leaf: Cid, parent: Option<Cid>, children: Vec<Cid>) {
         let index = self.index.get_or_insert_with(DagIndex::new);
         if index.parents.contains_key(&leaf) {
@@ -592,7 +588,7 @@ impl DagStore {
                 None => None,
             };
             visit(&leaf, parent.as_ref())?;
-            // Reversed so popping yields link order, matching Go's recursion.
+            // Reverse before pushing so stack traversal preserves link order.
             for child in leaf.links().iter().rev() {
                 if !visited.contains(child) {
                     stack.push((child.clone(), Some(cid.clone())));
@@ -606,8 +602,8 @@ impl DagStore {
     ///
     /// The leaves are read back through [`Self::retrieve_leaf_without_content`] and
     /// written straight back, so inline payloads survive the rewrite and
-    /// separately stored payloads are never touched. A batch size of zero means
-    /// "pick a small default", as in Go.
+    /// separately stored payloads are never touched. A zero batch size selects the
+    /// bounded default of ten leaves.
     pub fn update_parent_hashes_streaming(&mut self, batch_size: usize) -> Result<()> {
         self.require_root()?;
         self.ensure_index()?;

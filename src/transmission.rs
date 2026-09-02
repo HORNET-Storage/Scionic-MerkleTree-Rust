@@ -7,45 +7,28 @@ use crate::encoding::{
     cbor_decode_shared, cbor_encode, sha256, sorted_wire_map, CborValue, KeyOrder,
 };
 use crate::serialization::{
-    cbor_get, cbor_map, cbor_optional_text, cbor_optional_unsigned, cbor_required_text,
-    decode_leaf, decode_proofs, json_get, json_leaf_to_cbor, json_object, json_proof_to_cbor,
-    json_required_string, json_string, leaf_wire_value, parse_json, proof_wire_value, write_json,
-    JsonValue, WireKey,
+    cbor_get, cbor_map, cbor_required_text, cbor_required_unsigned, decode_leaf, decode_proofs,
+    ensure_cbor_fields, ensure_json_fields, json_get, json_leaf_to_cbor, json_object,
+    json_proof_to_cbor, json_required_string, leaf_wire_value, parse_json, proof_wire_value,
+    write_json, JsonValue, WireKey,
 };
 use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 
 pub const DEFAULT_BATCH_TARGET: usize = 4 * 1024 * 1024;
+const MAX_TRANSMISSION_PACKET_COUNT: usize = 65_536;
+const MAX_TRANSMISSION_PACKETS: u64 = MAX_TRANSMISSION_PACKET_COUNT as u64;
+const MAX_TRANSMISSION_LEAVES_PER_PACKET: usize = 65_536;
 
-static PACKET_LEAF: WireKey = WireKey::new("TransmissionPacket.Leaf", "Leaf", &["Leaf", "leaf"]);
-static PACKET_PARENT_HASH: WireKey = WireKey::new(
-    "TransmissionPacket.ParentHash",
-    "ParentHash",
-    &["ParentHash", "parentHash"],
-);
-static PACKET_PROOFS: WireKey = WireKey::new("TransmissionPacket.proofs", "proofs", &["proofs"]);
-static BATCH_LEAVES: WireKey = WireKey::new(
-    "BatchedTransmissionPacket.Leaves",
-    "Leaves",
-    &["Leaves", "leaves"],
-);
-static BATCH_RELATIONSHIPS: WireKey = WireKey::new(
-    "BatchedTransmissionPacket.Relationships",
-    "Relationships",
-    &["Relationships", "relationships"],
-);
-static BATCH_PACKET_INDEX: WireKey = WireKey::new(
-    "BatchedTransmissionPacket.PacketIndex",
-    "PacketIndex",
-    &["PacketIndex", "packetIndex"],
-);
-static BATCH_TOTAL_PACKETS: WireKey = WireKey::new(
-    "BatchedTransmissionPacket.TotalPackets",
-    "TotalPackets",
-    &["TotalPackets", "totalPackets"],
-);
-static PACKET_LEAF_HASH: WireKey = WireKey::new("DagLeaf.Hash", "Hash", &["Hash", "hash"]);
+static PACKET_LEAF: WireKey = WireKey::new("Leaf");
+static PACKET_PARENT_HASH: WireKey = WireKey::new("ParentHash");
+static PACKET_PROOFS: WireKey = WireKey::new("proofs");
+static BATCH_LEAVES: WireKey = WireKey::new("Leaves");
+static BATCH_RELATIONSHIPS: WireKey = WireKey::new("Relationships");
+static BATCH_PACKET_INDEX: WireKey = WireKey::new("PacketIndex");
+static BATCH_TOTAL_PACKETS: WireKey = WireKey::new("TotalPackets");
+static PACKET_LEAF_HASH: WireKey = WireKey::new("Hash");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransmissionPacket {
@@ -145,7 +128,6 @@ impl BatchedTransmissionPacket {
         self.leaves
             .iter()
             .find(|leaf| self.relationships.get(leaf.cid()) == Some(&None))
-            .or_else(|| self.leaves.first())
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>> {
@@ -236,6 +218,8 @@ pub struct BatchedDagReceiver {
     root: Option<Cid>,
     expected_root: Option<Cid>,
     leaves: BTreeMap<Cid, DagLeaf>,
+    next_packet_index: u64,
+    declared_total_packets: Option<u64>,
     /// `Some` once a packet has streamed through `apply_and_verify_streaming`:
     /// the receiver then holds a content-free skeleton, and these are the size
     /// totals `finish_verified` holds the root to in place of retained payloads.
@@ -252,6 +236,8 @@ impl BatchedDagReceiver {
             root: None,
             expected_root: Some(root),
             leaves: BTreeMap::new(),
+            next_packet_index: 0,
+            declared_total_packets: None,
             streamed: None,
         }
     }
@@ -264,7 +250,33 @@ impl BatchedDagReceiver {
         &self.leaves
     }
 
+    fn verify_packet_position(&self, packet: &BatchedTransmissionPacket) -> Result<()> {
+        validate_packet_counters(packet.packet_index, packet.total_packets)?;
+        if packet.packet_index != self.next_packet_index {
+            return Err(invalid_data(format!(
+                "expected PacketIndex {}, received {}",
+                self.next_packet_index, packet.packet_index
+            )));
+        }
+        if let Some(expected) = self.declared_total_packets {
+            if packet.total_packets != expected {
+                return Err(invalid_data(format!(
+                    "TotalPackets changed from {expected} to {}",
+                    packet.total_packets
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn record_packet(&mut self, packet: &BatchedTransmissionPacket) {
+        self.declared_total_packets
+            .get_or_insert(packet.total_packets);
+        self.next_packet_index = packet.packet_index + 1;
+    }
+
     pub fn verify_packet(&self, packet: &BatchedTransmissionPacket) -> Result<()> {
+        self.verify_packet_position(packet)?;
         verify_batched_root_markers(self.root.as_ref(), self.expected_root.as_ref(), packet)?;
         verify_batched_packet_against(&self.leaves, packet)
     }
@@ -272,6 +284,7 @@ impl BatchedDagReceiver {
     pub fn apply_packet(&mut self, packet: &BatchedTransmissionPacket) {
         self.adopt_root(packet);
         apply_batched_packet_to(&mut self.leaves, packet, false);
+        self.record_packet(packet);
     }
 
     pub fn apply_and_verify(&mut self, packet: &BatchedTransmissionPacket) -> Result<()> {
@@ -322,6 +335,7 @@ impl BatchedDagReceiver {
         }
         self.adopt_root(packet);
         apply_batched_packet_to(&mut self.leaves, packet, true);
+        self.record_packet(packet);
         self.streamed = Some(totals);
         Ok(())
     }
@@ -335,6 +349,14 @@ impl BatchedDagReceiver {
     }
 
     pub fn finish_verified(self) -> Result<Dag> {
+        if let Some(expected) = self.declared_total_packets {
+            if self.next_packet_index != expected {
+                return Err(invalid_data(format!(
+                    "batched transmission ended after {} of {expected} packets",
+                    self.next_packet_index
+                )));
+            }
+        }
         let root = match (self.root, self.expected_root) {
             (Some(found), Some(expected)) if found != expected => {
                 return Err(Error::ConflictingTransmissionRoot {
@@ -439,6 +461,9 @@ impl Dag {
             let total_packets = u64::try_from(packets.len()).map_err(|_| Error::SizeOverflow {
                 field: "TotalPackets",
             })?;
+            if !packets.is_empty() {
+                validate_packet_counters(0, total_packets)?;
+            }
             return packets
                 .into_iter()
                 .enumerate()
@@ -496,15 +521,22 @@ impl Dag {
                     continue;
                 };
                 let child_size = estimate_leaf_size(child)?;
-                if current_size
-                    .checked_add(child_size)
-                    .ok_or(Error::SizeOverflow {
-                        field: "batch estimate",
-                    })?
-                    > target.get()
-                    && !current.leaves.is_empty()
+                let exceeds_target =
+                    current_size
+                        .checked_add(child_size)
+                        .ok_or(Error::SizeOverflow {
+                            field: "batch estimate",
+                        })?
+                        > target.get();
+                if (exceeds_target && !current.leaves.is_empty())
+                    || current.leaves.len() >= MAX_TRANSMISSION_LEAVES_PER_PACKET
                 {
                     self.finalize_batch(&mut current, &parents_in_batch, &mut proof_cache)?;
+                    if batches.len() >= MAX_TRANSMISSION_PACKET_COUNT {
+                        return Err(invalid_data(format!(
+                            "generated transmission exceeds {MAX_TRANSMISSION_PACKETS} packets"
+                        )));
+                    }
                     batches.push(current);
                     current = BatchedTransmissionPacket {
                         leaves: Vec::new(),
@@ -540,11 +572,17 @@ impl Dag {
 
         if !current.leaves.is_empty() {
             self.finalize_batch(&mut current, &parents_in_batch, &mut proof_cache)?;
+            if batches.len() >= MAX_TRANSMISSION_PACKET_COUNT {
+                return Err(invalid_data(format!(
+                    "generated transmission exceeds {MAX_TRANSMISSION_PACKETS} packets"
+                )));
+            }
             batches.push(current);
         }
         let total_packets = u64::try_from(batches.len()).map_err(|_| Error::SizeOverflow {
             field: "TotalPackets",
         })?;
+        validate_packet_counters(0, total_packets)?;
         for (index, batch) in batches.iter_mut().enumerate() {
             batch.packet_index = u64::try_from(index).map_err(|_| Error::SizeOverflow {
                 field: "PacketIndex",
@@ -668,10 +706,9 @@ fn verify_transmission_packet_against(
         .parent_hash
         .as_ref()
         .expect("non-root packet has a parent");
-    // An absent parent is accepted, matching Go. That is safe rather than lax:
-    // apply_transmission_packet_to installs no edge when the parent is unknown, so
-    // nothing unauthenticated enters the graph. A parent-child edge is only ever
-    // created from a parent's own authenticated link list.
+    // An absent parent is safe to accept: `apply_transmission_packet_to` installs
+    // no edge when the parent is unknown. A parent-child edge is created only
+    // from the parent's authenticated link list.
     if let Some(parent) = leaves.get(parent_cid) {
         // Gate on the AUTHENTICATED link count, not the retained list. A pruned
         // partial parent can declare CurrentLinkCount = 2 while retaining a single
@@ -757,9 +794,8 @@ fn verify_batched_packet_against(
         // an honest root with CurrentLinkCount == 1 plus a foreign leaf claiming
         // that root as its parent is enough to corrupt the receiver.
         //
-        // Dag::verify_partial already enforces this invariant with
-        // ParentMissingLink; the batched path must not be weaker than it. Go builds
-        // relationships from real parent links, so this rejects nothing Go emits.
+        // `Dag::verify_partial` enforces the same invariant with
+        // `ParentMissingLink`; the batched path must not be weaker.
         if !parent_leaf.links().contains(child.cid()) {
             return Err(Error::ParentMissingLink {
                 parent: parent_cid.to_string(),
@@ -1025,19 +1061,25 @@ fn transmission_packet_wire_value(packet: &TransmissionPacket, order: KeyOrder) 
 
 fn transmission_packet_from_wire_value(value: &CborValue) -> Result<TransmissionPacket> {
     let map = cbor_map(value, "transmission packet")?;
+    ensure_cbor_fields(
+        map,
+        &[&PACKET_LEAF, &PACKET_PARENT_HASH],
+        &[&PACKET_PROOFS],
+        "transmission packet",
+    )?;
     let leaf_value = cbor_get(map, &PACKET_LEAF)?
         .ok_or_else(|| invalid_data("missing transmission packet Leaf"))?;
     let leaf = decode_packet_leaf(leaf_value)?;
-    let parent_text = cbor_optional_text(cbor_get(map, &PACKET_PARENT_HASH)?)?.unwrap_or("");
+    let parent_text = cbor_required_text(
+        cbor_get(map, &PACKET_PARENT_HASH)?,
+        "transmission packet ParentHash",
+    )?;
     let parent_hash = if parent_text.is_empty() {
         None
     } else {
         Some(Cid::parse(parent_text)?)
     };
-    // Bind each outer proof to its map key at decode time. Go always files a
-    // packet proof under the child it proves (GetLeafSequence sets
-    // Proofs[childHash] with branch.Leaf = childHash), so key binding rejects
-    // nothing the reference can produce while closing the key/branch mismatch.
+    // Every proof is filed under the canonical CID of the child it proves.
     let proofs = decode_proofs(cbor_get(map, &PACKET_PROOFS)?, true)?;
     Ok(TransmissionPacket {
         leaf,
@@ -1089,19 +1131,57 @@ fn batched_packet_wire_value(packet: &BatchedTransmissionPacket, order: KeyOrder
     ])
 }
 
+fn validate_packet_counters(packet_index: u64, total_packets: u64) -> Result<()> {
+    if total_packets == 0 || total_packets > MAX_TRANSMISSION_PACKETS {
+        return Err(invalid_data(format!(
+            "TotalPackets must be between 1 and {MAX_TRANSMISSION_PACKETS}"
+        )));
+    }
+    if packet_index >= total_packets {
+        return Err(invalid_data(format!(
+            "PacketIndex {packet_index} is outside TotalPackets {total_packets}"
+        )));
+    }
+    Ok(())
+}
+
 fn batched_packet_from_wire_value(value: &CborValue) -> Result<BatchedTransmissionPacket> {
     let map = cbor_map(value, "batched transmission packet")?;
-    let relationships = decode_relationships(cbor_get(map, &BATCH_RELATIONSHIPS)?)?;
-    let leaves = match cbor_get(map, &BATCH_LEAVES)? {
-        None | Some(CborValue::Null) => Vec::new(),
-        Some(CborValue::Array(values)) => values
+    ensure_cbor_fields(
+        map,
+        &[
+            &BATCH_LEAVES,
+            &BATCH_RELATIONSHIPS,
+            &BATCH_PACKET_INDEX,
+            &BATCH_TOTAL_PACKETS,
+        ],
+        &[],
+        "batched transmission packet",
+    )?;
+    let leaves = match cbor_get(map, &BATCH_LEAVES)?
+        .ok_or_else(|| invalid_data("missing batched packet Leaves"))?
+    {
+        CborValue::Array(values) if !values.is_empty() => values
             .iter()
             .map(decode_packet_leaf)
             .collect::<Result<Vec<_>>>()?,
+        CborValue::Array(_) => return Err(invalid_data("batched packet Leaves is empty")),
         _ => return Err(invalid_data("batched packet Leaves is not an array")),
     };
-    let packet_index = cbor_optional_unsigned(cbor_get(map, &BATCH_PACKET_INDEX)?)?.unwrap_or(0);
-    let total_packets = cbor_optional_unsigned(cbor_get(map, &BATCH_TOTAL_PACKETS)?)?.unwrap_or(0);
+    let relationships = decode_relationships(cbor_get(map, &BATCH_RELATIONSHIPS)?)?;
+    let packet_index = cbor_required_unsigned(cbor_get(map, &BATCH_PACKET_INDEX)?, "PacketIndex")?;
+    let total_packets =
+        cbor_required_unsigned(cbor_get(map, &BATCH_TOTAL_PACKETS)?, "TotalPackets")?;
+    validate_packet_counters(packet_index, total_packets)?;
+    let leaf_ids: BTreeSet<Cid> = leaves.iter().map(|leaf| leaf.cid().clone()).collect();
+    if leaf_ids.len() != leaves.len() {
+        return Err(invalid_data("batched packet contains duplicate leaves"));
+    }
+    if leaf_ids.len() != relationships.len() || !leaf_ids.iter().eq(relationships.keys()) {
+        return Err(invalid_data(
+            "Relationships must contain exactly one entry for every packet leaf",
+        ));
+    }
     Ok(BatchedTransmissionPacket {
         leaves,
         relationships,
@@ -1120,43 +1200,39 @@ fn decode_packet_leaf(value: &CborValue) -> Result<DagLeaf> {
 }
 
 fn decode_relationships(value: Option<&CborValue>) -> Result<BTreeMap<Cid, Option<Cid>>> {
-    let Some(value) = value else {
-        return Ok(BTreeMap::new());
-    };
-    if matches!(value, CborValue::Null) {
-        return Ok(BTreeMap::new());
+    let value = value.ok_or_else(|| invalid_data("missing Relationships"))?;
+    let mut relationships = BTreeMap::new();
+    for (child, parent) in cbor_map(value, "Relationships")? {
+        let child = Cid::parse(child)?;
+        let parent = cbor_required_text(Some(parent), "relationship parent")?;
+        let parent = if parent.is_empty() {
+            None
+        } else {
+            Some(Cid::parse(parent)?)
+        };
+        if relationships.insert(child, parent).is_some() {
+            return Err(invalid_data(
+                "Relationships contains duplicate canonical child identifiers",
+            ));
+        }
     }
-    cbor_map(value, "Relationships")?
-        .iter()
-        .map(|(child, parent)| {
-            let child = Cid::parse(child)?;
-            let parent = cbor_required_text(Some(parent), "relationship parent")?;
-            let parent = if parent.is_empty() {
-                None
-            } else {
-                Some(Cid::parse(parent)?)
-            };
-            Ok((child, parent))
-        })
-        .collect()
+    Ok(relationships)
 }
 
 fn json_transmission_packet_to_cbor(value: &JsonValue) -> Result<CborValue> {
     let object = json_object(value, "transmission packet")?;
+    ensure_json_fields(
+        object,
+        &[&PACKET_LEAF, &PACKET_PARENT_HASH],
+        &[&PACKET_PROOFS],
+        "transmission packet",
+    )?;
     let leaf = json_get(object, &PACKET_LEAF)?
         .ok_or_else(|| invalid_json("missing transmission packet Leaf"))?;
+    let parent = json_required_string(json_get(object, &PACKET_PARENT_HASH)?, "ParentHash")?;
     let mut pairs = vec![
         ("Leaf".to_owned(), json_leaf_to_cbor(leaf)?),
-        (
-            "ParentHash".to_owned(),
-            CborValue::Text(
-                json_get(object, &PACKET_PARENT_HASH)?
-                    .map(|value| json_string(value, "ParentHash"))
-                    .transpose()?
-                    .unwrap_or("")
-                    .to_owned(),
-            ),
-        ),
+        ("ParentHash".to_owned(), CborValue::Text(parent.to_owned())),
     ];
     if let Some(proofs) = json_get(object, &PACKET_PROOFS)? {
         pairs.push((
@@ -1169,67 +1245,74 @@ fn json_transmission_packet_to_cbor(value: &JsonValue) -> Result<CborValue> {
 
 fn json_batched_packet_to_cbor(value: &JsonValue) -> Result<CborValue> {
     let object = json_object(value, "batched transmission packet")?;
-    let mut pairs = Vec::new();
-    if let Some(leaves) = json_get(object, &BATCH_LEAVES)? {
-        let converted = match leaves {
-            JsonValue::Null => CborValue::Null,
-            JsonValue::Array(values) => CborValue::Array(
-                values
-                    .iter()
-                    .map(json_leaf_to_cbor)
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            _ => return Err(invalid_json("batched packet Leaves is not an array")),
-        };
-        pairs.push(("Leaves".to_owned(), converted));
-    }
-    if let Some(relationships) = json_get(object, &BATCH_RELATIONSHIPS)? {
-        let converted = match relationships {
-            JsonValue::Null => CborValue::Null,
-            JsonValue::Object(values) => CborValue::Map(
-                values
-                    .iter()
-                    .map(|(child, parent)| {
-                        Ok((
-                            child.clone(),
-                            CborValue::Text(
-                                json_required_string(Some(parent), "relationship parent")?
-                                    .to_owned(),
-                            ),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            _ => return Err(invalid_json("Relationships is not an object")),
-        };
-        pairs.push(("Relationships".to_owned(), converted));
-    }
-    if let Some(index) = json_get(object, &BATCH_PACKET_INDEX)? {
-        pairs.push((
+    ensure_json_fields(
+        object,
+        &[
+            &BATCH_LEAVES,
+            &BATCH_RELATIONSHIPS,
+            &BATCH_PACKET_INDEX,
+            &BATCH_TOTAL_PACKETS,
+        ],
+        &[],
+        "batched transmission packet",
+    )?;
+    let leaves = match json_get(object, &BATCH_LEAVES)?
+        .ok_or_else(|| invalid_json("missing batched packet Leaves"))?
+    {
+        JsonValue::Array(values) => CborValue::Array(
+            values
+                .iter()
+                .map(json_leaf_to_cbor)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        _ => return Err(invalid_json("batched packet Leaves is not an array")),
+    };
+    let relationships = match json_get(object, &BATCH_RELATIONSHIPS)?
+        .ok_or_else(|| invalid_json("missing Relationships"))?
+    {
+        JsonValue::Object(values) => CborValue::Map(
+            values
+                .iter()
+                .map(|(child, parent)| {
+                    Ok((
+                        child.clone(),
+                        CborValue::Text(
+                            json_required_string(Some(parent), "relationship parent")?.to_owned(),
+                        ),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        _ => return Err(invalid_json("Relationships is not an object")),
+    };
+    let packet_index = json_get(object, &BATCH_PACKET_INDEX)?
+        .ok_or_else(|| invalid_json("missing PacketIndex"))?;
+    let total_packets = json_get(object, &BATCH_TOTAL_PACKETS)?
+        .ok_or_else(|| invalid_json("missing TotalPackets"))?;
+    Ok(CborValue::Map(vec![
+        ("Leaves".to_owned(), leaves),
+        ("Relationships".to_owned(), relationships),
+        (
             "PacketIndex".to_owned(),
-            json_unsigned(index, "PacketIndex")?,
-        ));
-    }
-    if let Some(total) = json_get(object, &BATCH_TOTAL_PACKETS)? {
-        pairs.push((
+            json_unsigned(packet_index, "PacketIndex")?,
+        ),
+        (
             "TotalPackets".to_owned(),
-            json_unsigned(total, "TotalPackets")?,
-        ));
-    }
-    Ok(CborValue::Map(pairs))
+            json_unsigned(total_packets, "TotalPackets")?,
+        ),
+    ]))
 }
 
 fn json_proof_map_to_cbor(value: &JsonValue, field: &'static str) -> Result<CborValue> {
-    match value {
-        JsonValue::Null => Ok(CborValue::Null),
-        JsonValue::Object(values) => Ok(CborValue::Map(
-            values
-                .iter()
-                .map(|(key, proof)| Ok((key.clone(), json_proof_to_cbor(proof)?)))
-                .collect::<Result<Vec<_>>>()?,
-        )),
-        _ => Err(invalid_json(format!("{field} is not an object"))),
-    }
+    let JsonValue::Object(values) = value else {
+        return Err(invalid_json(format!("{field} is not an object")));
+    };
+    Ok(CborValue::Map(
+        values
+            .iter()
+            .map(|(key, proof)| Ok((key.clone(), json_proof_to_cbor(proof)?)))
+            .collect::<Result<Vec<_>>>()?,
+    ))
 }
 
 fn json_unsigned(value: &JsonValue, field: &'static str) -> Result<CborValue> {
@@ -1416,12 +1499,14 @@ mod streaming_tests {
         assert_eq!(format!("{streamed_error:?}"), format!("{retained_error:?}"));
         assert_eq!(streaming, before);
 
-        // A packet whose parent the receiver has not seen.
+        // A correctly positioned packet whose parent the receiver has not seen.
+        let mut orphan = packets[1].clone();
+        orphan.packet_index = 0;
         let mut fresh = BatchedDagReceiver::new();
-        let retained_error = fresh.apply_and_verify(&packets[1]).unwrap_err();
+        let retained_error = fresh.apply_and_verify(&orphan).unwrap_err();
         let mut streaming = BatchedDagReceiver::new();
         let streamed_error = streaming
-            .apply_and_verify_streaming::<Error>(&packets[1], &mut |_, _| {
+            .apply_and_verify_streaming::<Error>(&orphan, &mut |_, _| {
                 panic!("an orphan payload must never reach the sink")
             })
             .unwrap_err();
@@ -1482,5 +1567,85 @@ mod streaming_tests {
         let skeleton = receiver.finish_verified().unwrap();
         assert_eq!(skeleton.root(), source.root());
         assert!(!skeleton.is_partial());
+    }
+    #[test]
+    fn receiver_rejects_replayed_skipped_inconsistent_and_incomplete_batches() {
+        let source = chunked_dag(10, 0, 0);
+        let batches = packets(&source);
+        let mut receiver = BatchedDagReceiver::new();
+        receiver.apply_and_verify(&batches[0]).unwrap();
+        let after_first = receiver.clone();
+
+        assert!(matches!(
+            receiver.apply_and_verify(&batches[0]),
+            Err(Error::InvalidData { .. })
+        ));
+        assert_eq!(receiver, after_first);
+        assert!(matches!(
+            receiver.apply_and_verify(&batches[2]),
+            Err(Error::InvalidData { .. })
+        ));
+        assert_eq!(receiver, after_first);
+
+        let mut inconsistent = batches[1].clone();
+        inconsistent.total_packets += 1;
+        assert!(matches!(
+            receiver.apply_and_verify(&inconsistent),
+            Err(Error::InvalidData { .. })
+        ));
+        assert_eq!(receiver, after_first);
+        assert!(matches!(
+            receiver.clone().finish_verified(),
+            Err(Error::InvalidData { detail }) if detail.contains("ended after 1 of")
+        ));
+
+        for batch in &batches[1..] {
+            receiver.apply_and_verify(batch).unwrap();
+        }
+        assert_eq!(receiver.finish_verified().unwrap().root(), source.root());
+    }
+
+    #[test]
+    fn strict_packet_schemas_reject_aliases_unknown_fields_and_invalid_counters() {
+        let source = chunked_dag(10, 0, 0);
+        let batches = packets(&source);
+        assert!(batches[0].root_leaf().is_some());
+        assert!(batches[1].root_leaf().is_none());
+
+        let canonical = batched_packet_wire_value(&batches[0], KeyOrder::Cbor);
+        assert!(batched_packet_from_wire_value(&canonical).is_ok());
+
+        let mut alias = canonical.clone();
+        let CborValue::Map(pairs) = &mut alias else {
+            unreachable!();
+        };
+        pairs.iter_mut().find(|(key, _)| key == "Leaves").unwrap().0 = "leaves".to_owned();
+        assert!(batched_packet_from_wire_value(&alias).is_err());
+
+        let mut unknown = canonical.clone();
+        let CborValue::Map(pairs) = &mut unknown else {
+            unreachable!();
+        };
+        pairs.push(("Unknown".to_owned(), CborValue::Null));
+        assert!(batched_packet_from_wire_value(&unknown).is_err());
+
+        let mut zero_total = canonical;
+        let CborValue::Map(pairs) = &mut zero_total else {
+            unreachable!();
+        };
+        pairs
+            .iter_mut()
+            .find(|(key, _)| key == "TotalPackets")
+            .unwrap()
+            .1 = CborValue::Unsigned(0);
+        assert!(batched_packet_from_wire_value(&zero_total).is_err());
+
+        let single = source.get_leaf_sequence().unwrap().remove(0);
+        let mut missing_parent = transmission_packet_wire_value(&single, KeyOrder::Cbor);
+        let CborValue::Map(pairs) = &mut missing_parent else {
+            unreachable!();
+        };
+        pairs.retain(|(key, _)| key != "ParentHash");
+        assert!(transmission_packet_from_wire_value(&missing_parent).is_err());
     }
 }

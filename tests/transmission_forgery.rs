@@ -12,8 +12,8 @@
 //! * an outer proof was looked up by map key but verified against the branch's
 //!   own declared child, so a branch filed under key C proving D was accepted.
 //!
-//! Neither tightening costs parity: Go builds relationships from real parent
-//! links, and files each proof under the child it proves.
+//! Both checks enforce the canonical relationship and proof-key bindings emitted
+//! by the Rust producer.
 
 mod support;
 
@@ -32,6 +32,10 @@ fn batched_receiver_rejects_a_foreign_child_claiming_a_single_link_parent() {
     // authentication to the unconditional link push.
     let victim_input = create_fixture(temp.path(), "single_large_file").unwrap();
     let victim = create_dag_with_options(&victim_input, &options_4096()).unwrap();
+    let victim_packets = victim
+        .batched_leaf_sequence_with(Batching::Disabled)
+        .unwrap();
+    assert!(victim_packets.len() > 1);
     assert_eq!(
         victim.root_leaf().current_link_count(),
         1,
@@ -71,15 +75,22 @@ fn batched_receiver_rejects_a_foreign_child_claiming_a_single_link_parent() {
         1,
         "the parent CID should appear only inside Relationships"
     );
-    let forged_json = json.replace(foreign_parent.as_str(), victim.root().as_str());
+    let expected_packet = &victim_packets[1];
+    let foreign_index = format!("\"PacketIndex\": {}", foreign_packet.packet_index());
+    let expected_index = format!("\"PacketIndex\": {}", expected_packet.packet_index());
+    let foreign_total = format!("\"TotalPackets\": {}", foreign_packet.total_packets());
+    let expected_total = format!("\"TotalPackets\": {}", expected_packet.total_packets());
+    let forged_json = json
+        .replace(foreign_parent.as_str(), victim.root().as_str())
+        .replace(&foreign_index, &expected_index)
+        .replace(&foreign_total, &expected_total);
     let forged = BatchedTransmissionPacket::from_json(forged_json.as_bytes())
         .expect("the forgery is structurally valid, which is the point");
 
-    // Seed the receiver with the victim's honest batches.
+    // Seed packet zero so the forged packet reaches relationship authentication
+    // with the expected transfer index and total.
     let mut receiver = BatchedDagReceiver::new();
-    for packet in victim.batched_leaf_sequence().unwrap() {
-        receiver.apply_and_verify(&packet).unwrap();
-    }
+    receiver.apply_and_verify(&victim_packets[0]).unwrap();
     let before = receiver.leaves().clone();
 
     let result = receiver.apply_and_verify(&forged);

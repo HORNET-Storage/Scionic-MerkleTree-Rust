@@ -28,12 +28,12 @@ fn all_go_fixtures_round_trip_canonical_json_and_cbor() {
 }
 
 #[test]
-fn swift_lower_camel_json_aliases_decode_to_the_go_shape() {
-    let temp = TempDir::new("layer5-swift-json").unwrap();
+fn lower_camel_json_aliases_are_rejected() {
+    let temp = TempDir::new("layer5-lower-camel-json").unwrap();
     let input = create_fixture(temp.path(), "single_small_file").unwrap();
     let dag = create_dag_with_options(&input, &options_4096()).unwrap();
-    let mut swift = String::from_utf8(dag.to_json().unwrap()).unwrap();
-    for (go, swift_name) in [
+    let mut lower_camel = String::from_utf8(dag.to_json().unwrap()).unwrap();
+    for (canonical, alias) in [
         ("Root", "root"),
         ("Leafs", "leafs"),
         ("Hash", "hash"),
@@ -49,11 +49,35 @@ fn swift_lower_camel_json_aliases_decode_to_the_go_shape() {
         ("Links", "links"),
         ("AdditionalData", "additionalData"),
     ] {
-        swift = swift.replace(&format!("\"{go}\""), &format!("\"{swift_name}\""));
+        lower_camel = lower_camel.replace(&format!("\"{canonical}\""), &format!("\"{alias}\""));
     }
-    let restored = Dag::from_json(swift.as_bytes()).unwrap();
-    assert_eq!(restored, dag);
-    restored.verify().unwrap();
+    assert!(Dag::from_json(lower_camel.as_bytes()).is_err());
+}
+
+#[test]
+fn non_root_wire_counters_must_be_zero() {
+    let temp = TempDir::new("layer5-non-root-counters").unwrap();
+    let input = create_fixture(temp.path(), "single_small_file").unwrap();
+    let dag = create_dag_with_options(&input, &options_4096()).unwrap();
+    let non_root = dag
+        .leaves()
+        .values()
+        .find(|leaf| leaf.cid() != dag.root())
+        .expect("fixture has a non-root leaf");
+    let json = String::from_utf8(dag.to_json().unwrap()).unwrap();
+    let marker = format!("\"{}\": {{", non_root.cid());
+    let leaf_start = json.find(&marker).expect("serialized non-root leaf");
+
+    for field in ["LeafCount", "ContentSize", "DagSize"] {
+        let mut changed = json.clone();
+        let needle = format!("\"{field}\": 0");
+        let relative = changed[leaf_start..]
+            .find(&needle)
+            .unwrap_or_else(|| panic!("serialized non-root {field}"));
+        let start = leaf_start + relative;
+        changed.replace_range(start..start + needle.len(), &format!("\"{field}\": 1"));
+        assert!(Dag::from_json(changed.as_bytes()).is_err(), "{field}");
+    }
 }
 
 #[test]

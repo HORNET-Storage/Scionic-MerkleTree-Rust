@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-#![doc = "A byte-compatible Scionic Merkle Tree implementation."]
+#![doc = "The authoritative Scionic Merkle Tree implementation."]
 
 mod classic;
 mod dag;
@@ -57,11 +57,6 @@ pub enum Error {
     },
     DuplicateKey {
         key: String,
-    },
-    AmbiguousFieldSpellings {
-        field: &'static str,
-        first: String,
-        second: String,
     },
     InvalidMerkleLeafCount {
         count: usize,
@@ -215,14 +210,6 @@ impl fmt::Display for Error {
             Self::InvalidLeafType { value } => write!(f, "invalid leaf type: {value:?}"),
             Self::InvalidData { detail } => write!(f, "invalid DAG data: {detail}"),
             Self::DuplicateKey { key } => write!(f, "duplicate map key: {key:?}"),
-            Self::AmbiguousFieldSpellings {
-                field,
-                first,
-                second,
-            } => write!(
-                f,
-                "ambiguous spellings for {field}: {first:?} and {second:?}"
-            ),
             Self::InvalidMerkleLeafCount { count } => write!(
                 f,
                 "classic Merkle trees require at least two leaves, got {count}"
