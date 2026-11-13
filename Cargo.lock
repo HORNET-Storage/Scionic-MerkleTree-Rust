@@ -62,7 +62,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "scionic-merkletree"
-version = "2.4.3"
+version = "2.5.6"
 dependencies = [
  "sha2",
 ]
