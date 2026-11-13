@@ -1,8 +1,8 @@
 name: CI
 
-# Mirrors the local verification bar used for parity work:
+# The same checks that are run locally before a commit:
 # clippy across every target with warnings promoted to errors, then the full
-# test suite (which includes the committed spec-vector corpus assertions).
+# test suite, which holds the library to the vectors under spec/.
 
 on:
   push:

@@ -14,6 +14,6 @@ Required offline gates:
 2. `cargo clippy --all-targets --locked --offline -- -D warnings`
 3. `cargo test --locked --offline`
 
-Vectors committed before version 2.5.6 are historical evidence only: current Rust invariants take precedence over their byte parity. From version 2.5.6 the three libraries share one set of vectors, which each library makes and each of the other two accepts. Where they disagree, this crate's invariants decide, and the other library is fixed.
+The format is `spec/FORMAT.md`, and the code is held to it by the tests. The layout before it is gone from the tree, with its code and its vectors: they stay in history (`161f095`), nothing reads or writes that layout any more, and nothing is to be added for it. From version 2.5.6 the three libraries share one set of vectors under `spec/`, which each library makes and each of the other two accepts. Where they disagree, this crate's invariants decide, and the other library is fixed.
 
 The gitignored `.local/` notes (`.local/AGENTS.md`, `.local/PORT-PLAN.md`) are the 2026-07 porting record. Where they ask for Go byte parity as a requirement, this file and the workspace `../AGENTS.md` take precedence.
