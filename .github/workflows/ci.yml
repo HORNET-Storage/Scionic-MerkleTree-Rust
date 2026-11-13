@@ -1,24 +1,44 @@
 name: CI
 
-# The same checks that are run locally before a commit:
-# clippy across every target with warnings promoted to errors, then the full
-# test suite, which holds the library to the vectors under spec/.
+# The checks that are run locally before a commit, on Linux, macOS and
+# Windows: formatting, clippy across every target with warnings promoted to
+# errors, and the full test suite, built for testing and built for use.
+# The tests hold the library to the vectors under spec/, and to the forged
+# bytes that it has to refuse.
 
 on:
   push:
-    branches: [main]
+    branches: [main, hardening]
   pull_request:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    name: clippy -D warnings + tests
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --locked --release
+
+  oldest:
+    name: the oldest Rust the package names
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install 1.85.0 --profile minimal
+      - run: cargo +1.85.0 test --locked
