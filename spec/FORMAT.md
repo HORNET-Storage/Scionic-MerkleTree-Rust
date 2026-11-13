@@ -211,10 +211,12 @@ A tree can hold a name that one system cannot. Writing out is stricter than hold
 - Before anything is written, every list and every piece must be there, and every name must be one the system can hold as it is. On Windows that leaves out names with `< > : " | ? * \` or a control character, names that end in a dot or a space, and the device names (`CON`, `NUL`, `COM1` and the like, with or without an ending).
 - Where two names of one folder land on the same place, as `File` and `file` do on Windows and macOS, the second is refused. So is a name that the system keeps differently from how it was given.
 - A name is never changed to make it fit. The error says which name it was.
+- A folder that this writing created is held open while it is filled, and what goes into it is made from the folder itself. A link that takes its place meanwhile is not written through.
 
 ## Building a tree
 
 - A file is read a part at a time and never held whole, and its hash does not depend on how it was read.
 - The record's totals are counted by the checks that a receiver runs, so a tree that is built has passed them.
 - A link is never followed. It is refused, or left out when the builder is told to. Anything that is neither a file nor a folder is refused.
+- That holds too for a link that takes a file's or a folder's place while the folder is read. A builder holds each folder open while it reads it, and opens what is in it from the folder itself, so that no path is looked up twice. Where a system has no way to do that, the builder says so.
 - A name that is not UTF-8 is refused.

@@ -24,7 +24,7 @@ A Scionic Merkle tree holds a folder of files, or one file, under one root hash.
 | `sync` | Answering requests from a store, fetching a whole tree, reading parts of one straight from a peer, bundles, and all of it over a connection. |
 | `store` | What a store has to do, and a store in memory. |
 
-The only dependency is `sha2`. The crate forbids `unsafe`.
+It depends on `sha2`, and on Unix on `rustix`, which opens a file from the folder it is in. The crate forbids `unsafe`.
 
 ## Using it
 
@@ -100,7 +100,8 @@ The tests under `tests/` hold the library to these, with forged bytes made by a 
 - A small tree that stands for an endless one, by holding one folder under many names, is counted before it is written out, and refused.
 - Bytes that were harmed in a store are found when the tree is checked, and named by their hash. They can be removed and fetched again.
 - Nothing a peer sends makes a store remove bytes that are sound. A list that names a held piece with a wrong length is refused, and the piece stays.
-- A link that is in a folder is never followed when a tree is built. A tree is written only to a new place, and only with names the system can hold as they are.
+- A link is never followed when a tree is built. That holds for a link that is in the folder, and for one that takes a file's or a folder's place while the folder is being read: each folder is held open while it is read, and what is in it is opened from the folder itself, never by a path that is looked up again.
+- A tree is written only to a new place, and only with names the system can hold as they are. The new folders are held open while they are filled, so a link that takes the place of one is not written through.
 - Malformed input is an error, and never a crash or a loop.
 
 ## What it does not do well yet
@@ -110,7 +111,8 @@ The tests under `tests/` hold the library to these, with forged bytes made by a 
 - Checking or fetching a whole tree keeps about a hundred bytes in memory for every different piece, so that each piece is counted once: about 50 MB for a terabyte.
 - A list is taken in whole. A file's list is about 19 MB for each terabyte of the file, and a folder's list has to fit in memory.
 - A responder that tells a peer which pieces of a file it holds looks into its store for each of them. `Responder::have(false)` switches that off for one that serves strangers.
-- A tree is built from a folder as the folder is while it is read. If another program on the same machine changes the folder during the build, the tree can hold a mix of old and new, and if that program swaps a folder for a link in that time, the build goes where the link leads. Closing this for good takes a way of opening files that Rust's standard library does not offer without code marked `unsafe` or another dependency, and this library has neither. Build from a folder that no other program is writing to. A tree is written out into a new folder of its own, which other users cannot change; a program that runs as the same user is not guarded against.
+- A tree is built from a folder as the folder is while it is read. If another program changes files in it meanwhile, the tree can hold a mix of old and new. It cannot be led outside the folder.
+- Opening every file from its folder costs a little for each file on Windows: a folder of 20,000 small files took 0.19 seconds to build where it had taken 0.15. While a folder is being read there, other programs cannot rename or delete it. On systems that are neither Unix nor Windows, a folder is not held open, and a link that is swapped in while a folder is read can be followed.
 
 ## Checking a change
 
