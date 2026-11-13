@@ -1,15 +1,15 @@
 //! The things a tree is made of, and their exact bytes.
 //!
-//! * A **piece** is a run of a file's bytes. Its hash is the SHA-256 of those
+//! * A **chunk** is a range of a file's bytes. Its hash is the SHA-256 of those
 //!   bytes, and nothing else.
-//! * A **file** is the list of its pieces, in the file's order.
+//! * A **file** is the list of its chunks, in the file's order.
 //! * A **folder** is the list of its entries, sorted by name. An entry holds a
 //!   name, and the file or folder under it.
 //! * The **record** says what a tree's root stands for.
 //!
 //! A thing's hash covers what the thing is, and its parent's hash covers where
-//! it sits. So a file has no name of its own and a piece has no number of its
-//! own: the name is in the folder, and the number is the piece's place in the
+//! it sits. So a file has no name of its own and a chunk has no number of its
+//! own: the name is in the folder, and the number is the chunk's place in the
 //! file's list.
 //!
 //! A value of one of these types is always well formed. It is checked when it
@@ -19,7 +19,7 @@
 use crate::fastcdc::{FASTCDC_MAX_SIZE, FASTCDC_MIN_SIZE};
 use crate::hash::{Hash, Root};
 use crate::tree::{
-    check_lookup, check_opening, top_of, Carried, Leaf, ListKind, ListTree, Node, EMPTY_LIST,
+    check_branch, check_lookup, top_of, Carried, Leaf, ListKind, ListTree, Node, EMPTY_LIST,
     MAX_LIST_ITEMS,
 };
 use crate::{Error, Result};
@@ -27,8 +27,8 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-/// The most bytes a piece may hold: 8 MiB.
-pub const MAX_PIECE_BYTES: usize = FASTCDC_MAX_SIZE;
+/// The most bytes a chunk may hold: 8 MiB.
+pub const MAX_CHUNK_BYTES: usize = FASTCDC_MAX_SIZE;
 /// How many bytes one item of a file's list takes: a hash and a length.
 pub const LIST_ITEM_BYTES: usize = 36;
 /// The most bytes a name may hold.
@@ -41,7 +41,7 @@ pub const MAX_EXTRA_NAME_BYTES: usize = 64;
 pub const MAX_EXTRA_VALUE_BYTES: usize = 1024;
 /// The most folders that may sit inside one another, the top one counted.
 pub const MAX_FOLDER_DEPTH: usize = 128;
-/// The most nodes an opening may carry: 40 on each side of what it shows.
+/// The most nodes a branch may carry: 40 on each side of what it shows.
 pub const MAX_CARRIED_NODES: usize = 80;
 /// The most bytes a set of extra data may take: how many values it has, and
 /// 32 values that are as long as they can be.
@@ -53,13 +53,13 @@ pub const MAX_RECORD_BYTES: usize = 66 + MAX_EXTRA_BYTES;
 /// The most bytes a folder's entry may take: its fixed part, the longest
 /// name, and extra data that is as full as it can be.
 pub const MAX_ENTRY_BYTES: usize = 43 + MAX_NAME_BYTES + MAX_EXTRA_BYTES;
-/// The extra value of a record that says how the tree's files were cut.
-pub const CUTTING_KEY: &str = "chunking";
+/// The extra value of a record that says how the tree's files were chunked.
+pub const CHUNKING_KEY: &str = "chunking";
 /// The extra value of a record that says when the tree was built.
 pub const TIMESTAMP_KEY: &str = "timestamp";
-/// How a tree says that its files were cut by content.
-pub const CUTTING_FASTCDC_V1: &str = "fastcdc-v1";
-const CUTTING_FIXED_PREFIX: &str = "fixed-";
+/// How a tree says that its files were chunked by content.
+pub const CHUNKING_FASTCDC_V1: &str = "fastcdc-v1";
+const CHUNKING_FIXED_PREFIX: &str = "fixed-";
 
 const FILE_LEAF_MARK: u8 = 0x00;
 const FOLDER_LEAF_MARK: u8 = 0x02;
@@ -75,7 +75,7 @@ fn invalid(detail: impl Into<String>) -> Error {
     }
 }
 
-/// Reads numbers and runs of bytes off the front of a slice.
+/// Reads numbers and bytes off the front of a slice.
 pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     what: &'static str,
@@ -320,15 +320,15 @@ impl ExtraData {
     }
 }
 
-/// One item of a file's list: a piece's hash, and how many bytes it holds.
+/// One item of a file's list: a chunk's hash, and how many bytes it holds.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct PieceRef {
+pub struct ChunkRef {
     pub hash: Hash,
     pub length: u32,
 }
 
-impl PieceRef {
-    /// The item for a piece with these bytes. A piece holds 1 byte to 8 MiB.
+impl ChunkRef {
+    /// The item for a chunk with these bytes. A chunk holds 1 byte to 8 MiB.
     pub fn of(bytes: &[u8]) -> Result<Self> {
         let item = Self {
             hash: Hash::of(bytes),
@@ -339,13 +339,13 @@ impl PieceRef {
     }
 
     fn check(&self) -> Result<()> {
-        if self.length == 0 || self.length as usize > MAX_PIECE_BYTES {
-            return Err(invalid("a piece does not hold 1 byte to 8 MiB"));
+        if self.length == 0 || self.length as usize > MAX_CHUNK_BYTES {
+            return Err(invalid("a chunk does not hold 1 byte to 8 MiB"));
         }
         Ok(())
     }
 
-    /// Whether `bytes` are the piece this item names: of its length, and
+    /// Whether `bytes` are the chunk this item names: of its length, and
     /// with its hash.
     pub fn matches(&self, bytes: &[u8]) -> bool {
         bytes.len() as u64 == u64::from(self.length) && Hash::of(bytes) == self.hash
@@ -474,7 +474,7 @@ fn owner_hash(mark: u8, count: u64, size: u64, list: &Hash) -> Hash {
     Hash::of(&bytes)
 }
 
-/// The hash of a file with `count` pieces and `size` bytes, whose list's tree
+/// The hash of a file with `count` chunks and `size` bytes, whose list's tree
 /// has `list` on top.
 pub fn file_hash(count: u64, size: u64, list: &Hash) -> Hash {
     owner_hash(FILE_MARK, count, size, list)
@@ -505,42 +505,42 @@ fn confirm(target: &Target, count: u64, top: Node) -> Result<()> {
     Ok(())
 }
 
-/// How a tree's files are cut into pieces.
+/// How a tree's files are split into chunks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Cutting {
-    /// By content: pieces of more than 512 KiB, about 2 MiB on average, and
-    /// 8 MiB at most. Only a file's last piece may be smaller.
+pub enum Chunking {
+    /// By content: chunks of more than 512 KiB, about 2 MiB on average, and
+    /// 8 MiB at most. Only a file's last chunk may be smaller.
     FastCdcV1,
-    /// Every piece but a file's last holds exactly this many bytes. For tests.
+    /// Every chunk but a file's last holds exactly this many bytes. For tests.
     Fixed(NonZeroU32),
 }
 
-impl Cutting {
-    /// Cutting at a fixed size, of 1 byte to 8 MiB.
+impl Chunking {
+    /// Chunking at a fixed size, of 1 byte to 8 MiB.
     pub fn fixed(size: u32) -> Result<Self> {
         NonZeroU32::new(size)
-            .filter(|size| size.get() as usize <= MAX_PIECE_BYTES)
+            .filter(|size| size.get() as usize <= MAX_CHUNK_BYTES)
             .map(Self::Fixed)
-            .ok_or_else(|| invalid("a fixed piece size is not 1 byte to 8 MiB"))
+            .ok_or_else(|| invalid("a fixed chunk size is not 1 byte to 8 MiB"))
     }
 
     /// How a record says this: `fastcdc-v1`, or `fixed-` and the size.
     pub fn tag(self) -> String {
         match self {
-            Self::FastCdcV1 => CUTTING_FASTCDC_V1.to_owned(),
-            Self::Fixed(size) => format!("{CUTTING_FIXED_PREFIX}{size}"),
+            Self::FastCdcV1 => CHUNKING_FASTCDC_V1.to_owned(),
+            Self::Fixed(size) => format!("{CHUNKING_FIXED_PREFIX}{size}"),
         }
     }
 
     /// Reads what a record says. A size is written in digits with no zero in
-    /// front, so each way of cutting has one spelling.
+    /// front, so each way of chunking has one spelling.
     pub fn from_tag(tag: &[u8]) -> Result<Self> {
-        let unknown = || invalid("a record names a way of cutting that is not known");
-        if tag == CUTTING_FASTCDC_V1.as_bytes() {
+        let unknown = || invalid("a record names a way of chunking that is not known");
+        if tag == CHUNKING_FASTCDC_V1.as_bytes() {
             return Ok(Self::FastCdcV1);
         }
         let digits = tag
-            .strip_prefix(CUTTING_FIXED_PREFIX.as_bytes())
+            .strip_prefix(CHUNKING_FIXED_PREFIX.as_bytes())
             .ok_or_else(unknown)?;
         if digits.is_empty()
             || digits.len() > 7
@@ -555,7 +555,7 @@ impl Cutting {
         Self::fixed(size).map_err(|_| unknown())
     }
 
-    /// Whether a piece of `length` bytes fits, as a file's last piece or as
+    /// Whether a chunk of `length` bytes fits, as a file's last chunk or as
     /// one before it.
     pub fn check_length(self, length: u32, is_last: bool) -> Result<()> {
         let length = length as usize;
@@ -576,12 +576,12 @@ impl Cutting {
             Ok(())
         } else {
             Err(invalid(
-                "a piece has a length that the tree's way of cutting does not give",
+                "a chunk has a length that the tree's way of chunking does not give",
             ))
         }
     }
 
-    /// The fewest and the most pieces that a file of `size` bytes can have.
+    /// The fewest and the most chunks that a file of `size` bytes can have.
     pub fn count_bounds(self, size: u64) -> (u64, u64) {
         if size == 0 {
             return (0, 0);
@@ -591,38 +591,38 @@ impl Cutting {
                 size.div_ceil(FASTCDC_MAX_SIZE as u64),
                 (size - 1) / (FASTCDC_MIN_SIZE as u64 + 1) + 1,
             ),
-            Self::Fixed(piece) => {
-                let count = size.div_ceil(u64::from(piece.get()));
+            Self::Fixed(chunk) => {
+                let count = size.div_ceil(u64::from(chunk.get()));
                 (count, count)
             }
         }
     }
 
-    /// Whether a file of `size` bytes can have `count` pieces.
+    /// Whether a file of `size` bytes can have `count` chunks.
     pub fn check_count(self, size: u64, count: u64) -> Result<()> {
         let (fewest, most) = self.count_bounds(size);
         if (fewest..=most).contains(&count) {
             Ok(())
         } else {
             Err(invalid(
-                "a file has a number of pieces that its size does not allow",
+                "a file has a number of chunks that its size does not allow",
             ))
         }
     }
 }
 
-/// A file: the list of its pieces, in the file's order.
+/// A file: the list of its chunks, in the file's order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileList {
-    items: Vec<PieceRef>,
+    items: Vec<ChunkRef>,
     size: u64,
     hash: Hash,
 }
 
 impl FileList {
-    /// The file with these pieces, in this order. A piece that occurs twice
-    /// is listed twice. No pieces at all is the empty file.
-    pub fn new(items: Vec<PieceRef>) -> Result<Self> {
+    /// The file with these chunks, in this order. A chunk that occurs twice
+    /// is listed twice. No chunks at all is the empty file.
+    pub fn new(items: Vec<ChunkRef>) -> Result<Self> {
         let mut leaves = Vec::with_capacity(items.len());
         for item in &items {
             item.check()?;
@@ -639,20 +639,20 @@ impl FileList {
         })
     }
 
-    /// Reads the items of a whole list: 36 bytes for each piece.
-    fn items_of(bytes: &[u8]) -> Result<Vec<PieceRef>> {
+    /// Reads the items of a whole list: 36 bytes for each chunk.
+    fn items_of(bytes: &[u8]) -> Result<Vec<ChunkRef>> {
         if bytes.len() % LIST_ITEM_BYTES != 0 {
             return Err(invalid("a file's list is not a whole number of items"));
         }
         let mut reader = Reader::new(bytes, "a file's list");
         let mut items = Vec::with_capacity(bytes.len() / LIST_ITEM_BYTES);
         while !reader.is_empty() {
-            items.push(PieceRef::decode(&mut reader)?);
+            items.push(ChunkRef::decode(&mut reader)?);
         }
         Ok(items)
     }
 
-    /// Reads a whole list: 36 bytes for each piece.
+    /// Reads a whole list: 36 bytes for each chunk.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         Self::new(Self::items_of(bytes)?)
     }
@@ -665,11 +665,11 @@ impl FileList {
         out
     }
 
-    pub fn items(&self) -> &[PieceRef] {
+    pub fn items(&self) -> &[ChunkRef] {
         &self.items
     }
 
-    /// How many pieces the file has.
+    /// How many chunks the file has.
     pub fn count(&self) -> u64 {
         self.items.len() as u64
     }
@@ -679,7 +679,7 @@ impl FileList {
         self.size
     }
 
-    /// The file's hash. It covers the pieces, their order, how many there
+    /// The file's hash. It covers the chunks, their order, how many there
     /// are and the size, and nothing about where the file sits.
     pub fn hash(&self) -> &Hash {
         &self.hash
@@ -698,12 +698,12 @@ impl FileList {
         self.items.len() as u64 * LIST_ITEM_BYTES as u64
     }
 
-    /// Whether every piece has a length that `cutting` gives.
-    pub fn check_cutting(&self, cutting: Cutting) -> Result<()> {
-        cutting.check_count(self.size, self.count())?;
+    /// Whether every chunk has a length that `chunking` gives.
+    pub fn check_chunking(&self, chunking: Chunking) -> Result<()> {
+        chunking.check_count(self.size, self.count())?;
         let last = self.items.len().saturating_sub(1);
         for (index, item) in self.items.iter().enumerate() {
-            cutting.check_length(item.length, index == last)?;
+            chunking.check_length(item.length, index == last)?;
         }
         Ok(())
     }
@@ -718,16 +718,16 @@ impl FileList {
             .collect()
     }
 
-    /// Shows pieces `start` up to, not including, `end`. This hashes the
+    /// Shows chunks `start` up to, not including, `end`. This hashes the
     /// whole list each time: keep an [`OpenFile`] to show many parts.
-    pub fn open(&self, start: u64, end: u64) -> Result<FileRun> {
+    pub fn open(&self, start: u64, end: u64) -> Result<FileBranch> {
         let tree = ListTree::build(ListKind::File, &self.leaves())?;
         self.open_with(&tree, start, end)
     }
 
-    fn open_with(&self, tree: &ListTree, start: u64, end: u64) -> Result<FileRun> {
+    fn open_with(&self, tree: &ListTree, start: u64, end: u64) -> Result<FileBranch> {
         let carried = tree.open(start, end)?;
-        Ok(FileRun {
+        Ok(FileBranch {
             count: self.count(),
             start,
             items: self.items[start as usize..end as usize].to_vec(),
@@ -737,12 +737,12 @@ impl FileList {
 }
 
 /// A file's list with its tree kept, for showing many parts of it, and for
-/// finding the pieces that hold a stretch of bytes.
+/// finding the chunks that hold a stretch of bytes.
 #[derive(Clone, Debug)]
 pub struct OpenFile {
     list: Arc<FileList>,
     tree: ListTree,
-    /// Where each piece starts, and after the last one the file's size.
+    /// Where each chunk starts, and after the last one the file's size.
     starts: Vec<u64>,
 }
 
@@ -798,58 +798,58 @@ impl OpenFile {
         Arc::clone(&self.list)
     }
 
-    /// The byte at which piece `index` starts. The count gives the size.
+    /// The byte at which chunk `index` starts. The count gives the size.
     pub fn start_of(&self, index: u64) -> Option<u64> {
         self.starts.get(usize::try_from(index).ok()?).copied()
     }
 
-    /// The pieces that hold the `length` bytes from `offset`: the first one's
+    /// The chunks that hold the `length` bytes from `offset`: the first one's
     /// number, and the number after the last one. The stretch must lie
     /// inside the file and hold at least one byte.
-    pub fn pieces_for(&self, offset: u64, length: u64) -> Result<(u64, u64)> {
+    pub fn chunks_for(&self, offset: u64, length: u64) -> Result<(u64, u64)> {
         let end = offset
             .checked_add(length)
             .filter(|end| length > 0 && *end <= self.list.size)
             .ok_or_else(|| invalid("a stretch of bytes is outside the file"))?;
-        // Every piece holds a byte, so the starts ascend and each is found.
+        // Every chunk holds a byte, so the starts ascend and each is found.
         let first = self.starts.partition_point(|start| *start <= offset) - 1;
         let after = self.starts.partition_point(|start| *start < end);
         Ok((first as u64, after as u64))
     }
 
-    /// Shows pieces `start` up to, not including, `end`.
-    pub fn open(&self, start: u64, end: u64) -> Result<FileRun> {
+    /// Shows chunks `start` up to, not including, `end`.
+    pub fn open(&self, start: u64, end: u64) -> Result<FileBranch> {
         self.list.open_with(&self.tree, start, end)
     }
 
-    /// Shows the pieces that hold the `length` bytes from `offset`.
-    pub fn open_bytes(&self, offset: u64, length: u64) -> Result<FileRun> {
-        let (start, end) = self.pieces_for(offset, length)?;
+    /// Shows the chunks that hold the `length` bytes from `offset`.
+    pub fn open_bytes(&self, offset: u64, length: u64) -> Result<FileBranch> {
+        let (start, end) = self.chunks_for(offset, length)?;
         self.open(start, end)
     }
 }
 
-/// A run of a file's list, with the nodes that stand for the rest of it.
+/// A branch of a file's list, with the nodes that stand for the rest of it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileRun {
+pub struct FileBranch {
     count: u64,
     start: u64,
-    items: Vec<PieceRef>,
+    items: Vec<ChunkRef>,
     carried: Vec<Carried>,
 }
 
-impl FileRun {
-    /// How many pieces the whole file is said to have.
+impl FileBranch {
+    /// How many chunks the whole file is said to have.
     pub fn count(&self) -> u64 {
         self.count
     }
 
-    /// The number of the first piece shown.
+    /// The number of the first chunk shown.
     pub fn start(&self) -> u64 {
         self.start
     }
 
-    pub fn items(&self) -> &[PieceRef] {
+    pub fn items(&self) -> &[ChunkRef] {
         &self.items
     }
 
@@ -871,16 +871,16 @@ impl FileRun {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut reader = Reader::new(bytes, "a run of a file's list");
-        let (count, start, shown) = run_header(&mut reader)?;
+        let mut reader = Reader::new(bytes, "a branch of a file's list");
+        let (count, start, shown) = branch_header(&mut reader)?;
         if shown == 0 || reader.remaining() / LIST_ITEM_BYTES < shown {
             return Err(invalid(
-                "a run of a file's list is cut short, or shows nothing",
+                "a branch of a file's list is cut short, or shows nothing",
             ));
         }
         let mut items = Vec::with_capacity(shown);
         for _ in 0..shown {
-            items.push(PieceRef::decode(&mut reader)?);
+            items.push(ChunkRef::decode(&mut reader)?);
         }
         let mut carried = Vec::new();
         for _ in 0..carried_count(&mut reader)? {
@@ -901,15 +901,15 @@ impl FileRun {
         })
     }
 
-    /// Checks the run against the file it is said to be a part of, and gives
-    /// the byte of the file at which the run starts. With a way of cutting,
-    /// the pieces' lengths are held to it too.
-    pub fn check(&self, file: &Target, cutting: Option<Cutting>) -> Result<u64> {
+    /// Checks the branch against the file it is said to be a part of, and gives
+    /// the byte of the file at which the branch starts. With a way of chunking,
+    /// the chunks' lengths are held to it too.
+    pub fn check(&self, file: &Target, chunking: Option<Chunking>) -> Result<u64> {
         file.require(Kind::File)?;
-        if let Some(cutting) = cutting {
-            cutting.check_count(file.size, self.count)?;
+        if let Some(chunking) = chunking {
+            chunking.check_count(file.size, self.count)?;
             for (place, item) in (self.start..).zip(&self.items) {
-                cutting.check_length(item.length, place + 1 == self.count)?;
+                chunking.check_length(item.length, place + 1 == self.count)?;
             }
         }
         let leaves: Vec<Leaf<'_>> = self
@@ -920,7 +920,7 @@ impl FileRun {
                 name: &[],
             })
             .collect();
-        let shown = check_opening(
+        let shown = check_branch(
             ListKind::File,
             self.count,
             self.start,
@@ -932,9 +932,9 @@ impl FileRun {
     }
 }
 
-/// What every run starts with: how many items the whole list has, the place
+/// What every branch starts with: how many items the whole list has, the place
 /// of the first one shown, and how many are shown.
-fn run_header(reader: &mut Reader<'_>) -> Result<(u64, u64, usize)> {
+fn branch_header(reader: &mut Reader<'_>) -> Result<(u64, u64, usize)> {
     let count = reader.u64()?;
     let start = reader.u64()?;
     let shown = reader.u32()?;
@@ -942,7 +942,7 @@ fn run_header(reader: &mut Reader<'_>) -> Result<(u64, u64, usize)> {
         .checked_add(u64::from(shown))
         .is_some_and(|end| end <= count);
     if count > MAX_LIST_ITEMS || !inside {
-        return Err(invalid("a run lies outside its list"));
+        return Err(invalid("a branch lies outside its list"));
     }
     Ok((count, start, shown as usize))
 }
@@ -950,7 +950,7 @@ fn run_header(reader: &mut Reader<'_>) -> Result<(u64, u64, usize)> {
 fn carried_count(reader: &mut Reader<'_>) -> Result<usize> {
     let count = usize::from(reader.u16()?);
     if count > MAX_CARRIED_NODES {
-        return Err(invalid("a run carries more nodes than any list needs"));
+        return Err(invalid("a branch carries more nodes than any list needs"));
     }
     Ok(count)
 }
@@ -1074,21 +1074,21 @@ impl FolderList {
 
     /// Shows entries `start` up to, not including, `end`. This hashes the
     /// whole list each time: keep an [`OpenFolder`] to show many parts.
-    pub fn open(&self, start: u64, end: u64) -> Result<FolderRun> {
+    pub fn open(&self, start: u64, end: u64) -> Result<FolderBranch> {
         let tree = ListTree::build(ListKind::Folder, &self.leaves())?;
         self.open_with(&tree, start, end)
     }
 
     /// Shows the entry at the one place where `name` can be. It answers
     /// whether the folder has the name, whichever way the answer falls.
-    pub fn open_name(&self, name: &str) -> Result<FolderRun> {
+    pub fn open_name(&self, name: &str) -> Result<FolderBranch> {
         let tree = ListTree::build(ListKind::Folder, &self.leaves())?;
         self.open_name_with(&tree, name)
     }
 
-    fn open_with(&self, tree: &ListTree, start: u64, end: u64) -> Result<FolderRun> {
+    fn open_with(&self, tree: &ListTree, start: u64, end: u64) -> Result<FolderBranch> {
         let carried = tree.open(start, end)?;
-        Ok(FolderRun {
+        Ok(FolderBranch {
             count: self.count(),
             start,
             entries: self.entries[start as usize..end as usize].to_vec(),
@@ -1096,11 +1096,11 @@ impl FolderList {
         })
     }
 
-    fn open_name_with(&self, tree: &ListTree, name: &str) -> Result<FolderRun> {
+    fn open_name_with(&self, tree: &ListTree, name: &str) -> Result<FolderBranch> {
         check_name(name)?;
         match self.place_of(name) {
             Some(place) => self.open_with(tree, place, place + 1),
-            None => Ok(FolderRun {
+            None => Ok(FolderBranch {
                 count: 0,
                 start: 0,
                 entries: Vec::new(),
@@ -1152,28 +1152,28 @@ impl OpenFolder {
     }
 
     /// Shows entries `start` up to, not including, `end`.
-    pub fn open(&self, start: u64, end: u64) -> Result<FolderRun> {
+    pub fn open(&self, start: u64, end: u64) -> Result<FolderBranch> {
         self.list.open_with(&self.tree, start, end)
     }
 
     /// Shows the entry at the one place where `name` can be.
-    pub fn open_name(&self, name: &str) -> Result<FolderRun> {
+    pub fn open_name(&self, name: &str) -> Result<FolderBranch> {
         self.list.open_name_with(&self.tree, name)
     }
 }
 
-/// A run of a folder's list, with the nodes that stand for the rest of it.
-/// A run of an empty folder shows nothing, and carries nothing.
+/// A branch of a folder's list, with the nodes that stand for the rest of it.
+/// A branch of an empty folder shows nothing, and carries nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FolderRun {
+pub struct FolderBranch {
     count: u64,
     start: u64,
     entries: Vec<Entry>,
     carried: Vec<Carried>,
 }
 
-impl FolderRun {
-    /// The run of an empty folder: it shows nothing, and carries nothing.
+impl FolderBranch {
+    /// The branch of an empty folder: it shows nothing, and carries nothing.
     pub(crate) fn empty() -> Self {
         Self {
             count: 0,
@@ -1216,14 +1216,14 @@ impl FolderRun {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut reader = Reader::new(bytes, "a run of a folder's list");
-        let (count, start, shown) = run_header(&mut reader)?;
+        let mut reader = Reader::new(bytes, "a branch of a folder's list");
+        let (count, start, shown) = branch_header(&mut reader)?;
         if (shown == 0) != (count == 0) {
-            return Err(invalid("a run of a folder's list shows nothing"));
+            return Err(invalid("a branch of a folder's list shows nothing"));
         }
         // An entry takes 45 bytes at least, so a count is held to the bytes.
         if reader.remaining() / 45 < shown {
-            return Err(invalid("a run of a folder's list is cut short"));
+            return Err(invalid("a branch of a folder's list is cut short"));
         }
         let mut entries = Vec::with_capacity(shown);
         for _ in 0..shown {
@@ -1236,7 +1236,7 @@ impl FolderRun {
                 size: reader.u64()?,
             };
             let name_len = usize::from(reader.u16()?);
-            // The first carried node of a run that does not start the list
+            // The first carried node of a branch that does not start the list
             // is the node that begins the list. No fork hashes a name for
             // it, so it comes with none. Every other one comes with a name.
             let begins_the_list = index == 0 && start > 0;
@@ -1257,7 +1257,7 @@ impl FolderRun {
         }
         reader.finish()?;
         if count == 0 && !carried.is_empty() {
-            return Err(invalid("a run of an empty folder carries nodes"));
+            return Err(invalid("a branch of an empty folder carries nodes"));
         }
         Ok(Self {
             count,
@@ -1277,18 +1277,18 @@ impl FolderRun {
             .collect()
     }
 
-    /// Checks the run against the folder it is said to be a part of. Every
+    /// Checks the branch against the folder it is said to be a part of. Every
     /// entry shown is then an entry of that folder, at the place where a
     /// search for its name ends.
     pub fn check(&self, folder: &Target) -> Result<()> {
         folder.require(Kind::Folder)?;
         if self.count == 0 {
             if !self.entries.is_empty() || !self.carried.is_empty() || self.start != 0 {
-                return Err(invalid("a run of an empty folder shows something"));
+                return Err(invalid("a branch of an empty folder shows something"));
             }
             return confirm(folder, 0, EMPTY_LIST);
         }
-        let shown = check_opening(
+        let shown = check_branch(
             ListKind::Folder,
             self.count,
             self.start,
@@ -1298,9 +1298,9 @@ impl FolderRun {
         confirm(folder, self.count, shown.top)
     }
 
-    /// Checks the run as the answer to "what is under `name` in this
+    /// Checks the branch as the answer to "what is under `name` in this
     /// folder". It gives the entry, or nothing when the folder has no entry
-    /// of that name. Either answer is proven: the run must show the one place
+    /// of that name. Either answer is proven: the branch must show the one place
     /// where the name can be.
     pub fn check_name(&self, folder: &Target, name: &str) -> Result<Option<&Entry>> {
         check_name(name)?;
@@ -1327,10 +1327,10 @@ impl FolderRun {
 /// for it. Each counts a thing once, however often the tree uses it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Totals {
-    /// How many different pieces the tree has.
-    pub pieces: u64,
-    /// How many bytes those pieces hold.
-    pub piece_bytes: u64,
+    /// How many different chunks the tree has.
+    pub chunks: u64,
+    /// How many bytes those chunks hold.
+    pub chunk_bytes: u64,
     /// How many bytes the lists of its different files and folders take.
     pub list_bytes: u64,
 }
@@ -1342,27 +1342,27 @@ pub struct Record {
     top: Target,
     totals: Totals,
     extra: ExtraData,
-    cutting: Cutting,
+    chunking: Chunking,
 }
 
 impl Record {
-    /// The record of a tree with `top` on top. How the tree was cut is
+    /// The record of a tree with `top` on top. How the tree was chunked is
     /// written into the extra data, in place of anything the caller put under
     /// that name.
     pub fn new(
         top: Target,
         totals: Totals,
-        cutting: Cutting,
+        chunking: Chunking,
         mut extra: ExtraData,
     ) -> Result<Self> {
-        extra.remove(CUTTING_KEY);
-        extra.insert(CUTTING_KEY, cutting.tag())?;
+        extra.remove(CHUNKING_KEY);
+        extra.insert(CHUNKING_KEY, chunking.tag())?;
         check_totals(&top, &totals)?;
         Ok(Self {
             top,
             totals,
             extra,
-            cutting,
+            chunking,
         })
     }
 
@@ -1375,16 +1375,16 @@ impl Record {
         let size = reader.u64()?;
         let hash = reader.hash()?;
         let totals = Totals {
-            pieces: reader.u64()?,
-            piece_bytes: reader.u64()?,
+            chunks: reader.u64()?,
+            chunk_bytes: reader.u64()?,
             list_bytes: reader.u64()?,
         };
         let extra = ExtraData::decode(&mut reader)?;
         reader.finish()?;
-        let cutting = Cutting::from_tag(
+        let chunking = Chunking::from_tag(
             extra
-                .get(CUTTING_KEY)
-                .ok_or_else(|| invalid("a record does not say how the tree was cut"))?,
+                .get(CHUNKING_KEY)
+                .ok_or_else(|| invalid("a record does not say how the tree was chunked"))?,
         )?;
         let top = Target { kind, hash, size };
         check_totals(&top, &totals)?;
@@ -1392,7 +1392,7 @@ impl Record {
             top,
             totals,
             extra,
-            cutting,
+            chunking,
         })
     }
 
@@ -1402,8 +1402,8 @@ impl Record {
         out.push(self.top.kind.byte());
         out.extend_from_slice(&self.top.size.to_be_bytes());
         out.extend_from_slice(self.top.hash.as_bytes());
-        out.extend_from_slice(&self.totals.pieces.to_be_bytes());
-        out.extend_from_slice(&self.totals.piece_bytes.to_be_bytes());
+        out.extend_from_slice(&self.totals.chunks.to_be_bytes());
+        out.extend_from_slice(&self.totals.chunk_bytes.to_be_bytes());
         out.extend_from_slice(&self.totals.list_bytes.to_be_bytes());
         self.extra.encode_into(&mut out);
         out
@@ -1427,23 +1427,23 @@ impl Record {
         &self.extra
     }
 
-    /// How the tree's files were cut.
-    pub fn cutting(&self) -> Cutting {
-        self.cutting
+    /// How the tree's files were chunked.
+    pub fn chunking(&self) -> Chunking {
+        self.chunking
     }
 }
 
 /// What must hold between a record's numbers in any tree. Whether the totals
 /// are right is checked against the whole tree.
 fn check_totals(top: &Target, totals: &Totals) -> Result<()> {
-    let fits = totals.pieces <= totals.piece_bytes
-        && totals.piece_bytes <= top.size
+    let fits = totals.chunks <= totals.chunk_bytes
+        && totals.chunk_bytes <= top.size
         && totals
-            .pieces
-            .checked_mul(MAX_PIECE_BYTES as u64)
-            .is_none_or(|most| totals.piece_bytes <= most)
+            .chunks
+            .checked_mul(MAX_CHUNK_BYTES as u64)
+            .is_none_or(|most| totals.chunk_bytes <= most)
         && totals
-            .pieces
+            .chunks
             .checked_mul(LIST_ITEM_BYTES as u64)
             .is_some_and(|least| totals.list_bytes >= least)
         && (top.kind == Kind::Folder || totals.list_bytes % LIST_ITEM_BYTES as u64 == 0);
@@ -1458,15 +1458,15 @@ fn check_totals(top: &Target, totals: &Totals) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn piece(seed: u8, length: u32) -> PieceRef {
-        PieceRef {
+    fn chunk(seed: u8, length: u32) -> ChunkRef {
+        ChunkRef {
             hash: Hash::of(&[seed]),
             length,
         }
     }
 
     fn file(seed: u8) -> Target {
-        FileList::new(vec![piece(seed, u32::from(seed) + 1)])
+        FileList::new(vec![chunk(seed, u32::from(seed) + 1)])
             .unwrap()
             .target()
     }
@@ -1510,8 +1510,8 @@ mod tests {
     #[test]
     fn every_hash_covers_exactly_the_bytes_the_format_names() {
         // A file's list item, and its leaf.
-        let first = piece(1, 5);
-        let second = piece(2, 7);
+        let first = chunk(1, 5);
+        let second = chunk(2, 7);
         let mut item = first.hash.as_bytes().to_vec();
         item.extend_from_slice(&5_u32.to_be_bytes());
         let one = FileList::new(vec![first]).unwrap();
@@ -1525,13 +1525,13 @@ mod tests {
             }
         );
 
-        // A file of one piece: the leaf is the top of its list.
+        // A file of one chunk: the leaf is the top of its list.
         assert_eq!(
             *one.hash(),
             sha(&[&[0x10], &u64be(1), &u64be(5), first_leaf.as_bytes()])
         );
 
-        // A file of two pieces: the top is a fork over the two leaves.
+        // A file of two chunks: the top is a fork over the two leaves.
         let second_leaf = second.leaf().hash;
         let top = sha(&[
             &[0x01],
@@ -1608,14 +1608,14 @@ mod tests {
 
         // The record, and the root.
         let totals = Totals {
-            pieces: 2,
-            piece_bytes: 12,
+            chunks: 2,
+            chunk_bytes: 12,
             list_bytes: 72 + both.encoded_len(),
         };
         let record = Record::new(
             both.target(),
             totals,
-            Cutting::fixed(5).unwrap(),
+            Chunking::fixed(5).unwrap(),
             ExtraData::new(),
         )
         .unwrap();
@@ -1636,8 +1636,8 @@ mod tests {
 
     #[test]
     fn the_same_thing_has_the_same_hash_wherever_it_is() {
-        // A file's hash covers its pieces, and nothing about where it sits.
-        let list = FileList::new(vec![piece(1, 5), piece(2, 7), piece(1, 5)]).unwrap();
+        // A file's hash covers its chunks, and nothing about where it sits.
+        let list = FileList::new(vec![chunk(1, 5), chunk(2, 7), chunk(1, 5)]).unwrap();
         let here = FolderList::new(vec![entry("a.bin", list.target())]).unwrap();
         let there = FolderList::new(vec![
             entry("other", file(9)),
@@ -1664,10 +1664,10 @@ mod tests {
         assert_eq!(*empty_folder.hash(), folder_hash(0, 0, &Hash::ZERO));
         assert_ne!(empty_file.hash(), empty_folder.hash());
 
-        // The pieces' order, their number and their lengths are all covered.
-        let other_order = FileList::new(vec![piece(2, 7), piece(1, 5), piece(1, 5)]).unwrap();
-        let one_less = FileList::new(vec![piece(1, 5), piece(2, 7)]).unwrap();
-        let other_length = FileList::new(vec![piece(1, 5), piece(2, 6), piece(1, 6)]).unwrap();
+        // The chunks' order, their number and their lengths are all covered.
+        let other_order = FileList::new(vec![chunk(2, 7), chunk(1, 5), chunk(1, 5)]).unwrap();
+        let one_less = FileList::new(vec![chunk(1, 5), chunk(2, 7)]).unwrap();
+        let other_length = FileList::new(vec![chunk(1, 5), chunk(2, 6), chunk(1, 6)]).unwrap();
         assert_eq!(other_length.size(), list.size());
         for other in [&other_order, &one_less, &other_length] {
             assert_ne!(other.hash(), list.hash());
@@ -1811,16 +1811,16 @@ mod tests {
     #[test]
     fn lists_are_read_strictly() {
         let hash = Hash::of(b"x");
-        // A file's list: whole items, and pieces of 1 byte to 8 MiB.
+        // A file's list: whole items, and chunks of 1 byte to 8 MiB.
         let item = |length: u32| [hash.as_bytes().as_slice(), &length.to_be_bytes()].concat();
         assert!(FileList::decode(&item(1)).is_ok());
-        assert!(FileList::decode(&item(MAX_PIECE_BYTES as u32)).is_ok());
+        assert!(FileList::decode(&item(MAX_CHUNK_BYTES as u32)).is_ok());
         assert!(FileList::decode(&item(0)).is_err());
-        assert!(FileList::decode(&item(MAX_PIECE_BYTES as u32 + 1)).is_err());
+        assert!(FileList::decode(&item(MAX_CHUNK_BYTES as u32 + 1)).is_err());
         assert!(FileList::decode(&item(1)[..35]).is_err());
         assert!(FileList::decode(&[item(1), vec![0]].concat()).is_err());
-        assert!(PieceRef::of(&[]).is_err());
-        assert_eq!(PieceRef::of(b"x").unwrap(), PieceRef { hash, length: 1 });
+        assert!(ChunkRef::of(&[]).is_err());
+        assert_eq!(ChunkRef::of(b"x").unwrap(), ChunkRef { hash, length: 1 });
 
         // A folder's list: every entry whole, of a known kind, validly named.
         assert!(FolderList::decode(&entry_bytes(1, 3, &hash, b"a", &NO_EXTRA)).is_ok());
@@ -1861,18 +1861,18 @@ mod tests {
     fn a_record_is_read_strictly() {
         let top = folder(&["a", "b"]).target();
         let totals = Totals {
-            pieces: 2,
-            piece_bytes: 3,
+            chunks: 2,
+            chunk_bytes: 3,
             list_bytes: 200,
         };
         let extra = ExtraData::new()
-            .with(CUTTING_KEY, "a caller cannot set this")
+            .with(CHUNKING_KEY, "a caller cannot set this")
             .unwrap()
             .with(TIMESTAMP_KEY, "2026-11-12T00:00:00Z")
             .unwrap();
-        let record = Record::new(top, totals, Cutting::FastCdcV1, extra).unwrap();
-        assert_eq!(record.extra().text(CUTTING_KEY), Some("fastcdc-v1"));
-        assert_eq!(record.cutting(), Cutting::FastCdcV1);
+        let record = Record::new(top, totals, Chunking::FastCdcV1, extra).unwrap();
+        assert_eq!(record.extra().text(CHUNKING_KEY), Some("fastcdc-v1"));
+        assert_eq!(record.chunking(), Chunking::FastCdcV1);
         assert_eq!(record.top(), top);
         assert_eq!(record.totals(), totals);
         let bytes = record.encode();
@@ -1890,7 +1890,7 @@ mod tests {
         other_kind[1] = 3;
         assert!(Record::decode(&other_kind).is_err());
 
-        // A record that does not say how its tree was cut is no record.
+        // A record that does not say how its tree was chunked is no record.
         let mut untagged = bytes[..66].to_vec();
         untagged.extend_from_slice(&NO_EXTRA);
         assert!(Record::decode(&untagged).is_err());
@@ -1903,42 +1903,42 @@ mod tests {
 
         // Totals that no tree can have.
         let bad_totals = [
-            (3, 2, 200),            // more pieces than piece bytes
-            (1, top.size + 1, 200), // more piece bytes than the tree holds
-            (2, 3, 71),             // lists too short to name the pieces
-            (0, 1, 0),              // bytes without pieces
+            (3, 2, 200),            // more chunks than chunk bytes
+            (1, top.size + 1, 200), // more chunk bytes than the tree holds
+            (2, 3, 71),             // lists too short to name the chunks
+            (0, 1, 0),              // bytes without chunks
         ];
-        for (pieces, piece_bytes, list_bytes) in bad_totals {
+        for (chunks, chunk_bytes, list_bytes) in bad_totals {
             let totals = Totals {
-                pieces,
-                piece_bytes,
+                chunks,
+                chunk_bytes,
                 list_bytes,
             };
-            let made = Record::new(top, totals, Cutting::FastCdcV1, ExtraData::new());
+            let made = Record::new(top, totals, Chunking::FastCdcV1, ExtraData::new());
             assert!(made.is_err(), "{totals:?}");
         }
-        let file_top = FileList::new(vec![piece(1, 5)]).unwrap().target();
+        let file_top = FileList::new(vec![chunk(1, 5)]).unwrap().target();
         let uneven = Totals {
-            pieces: 1,
-            piece_bytes: 5,
+            chunks: 1,
+            chunk_bytes: 5,
             list_bytes: 37,
         };
-        assert!(Record::new(file_top, uneven, Cutting::FastCdcV1, ExtraData::new()).is_err());
+        assert!(Record::new(file_top, uneven, Chunking::FastCdcV1, ExtraData::new()).is_err());
     }
 
     #[test]
-    fn a_way_of_cutting_has_one_spelling_and_holds_pieces_to_its_lengths() {
-        assert_eq!(Cutting::FastCdcV1.tag(), "fastcdc-v1");
-        assert_eq!(Cutting::fixed(16).unwrap().tag(), "fixed-16");
-        for cutting in [
-            Cutting::FastCdcV1,
-            Cutting::fixed(1).unwrap(),
-            Cutting::fixed(16).unwrap(),
-            Cutting::fixed(MAX_PIECE_BYTES as u32).unwrap(),
+    fn a_way_of_chunking_has_one_spelling_and_holds_chunks_to_its_lengths() {
+        assert_eq!(Chunking::FastCdcV1.tag(), "fastcdc-v1");
+        assert_eq!(Chunking::fixed(16).unwrap().tag(), "fixed-16");
+        for chunking in [
+            Chunking::FastCdcV1,
+            Chunking::fixed(1).unwrap(),
+            Chunking::fixed(16).unwrap(),
+            Chunking::fixed(MAX_CHUNK_BYTES as u32).unwrap(),
         ] {
             assert_eq!(
-                Cutting::from_tag(cutting.tag().as_bytes()).unwrap(),
-                cutting
+                Chunking::from_tag(chunking.tag().as_bytes()).unwrap(),
+                chunking
             );
         }
         for tag in [
@@ -1956,17 +1956,17 @@ mod tests {
             "fixed-99999999",
             "fixed-4294967297",
         ] {
-            assert!(Cutting::from_tag(tag.as_bytes()).is_err(), "{tag:?}");
+            assert!(Chunking::from_tag(tag.as_bytes()).is_err(), "{tag:?}");
         }
 
-        let content = Cutting::FastCdcV1;
+        let content = Chunking::FastCdcV1;
         let min = FASTCDC_MIN_SIZE as u32;
         let max = FASTCDC_MAX_SIZE as u32;
         assert!(content.check_length(min + 1, false).is_ok());
         assert!(content.check_length(max, false).is_ok());
         assert!(
             content.check_length(min, false).is_err(),
-            "the cutter never stops there"
+            "the chunker never stops there"
         );
         assert!(content.check_length(1, false).is_err());
         assert!(content.check_length(1, true).is_ok());
@@ -1974,7 +1974,7 @@ mod tests {
         assert!(content.check_length(max + 1, true).is_err());
         assert!(content.check_length(0, true).is_err());
 
-        let fixed = Cutting::fixed(16).unwrap();
+        let fixed = Chunking::fixed(16).unwrap();
         assert!(fixed.check_length(16, false).is_ok());
         assert!(fixed.check_length(15, false).is_err());
         assert!(fixed.check_length(17, false).is_err());
@@ -1985,10 +1985,10 @@ mod tests {
     }
 
     #[test]
-    fn a_files_size_bounds_how_many_pieces_it_can_have() {
+    fn a_files_size_bounds_how_many_chunks_it_can_have() {
         let step = FASTCDC_MIN_SIZE as u64 + 1;
         let max = FASTCDC_MAX_SIZE as u64;
-        let content = Cutting::FastCdcV1;
+        let content = Chunking::FastCdcV1;
         assert_eq!(content.count_bounds(0), (0, 0));
         assert_eq!(content.count_bounds(1), (1, 1));
         assert_eq!(content.count_bounds(step), (1, 1));
@@ -1996,8 +1996,8 @@ mod tests {
         assert_eq!(content.count_bounds(max), (1, 16));
         assert_eq!(content.count_bounds(max + 1), (2, 16));
         assert_eq!(content.count_bounds(2 * step + 1), (1, 3));
-        // A terabyte: at most about two million pieces, never a billion. The
-        // most is 2,097,148 pieces of 524,289 bytes, and a last one of 4.
+        // A terabyte: at most about two million chunks, never a billion. The
+        // most is 2,097,148 chunks of 524,289 bytes, and a last one of 4.
         let (fewest, most) = content.count_bounds(1 << 40);
         assert_eq!(fewest, 131_072);
         assert_eq!(most, 2_097_149);
@@ -2007,46 +2007,46 @@ mod tests {
         assert!(content.check_count(1 << 40, fewest - 1).is_err());
         assert!(content.check_count(0, 1).is_err());
 
-        // What the bounds say is what lists of fitting pieces can add up to.
-        let fixed = Cutting::fixed(4).unwrap();
+        // What the bounds say is what lists of fitting chunks can add up to.
+        let fixed = Chunking::fixed(4).unwrap();
         for size in 0..40_u64 {
-            let pieces = fixed.cut(&vec![0_u8; size as usize]).len() as u64;
-            assert_eq!(fixed.count_bounds(size), (pieces, pieces), "size {size}");
+            let chunks = fixed.cut(&vec![0_u8; size as usize]).len() as u64;
+            assert_eq!(fixed.count_bounds(size), (chunks, chunks), "size {size}");
         }
-        let list = FileList::new(vec![piece(1, 4), piece(2, 4), piece(3, 3)]).unwrap();
-        assert!(list.check_cutting(fixed).is_ok());
-        assert!(list.check_cutting(Cutting::fixed(5).unwrap()).is_err());
-        assert!(list.check_cutting(content).is_err());
+        let list = FileList::new(vec![chunk(1, 4), chunk(2, 4), chunk(3, 3)]).unwrap();
+        assert!(list.check_chunking(fixed).is_ok());
+        assert!(list.check_chunking(Chunking::fixed(5).unwrap()).is_err());
+        assert!(list.check_chunking(content).is_err());
         let short_in_the_middle =
-            FileList::new(vec![piece(1, 4), piece(2, 3), piece(3, 4)]).unwrap();
-        assert!(short_in_the_middle.check_cutting(fixed).is_err());
+            FileList::new(vec![chunk(1, 4), chunk(2, 3), chunk(3, 4)]).unwrap();
+        assert!(short_in_the_middle.check_chunking(fixed).is_err());
         assert!(FileList::new(Vec::new())
             .unwrap()
-            .check_cutting(content)
+            .check_chunking(content)
             .is_ok());
     }
 
     #[test]
-    fn every_run_of_a_file_checks_and_gives_the_byte_it_starts_at() {
+    fn every_branch_of_a_file_checks_and_gives_the_byte_it_starts_at() {
         for count in 1..=17_u8 {
-            let items: Vec<PieceRef> = (0..count)
-                .map(|index| piece(index, u32::from(index % 5) + 1))
+            let items: Vec<ChunkRef> = (0..count)
+                .map(|index| chunk(index, u32::from(index % 5) + 1))
                 .collect();
             let list = FileList::new(items.clone()).unwrap();
             let open = OpenFile::new(list.clone()).unwrap();
             let target = list.target();
             for start in 0..u64::from(count) {
                 for end in start + 1..=u64::from(count) {
-                    let run = open.open(start, end).unwrap();
-                    assert_eq!(run, list.open(start, end).unwrap());
-                    assert_eq!(FileRun::decode(&run.encode()).unwrap(), run);
+                    let branch = open.open(start, end).unwrap();
+                    assert_eq!(branch, list.open(start, end).unwrap());
+                    assert_eq!(FileBranch::decode(&branch.encode()).unwrap(), branch);
                     let before: u64 = items[..start as usize]
                         .iter()
                         .map(|item| u64::from(item.length))
                         .sum();
-                    assert_eq!(run.check(&target, None).unwrap(), before);
+                    assert_eq!(branch.check(&target, None).unwrap(), before);
                     assert_eq!(open.start_of(start), Some(before));
-                    assert_eq!(run.items(), &items[start as usize..end as usize]);
+                    assert_eq!(branch.items(), &items[start as usize..end as usize]);
                 }
             }
             assert_eq!(open.start_of(u64::from(count)), Some(list.size()));
@@ -2055,16 +2055,16 @@ mod tests {
     }
 
     #[test]
-    fn a_run_of_a_file_is_refused_for_any_other_file_count_or_place() {
-        let items: Vec<PieceRef> = (0..9).map(|index| piece(index, 4)).collect();
+    fn a_branch_of_a_file_is_refused_for_any_other_file_count_or_place() {
+        let items: Vec<ChunkRef> = (0..9).map(|index| chunk(index, 4)).collect();
         let list = FileList::new(items).unwrap();
         let target = list.target();
-        let run = list.open(3, 5).unwrap();
-        assert_eq!(run.check(&target, None).unwrap(), 12);
+        let branch = list.open(3, 5).unwrap();
+        assert_eq!(branch.check(&target, None).unwrap(), 12);
 
         // Another file, another size, and a folder.
         assert!(matches!(
-            run.check(&file(1), None),
+            branch.check(&file(1), None),
             Err(Error::SizeMismatch { .. })
         ));
         let other_hash = Target {
@@ -2072,7 +2072,7 @@ mod tests {
             ..target
         };
         assert!(matches!(
-            run.check(&other_hash, None),
+            branch.check(&other_hash, None),
             Err(Error::HashMismatch { .. })
         ));
         let other_size = Target {
@@ -2080,102 +2080,108 @@ mod tests {
             ..target
         };
         assert!(matches!(
-            run.check(&other_size, None),
+            branch.check(&other_size, None),
             Err(Error::SizeMismatch { .. })
         ));
         let as_folder = Target {
             kind: Kind::Folder,
             ..target
         };
-        assert!(run.check(&as_folder, None).is_err());
+        assert!(branch.check(&as_folder, None).is_err());
 
         // The same bytes with another count, another place, or one item less.
-        let bytes = run.encode();
+        let bytes = branch.encode();
         let with = |at: usize, value: u8| {
             let mut changed = bytes.clone();
             changed[at] = value;
-            FileRun::decode(&changed).and_then(|run| run.check(&target, None))
+            FileBranch::decode(&changed).and_then(|branch| branch.check(&target, None))
         };
-        assert!(with(7, 10).is_err(), "as a file of 10 pieces");
-        assert!(with(7, 8).is_err(), "as a file of 8 pieces");
+        assert!(with(7, 10).is_err(), "as a file of 10 chunks");
+        assert!(with(7, 8).is_err(), "as a file of 8 chunks");
         assert!(with(15, 4).is_err(), "one place on");
         assert!(with(15, 2).is_err(), "one place back");
         assert!(with(19, 1).is_err(), "one item less");
         assert!(with(19, 0).is_err(), "no items");
-        assert!(with(20, 0).is_err(), "another piece");
+        assert!(with(20, 0).is_err(), "another chunk");
         let last = bytes.len() - 1;
         assert!(
             with(last, bytes[last] ^ 1).is_err(),
             "another size for a carried node"
         );
         for cut in 0..bytes.len() {
-            assert!(FileRun::decode(&bytes[..cut]).is_err(), "cut at {cut}");
+            assert!(FileBranch::decode(&bytes[..cut]).is_err(), "cut at {cut}");
         }
-        assert!(FileRun::decode(&[bytes.clone(), vec![0]].concat()).is_err());
+        assert!(FileBranch::decode(&[bytes.clone(), vec![0]].concat()).is_err());
 
-        // The pieces' lengths are held to the way of cutting, when one is given.
-        assert!(run.check(&target, Some(Cutting::fixed(4).unwrap())).is_ok());
-        assert!(run
-            .check(&target, Some(Cutting::fixed(5).unwrap()))
+        // The chunks' lengths are held to the way of chunking, when one is given.
+        assert!(branch
+            .check(&target, Some(Chunking::fixed(4).unwrap()))
+            .is_ok());
+        assert!(branch
+            .check(&target, Some(Chunking::fixed(5).unwrap()))
             .is_err());
-        assert!(run.check(&target, Some(Cutting::FastCdcV1)).is_err());
+        assert!(branch.check(&target, Some(Chunking::FastCdcV1)).is_err());
 
-        // A run that claims more carried nodes than any list needs.
+        // A branch that claims more carried nodes than any list needs.
         let mut crowded = bytes[..20 + 2 * LIST_ITEM_BYTES].to_vec();
         crowded.extend_from_slice(&81_u16.to_be_bytes());
         crowded.extend_from_slice(&[0; 81 * 40]);
-        assert!(FileRun::decode(&crowded).is_err());
-        // A run that claims more items than it has bytes for.
+        assert!(FileBranch::decode(&crowded).is_err());
+        // A branch that claims more items than it has bytes for.
         let mut hollow = bytes[..16].to_vec();
         hollow.extend_from_slice(&u32::MAX.to_be_bytes());
-        assert!(FileRun::decode(&hollow).is_err());
+        assert!(FileBranch::decode(&hollow).is_err());
     }
 
     #[test]
-    fn the_pieces_that_hold_a_stretch_of_bytes_are_found() {
+    fn the_chunks_that_hold_a_stretch_of_bytes_are_found() {
         let lengths = [3_u32, 1, 4, 1, 5, 9, 2, 6];
-        let items: Vec<PieceRef> = lengths
+        let items: Vec<ChunkRef> = lengths
             .iter()
             .enumerate()
-            .map(|(index, length)| piece(index as u8, *length))
+            .map(|(index, length)| chunk(index as u8, *length))
             .collect();
         let list = FileList::new(items).unwrap();
         let open = OpenFile::new(list.clone()).unwrap();
         let size = list.size();
         assert_eq!(size, 31);
-        // Which piece holds each byte, worked out the long way.
+        // Which chunk holds each byte, worked out the long way.
         let mut holder = Vec::new();
         for (index, length) in lengths.iter().enumerate() {
             holder.extend(std::iter::repeat_n(index as u64, *length as usize));
         }
         for offset in 0..size {
             for length in 1..=size - offset {
-                let (first, after) = open.pieces_for(offset, length).unwrap();
+                let (first, after) = open.chunks_for(offset, length).unwrap();
                 assert_eq!(first, holder[offset as usize], "{offset}+{length}");
                 assert_eq!(
                     after,
                     holder[(offset + length - 1) as usize] + 1,
                     "{offset}+{length}"
                 );
-                let run = open.open_bytes(offset, length).unwrap();
-                let starts_at = run.check(&list.target(), None).unwrap();
+                let branch = open.open_bytes(offset, length).unwrap();
+                let starts_at = branch.check(&list.target(), None).unwrap();
                 assert!(starts_at <= offset);
-                let shown: u64 = run.items().iter().map(|item| u64::from(item.length)).sum();
+                let shown: u64 = branch
+                    .items()
+                    .iter()
+                    .map(|item| u64::from(item.length))
+                    .sum();
                 assert!(starts_at + shown >= offset + length);
             }
         }
-        assert!(open.pieces_for(0, 0).is_err());
-        assert!(open.pieces_for(size, 1).is_err());
-        assert!(open.pieces_for(size - 1, 2).is_err());
-        assert!(open.pieces_for(u64::MAX, 2).is_err());
+        assert!(open.chunks_for(0, 0).is_err());
+        assert!(open.chunks_for(size, 1).is_err());
+        assert!(open.chunks_for(size - 1, 2).is_err());
+        assert!(open.chunks_for(u64::MAX, 2).is_err());
         assert!(OpenFile::new(FileList::new(Vec::new()).unwrap())
             .unwrap()
-            .pieces_for(0, 1)
+            .chunks_for(0, 1)
             .is_err());
     }
 
     #[test]
-    fn every_run_of_a_folder_checks_and_reads_back() {
+    fn every_branch_of_a_folder_checks_and_reads_back() {
         let names: Vec<String> = (0..13).map(|index| format!("n{index:02}")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         for count in 1..=names.len() {
@@ -2184,17 +2190,20 @@ mod tests {
             let target = list.target();
             for start in 0..count as u64 {
                 for end in start + 1..=count as u64 {
-                    let run = open.open(start, end).unwrap();
-                    assert_eq!(run, list.open(start, end).unwrap());
-                    assert_eq!(FolderRun::decode(&run.encode()).unwrap(), run);
-                    run.check(&target).unwrap();
-                    assert_eq!(run.entries(), &list.entries()[start as usize..end as usize]);
-                    assert!(run.check(&folder(&["other"]).target()).is_err());
+                    let branch = open.open(start, end).unwrap();
+                    assert_eq!(branch, list.open(start, end).unwrap());
+                    assert_eq!(FolderBranch::decode(&branch.encode()).unwrap(), branch);
+                    branch.check(&target).unwrap();
+                    assert_eq!(
+                        branch.entries(),
+                        &list.entries()[start as usize..end as usize]
+                    );
+                    assert!(branch.check(&folder(&["other"]).target()).is_err());
                     let as_file = Target {
                         kind: Kind::File,
                         ..target
                     };
-                    assert!(run.check(&as_file).is_err());
+                    assert!(branch.check(&as_file).is_err());
                 }
             }
         }
@@ -2214,7 +2223,7 @@ mod tests {
                 let truth = list.get(name);
                 // The answer the folder gives.
                 let answer = list.open_name(name).unwrap();
-                assert_eq!(FolderRun::decode(&answer.encode()).unwrap(), answer);
+                assert_eq!(FolderBranch::decode(&answer.encode()).unwrap(), answer);
                 assert_eq!(answer.check_name(&target, name).unwrap(), truth);
                 // Any other entry shown in its place is refused, so there is
                 // one answer, and it is the true one.
@@ -2227,7 +2236,7 @@ mod tests {
                         assert!(verdict.is_err(), "{count}: {name} at {other}");
                     }
                 }
-                // A run of two entries is no answer for one name.
+                // A branch of two entries is no answer for one name.
                 if count >= 2 {
                     let two = list.open(0, 2).unwrap();
                     assert!(two.check_name(&target, name).is_err());
@@ -2244,22 +2253,22 @@ mod tests {
         let empty = FolderList::new(Vec::new()).unwrap();
         assert_eq!(empty.place_of("a"), None);
         let answer = empty.open_name("a").unwrap();
-        assert_eq!(FolderRun::decode(&answer.encode()).unwrap(), answer);
+        assert_eq!(FolderBranch::decode(&answer.encode()).unwrap(), answer);
         assert_eq!(answer.check_name(&empty.target(), "a").unwrap(), None);
         answer.check(&empty.target()).unwrap();
         // The same answer for a folder that is not empty is refused.
         let full = folder(&["a"]);
         assert!(answer.check_name(&full.target(), "a").is_err());
         assert!(answer.check(&full.target()).is_err());
-        // And a run that shows nothing of a folder with entries is no run.
+        // And a branch that shows nothing of a folder with entries is no branch.
         let mut nothing = 3_u64.to_be_bytes().to_vec();
         nothing.extend_from_slice(&[0; 8 + 4 + 2]);
-        assert!(FolderRun::decode(&nothing).is_err());
+        assert!(FolderBranch::decode(&nothing).is_err());
         let mut carrying = 0_u64.to_be_bytes().to_vec();
         carrying.extend_from_slice(&[0; 8 + 4]);
         carrying.extend_from_slice(&[0, 1]);
         carrying.extend_from_slice(&[0; 40]);
         carrying.extend_from_slice(&[0, 1, b'a']);
-        assert!(FolderRun::decode(&carrying).is_err());
+        assert!(FolderBranch::decode(&carrying).is_err());
     }
 }

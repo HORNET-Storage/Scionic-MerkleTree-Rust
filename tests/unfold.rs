@@ -13,7 +13,7 @@ use scionic_merkletree::{
     DEFAULT_MAX_CHANGES,
 };
 use std::fs;
-use support::{sample_folder, small_options, small_pieces, write, TempDir};
+use support::{sample_folder, small_chunks, small_options, write, TempDir};
 
 fn entry(name: &str, target: Target) -> Entry {
     Entry::new(name, target, ExtraData::new()).unwrap()
@@ -35,14 +35,14 @@ fn doubled(builder: &mut Builder<'_>, content: &[u8], levels: usize) -> Target {
 #[test]
 fn two_small_trees_that_differ_at_more_places_than_a_list_holds_are_refused() {
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     // Two trees of 41 small folders each. They differ in one file, and that
     // file has 2^40 places.
     let old_top = doubled(&mut builder, b"old", 40);
     let new_top = doubled(&mut builder, b"new", 40);
     assert_eq!(store.count(Stored::FolderList), 82);
     let finish = |top| {
-        Builder::new(&store, small_pieces())
+        Builder::new(&store, small_chunks())
             .finish(top, ExtraData::new())
             .unwrap()
     };
@@ -62,7 +62,7 @@ fn two_small_trees_that_differ_at_more_places_than_a_list_holds_are_refused() {
     assert_eq!(diff(&store, &old, &old).unwrap(), Vec::new());
 
     // Ten levels of it are 1,024 places, and are listed.
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let old_top = doubled(&mut builder, b"old", 10);
     let new_top = doubled(&mut builder, b"new", 10);
     let (old, new) = (finish(old_top), finish(new_top));

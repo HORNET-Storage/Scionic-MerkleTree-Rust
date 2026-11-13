@@ -1,6 +1,6 @@
 //! The classic tree over a list.
 //!
-//! A file is a list of pieces and a folder is a list of entries. This module
+//! A file is a list of chunks and a folder is a list of entries. This module
 //! turns a list into the one hash that its owner is known by, shows a part of a
 //! list together with the nodes that stand for the rest, and checks such a
 //! showing.
@@ -34,7 +34,7 @@ const FOLDER_FORK: u8 = 0x03;
 /// What a list is a list of.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ListKind {
-    /// A file's pieces, in the file's order.
+    /// A file's chunks, in the file's order.
     File,
     /// A folder's entries, sorted by name. Its forks record names.
     Folder,
@@ -67,7 +67,7 @@ pub struct Leaf<'a> {
 ///
 /// One carried node is in no right half: the one that begins with the list's
 /// first item. No hash covers a name for it, so it has none, and a checker
-/// takes none. That way every byte of an opening is covered by the hash it is
+/// takes none. That way every byte of a branch is covered by the hash it is
 /// held against.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Carried {
@@ -75,7 +75,7 @@ pub struct Carried {
     pub first_name: Vec<u8>,
 }
 
-/// What an opening shows, once it is rebuilt: the node on top of the list, to
+/// What a branch shows, once it is rebuilt: the node on top of the list, to
 /// hold against the hash and size the list is known by, and how many bytes of
 /// file content come before the first opened item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,7 +289,7 @@ impl ListTree {
     }
 
     /// The nodes to send with items `start` up to, not including, `end`: one
-    /// for each run of items that is left out, in the order a checker meets
+    /// for each branch of items that is left out, in the order a checker meets
     /// them.
     pub fn open(&self, start: u64, end: u64) -> Result<Vec<Carried>> {
         if start >= end || end > self.count() {
@@ -345,7 +345,7 @@ impl ListTree {
 /// known by. In a folder's list every opened entry must also be where the fork
 /// names send its name, so that an entry is never shown at a place where a
 /// search for its name would not find it.
-pub fn check_opening(
+pub fn check_branch(
     kind: ListKind,
     count: u64,
     start: u64,
@@ -423,7 +423,7 @@ impl<'a> Walk<'a> {
         };
         let (top, _) = walk.node(0, count)?;
         if walk.carried.next().is_some() {
-            return Err(invalid("an opening carries more nodes than it needs"));
+            return Err(invalid("a branch carries more nodes than it needs"));
         }
         Ok(Shown {
             top,
@@ -444,7 +444,7 @@ impl<'a> Walk<'a> {
             let carried = self
                 .carried
                 .next()
-                .ok_or_else(|| invalid("an opening carries fewer nodes than it needs"))?;
+                .ok_or_else(|| invalid("a branch carries fewer nodes than it needs"))?;
             // In a folder's tree, the node that begins the list has no name,
             // and every other carried node has one: see `Carried`.
             if self.kind == ListKind::Folder && (offset == 0) != carried.first_name.is_empty() {
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn every_run_of_every_list_opens_and_rebuilds_to_the_top() {
+    fn every_branch_of_every_list_opens_and_rebuilds_to_the_top() {
         for count in 1..=33_usize {
             for (kind, owned) in [
                 (ListKind::File, file_list(count)),
@@ -702,7 +702,7 @@ mod tests {
                 for start in 0..count {
                     for end in start + 1..=count {
                         let carried = tree.open(start as u64, end as u64).unwrap();
-                        let shown = check_opening(
+                        let shown = check_branch(
                             kind,
                             count as u64,
                             start as u64,
@@ -715,7 +715,7 @@ mod tests {
                         assert_eq!(shown.top, top, "{kind:?} of {count}, {start}..{end}");
                         let before: u64 = leaves[..start].iter().map(|leaf| leaf.node.size).sum();
                         assert_eq!(shown.offset, before, "{kind:?} of {count}, {start}..{end}");
-                        // An opening carries a node for each run it leaves
+                        // A branch carries a node for each stretch of the list it leaves
                         // out, and never more than two for a level.
                         assert!(carried.len() <= 2 * 6, "{} nodes", carried.len());
                         if start == 0 && end == count {
@@ -728,14 +728,14 @@ mod tests {
     }
 
     #[test]
-    fn an_opening_that_is_changed_does_not_rebuild_to_the_top() {
+    fn a_branch_that_is_changed_does_not_rebuild_to_the_top() {
         let owned = file_list(11);
         let leaves = leaves(&owned);
         let tree = ListTree::build(ListKind::File, &leaves).unwrap();
         let top = tree.top().unwrap();
         let carried = tree.open(4, 6).unwrap();
         let rebuilt = |start: u64, opened: &[Leaf<'_>], carried: &[Carried]| {
-            check_opening(ListKind::File, 11, start, opened, carried).map(|shown| shown.top)
+            check_branch(ListKind::File, 11, start, opened, carried).map(|shown| shown.top)
         };
         assert_eq!(rebuilt(4, &leaves[4..6], &carried).unwrap(), top);
 
@@ -763,7 +763,7 @@ mod tests {
         assert!(rebuilt(4, &leaves[4..6], &extra).is_err());
         // A list that is said to be longer or shorter.
         for count in [10, 12] {
-            let result = check_opening(ListKind::File, count, 4, &leaves[4..6], &carried);
+            let result = check_branch(ListKind::File, count, 4, &leaves[4..6], &carried);
             assert_ne!(
                 result.map(|shown| shown.top).ok(),
                 Some(top),
@@ -787,7 +787,7 @@ mod tests {
             let carried = tree.open(count as u64 - 1, count as u64).unwrap();
             let last = &leaves[count - 1..];
             assert!(
-                check_opening(ListKind::File, count as u64, count as u64, last, &carried).is_err()
+                check_branch(ListKind::File, count as u64, count as u64, last, &carried).is_err()
             );
             assert!(tree.open(count as u64, count as u64 + 1).is_err());
         }
@@ -877,10 +877,10 @@ mod tests {
                             answers.push((index, present));
                         }
                     }
-                    // An entry with this name that is shown as a plain opening
+                    // An entry with this name that is shown as a plain branch
                     // passes only at the place a search would reach.
                     if entry.name == name.as_bytes() {
-                        let plain = check_opening(
+                        let plain = check_branch(
                             ListKind::Folder,
                             count as u64,
                             index as u64,
@@ -904,16 +904,16 @@ mod tests {
     }
 
     #[test]
-    fn runs_of_a_folder_built_out_of_order_open_only_where_a_search_agrees() {
+    fn branches_of_a_folder_built_out_of_order_open_only_where_a_search_agrees() {
         // "c" sits left of a fork named "b": it cannot be shown, alone or in a
-        // run, and a search for it is sent to "b", which says it is missing.
+        // branch, and a search for it is sent to "b", which says it is missing.
         let owned = folder_list(&["a", "c", "b", "d"]);
         let leaves = leaves(&owned);
         let tree = ListTree::build_unchecked(ListKind::Folder, &leaves).unwrap();
         let top = tree.top().unwrap();
         let opens = |start: usize, end: usize| {
             let carried = tree.open(start as u64, end as u64).unwrap();
-            check_opening(
+            check_branch(
                 ListKind::Folder,
                 4,
                 start as u64,
@@ -944,11 +944,11 @@ mod tests {
         let tree = ListTree::build(ListKind::Folder, &leaves).unwrap();
         let top = tree.top().unwrap();
         let mut carried = tree.open(1, 2).unwrap();
-        let honest = check_opening(ListKind::Folder, 8, 1, &leaves[1..2], &carried).unwrap();
+        let honest = check_branch(ListKind::Folder, 8, 1, &leaves[1..2], &carried).unwrap();
         assert_eq!(honest.top, top);
         let last = carried.len() - 1;
         carried[last].first_name = b"name-9999".to_vec();
-        let forged = check_opening(ListKind::Folder, 8, 1, &leaves[1..2], &carried);
+        let forged = check_branch(ListKind::Folder, 8, 1, &leaves[1..2], &carried);
         assert_ne!(forged.map(|shown| shown.top).ok(), Some(top));
     }
 
@@ -959,7 +959,7 @@ mod tests {
         let tree = ListTree::build(ListKind::File, &leaves).unwrap();
         let mut carried = tree.open(0, 1).unwrap();
         carried[0].first_name = b"x".to_vec();
-        assert!(check_opening(ListKind::File, 4, 0, &leaves[..1], &carried).is_err());
+        assert!(check_branch(ListKind::File, 4, 0, &leaves[..1], &carried).is_err());
     }
 
     #[test]
@@ -977,7 +977,7 @@ mod tests {
                 for end in start + 1..=count {
                     let carried = tree.open(start as u64, end as u64).unwrap();
                     let rebuilds = |carried: &[Carried]| {
-                        check_opening(
+                        check_branch(
                             ListKind::Folder,
                             count as u64,
                             start as u64,

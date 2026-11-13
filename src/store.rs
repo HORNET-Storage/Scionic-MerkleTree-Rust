@@ -1,15 +1,15 @@
 //! Where a tree's parts are kept.
 //!
-//! A store keeps four kinds of thing, each found by its hash: pieces, the
+//! A store keeps four kinds of thing, each found by its hash: chunks, the
 //! lists of files, the lists of folders, and records. Because a thing's hash
-//! covers only what the thing is, a piece, a file or a folder that occurs in
+//! covers only what the thing is, a chunk, a file or a folder that occurs in
 //! many trees is kept once.
 //!
 //! A store checks nothing: it keeps what it is given under the hash it is
 //! given. Everything that this library puts into a store is checked first,
 //! and everything it takes out is checked again before it is used.
 
-use crate::format::{FileList, FolderList, Kind, PieceRef, Record, Target};
+use crate::format::{ChunkRef, FileList, FolderList, Kind, Record, Target};
 use crate::hash::{Hash, Root};
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -18,8 +18,8 @@ use std::sync::{Arc, RwLock};
 /// The kinds of thing a store keeps.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Stored {
-    /// A piece's bytes, under the SHA-256 of them.
-    Piece,
+    /// A chunk's bytes, under the SHA-256 of them.
+    Chunk,
     /// A file's whole list, under the file's hash.
     FileList,
     /// A folder's whole list, under the folder's hash.
@@ -32,7 +32,7 @@ pub enum Stored {
 ///
 /// A store that can say how long a thing is without reading it should have
 /// its own [`Store::size`]: a store on disk above all. Without it, seeing
-/// whether a piece is there takes a read of the whole piece.
+/// whether a chunk is there takes a read of the whole chunk.
 pub trait Store: Send + Sync {
     /// Keeps `bytes` under `hash`. Keeping what is kept already changes
     /// nothing.
@@ -195,8 +195,8 @@ pub(crate) fn load_file(store: &dyn Store, file: &Target) -> Result<Option<FileL
     Ok(Some(list))
 }
 
-/// Whether `bytes` are the piece that `item` names.
-pub(crate) fn check_piece(item: &PieceRef, bytes: &[u8], what: &'static str) -> Result<()> {
+/// Whether `bytes` are the chunk that `item` names.
+pub(crate) fn check_chunk(item: &ChunkRef, bytes: &[u8], what: &'static str) -> Result<()> {
     if bytes.len() as u64 != u64::from(item.length) {
         return Err(Error::SizeMismatch {
             what,
@@ -210,19 +210,19 @@ pub(crate) fn check_piece(item: &PieceRef, bytes: &[u8], what: &'static str) -> 
     Ok(())
 }
 
-/// The bytes of the piece that `item` names, read from the store and checked.
-/// Bytes that do not hash to the piece's hash are damaged. Bytes that do, and
+/// The bytes of the chunk that `item` names, read from the store and checked.
+/// Bytes that do not hash to the chunk's hash are damaged. Bytes that do, and
 /// are not as many as the item says, show that the item is wrong.
-pub(crate) fn load_piece(store: &dyn Store, item: &PieceRef) -> Result<Option<Arc<[u8]>>> {
-    let Some(bytes) = store.get(Stored::Piece, &item.hash)? else {
+pub(crate) fn load_chunk(store: &dyn Store, item: &ChunkRef) -> Result<Option<Arc<[u8]>>> {
+    let Some(bytes) = store.get(Stored::Chunk, &item.hash)? else {
         return Ok(None);
     };
     if Hash::of(&bytes) != item.hash {
-        return Err(damaged("a stored piece", &item.hash));
+        return Err(damaged("a stored chunk", &item.hash));
     }
     if bytes.len() as u64 != u64::from(item.length) {
         return Err(Error::SizeMismatch {
-            what: "a stored piece",
+            what: "a stored chunk",
             expected: u64::from(item.length),
             actual: bytes.len() as u64,
         });
@@ -242,18 +242,18 @@ mod tests {
     fn a_store_keeps_each_kind_apart_and_each_thing_once() {
         let store = MemoryStore::new();
         let hash = Hash::of(b"x");
-        store.put(Stored::Piece, &hash, b"x").unwrap();
-        store.put(Stored::Piece, &hash, b"x").unwrap();
-        assert_eq!(store.count(Stored::Piece), 1);
-        assert_eq!(store.bytes(Stored::Piece), 1);
-        assert!(store.has(Stored::Piece, &hash).unwrap());
+        store.put(Stored::Chunk, &hash, b"x").unwrap();
+        store.put(Stored::Chunk, &hash, b"x").unwrap();
+        assert_eq!(store.count(Stored::Chunk), 1);
+        assert_eq!(store.bytes(Stored::Chunk), 1);
+        assert!(store.has(Stored::Chunk, &hash).unwrap());
         assert!(!store.has(Stored::FileList, &hash).unwrap());
-        assert_eq!(store.size(Stored::Piece, &hash).unwrap(), Some(1));
+        assert_eq!(store.size(Stored::Chunk, &hash).unwrap(), Some(1));
         assert_eq!(store.size(Stored::Record, &hash).unwrap(), None);
-        assert_eq!(&*store.get(Stored::Piece, &hash).unwrap().unwrap(), b"x");
-        assert_eq!(store.hashes(Stored::Piece), vec![hash]);
-        store.remove(Stored::Piece, &hash).unwrap();
-        assert!(store.get(Stored::Piece, &hash).unwrap().is_none());
+        assert_eq!(&*store.get(Stored::Chunk, &hash).unwrap().unwrap(), b"x");
+        assert_eq!(store.hashes(Stored::Chunk), vec![hash]);
+        store.remove(Stored::Chunk, &hash).unwrap();
+        assert!(store.get(Stored::Chunk, &hash).unwrap().is_none());
     }
 
     /// A store that says how long a thing is, and counts how often a thing
@@ -289,17 +289,17 @@ mod tests {
             read: Default::default(),
         };
         let content: Vec<u8> = (0..5000_u32).map(|at| (at % 251) as u8).collect();
-        let mut builder = crate::Builder::new(&store, crate::Cutting::fixed(16).unwrap());
+        let mut builder = crate::Builder::new(&store, crate::Chunking::fixed(16).unwrap());
         let first = builder.file_from_bytes(&content).unwrap();
-        // Built again, every piece and the list are there already. Seeing
+        // Built again, every chunk and the list are there already. Seeing
         // that takes no read: for a store on disk, a read is the whole of a
-        // piece.
+        // chunk.
         let again = builder.file_from_bytes(&content).unwrap();
         assert_eq!(again, first);
-        assert!(store.inner.count(Stored::Piece) > 100);
+        assert!(store.inner.count(Stored::Chunk) > 100);
         assert_eq!(store.read.load(std::sync::atomic::Ordering::Relaxed), 0);
         // And it is still asked rightly.
-        assert!(!store.has(Stored::Piece, &Hash::of(b"not there")).unwrap());
+        assert!(!store.has(Stored::Chunk, &Hash::of(b"not there")).unwrap());
         assert!(store.has(Stored::FileList, &first.hash).unwrap());
         assert!(!store.has(Stored::FolderList, &first.hash).unwrap());
     }
@@ -307,24 +307,24 @@ mod tests {
     #[test]
     fn what_is_read_from_a_store_is_checked_before_it_is_used() {
         let store = MemoryStore::new();
-        let item = PieceRef::of(b"right").unwrap();
-        // A store that holds other bytes under a piece's hash.
-        store.put(Stored::Piece, &item.hash, b"wrong").unwrap();
+        let item = ChunkRef::of(b"right").unwrap();
+        // A store that holds other bytes under a chunk's hash.
+        store.put(Stored::Chunk, &item.hash, b"wrong").unwrap();
         assert!(matches!(
-            load_piece(&store, &item),
+            load_chunk(&store, &item),
             Err(Error::Corrupt { .. })
         ));
-        store.remove(Stored::Piece, &item.hash).unwrap();
-        store.put(Stored::Piece, &item.hash, b"longer").unwrap();
+        store.remove(Stored::Chunk, &item.hash).unwrap();
+        store.put(Stored::Chunk, &item.hash, b"longer").unwrap();
         assert!(matches!(
-            load_piece(&store, &item),
+            load_chunk(&store, &item),
             Err(Error::Corrupt { .. })
         ));
-        // The piece itself, named by an item that gives it another length.
-        store.remove(Stored::Piece, &item.hash).unwrap();
-        store.put(Stored::Piece, &item.hash, b"right").unwrap();
+        // The chunk itself, named by an item that gives it another length.
+        store.remove(Stored::Chunk, &item.hash).unwrap();
+        store.put(Stored::Chunk, &item.hash, b"right").unwrap();
         assert!(matches!(
-            load_piece(&store, &PieceRef { length: 4, ..item }),
+            load_chunk(&store, &ChunkRef { length: 4, ..item }),
             Err(Error::SizeMismatch { .. })
         ));
 

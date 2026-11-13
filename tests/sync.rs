@@ -1,4 +1,4 @@
-//! Syncing by file hash and piece number: a whole tree into a store, parts
+//! Syncing by file hash and chunk number: a whole tree into a store, parts
 //! of a tree straight from a peer, and a tree as one stream.
 
 mod support;
@@ -6,8 +6,8 @@ mod support;
 use scionic_merkletree::{
     build, export, fetch, file_of, folder_of, import, lookup, record_of, verify, Error, Frame,
     Kind, MemoryStore, Refusal, Remote, Request, Responder, Root, Store, Stored, Target,
-    BUNDLE_MAGIC, FRAME_FILE_LIST, FRAME_FILE_RUN, FRAME_FOLDER_LIST, FRAME_FOLDER_RUN,
-    FRAME_PIECE, FRAME_RECORD,
+    BUNDLE_MAGIC, FRAME_CHUNK, FRAME_FILE_BRANCH, FRAME_FILE_LIST, FRAME_FOLDER_BRANCH,
+    FRAME_FOLDER_LIST, FRAME_RECORD,
 };
 use std::fs;
 use support::{
@@ -27,18 +27,18 @@ fn a_tree_is_fetched_whole_into_an_empty_store() {
     assert_eq!(summary, verify(&dest, &root).unwrap());
     assert_eq!(contents(&dest), contents(&source));
 
-    // Each thing came once: the record, 5 folders, 6 files, 76 pieces.
+    // Each thing came once: the record, 5 folders, 6 files, 76 chunks.
     assert_eq!(peer.wire.frames_of(FRAME_RECORD), 1);
     assert_eq!(peer.wire.frames_of(FRAME_FOLDER_LIST), 5);
     assert_eq!(peer.wire.frames_of(FRAME_FILE_LIST), 6);
-    assert_eq!(peer.wire.frames_of(FRAME_PIECE), 76);
+    assert_eq!(peer.wire.frames_of(FRAME_CHUNK), 76);
     assert_eq!(peer.wire.frames.len(), 88);
 
     // From the top down. The record is asked for first, a list only once
-    // the list that names it is in, and pieces only by their file's hash and
+    // the list that names it is in, and chunks only by their file's hash and
     // their numbers in it.
     let mut known = vec![*root.as_hash()];
-    let mut asked_pieces = 0;
+    let mut asked_chunks = 0;
     for request in &peer.wire.requests {
         match Request::decode(request).unwrap() {
             Request::Record(asked) => assert_eq!(asked, root),
@@ -49,9 +49,9 @@ fn a_tree_is_fetched_whole_into_an_empty_store() {
                 known.extend(list.entries().iter().map(|entry| *entry.hash()));
             }
             Request::File(file) => assert!(known.contains(&file)),
-            Request::Pieces { file, count, .. } => {
+            Request::Chunks { file, count, .. } => {
                 assert!(known.contains(&file));
-                asked_pieces += count;
+                asked_chunks += count;
             }
             other => panic!("a whole tree is not fetched by {other:?}"),
         }
@@ -59,17 +59,17 @@ fn a_tree_is_fetched_whole_into_an_empty_store() {
             known.push(record_of(&dest, &root).unwrap().top().hash);
         }
     }
-    assert_eq!(asked_pieces, 76);
+    assert_eq!(asked_chunks, 76);
 }
 
 #[test]
-fn pieces_are_asked_for_by_their_file_and_their_numbers() {
+fn chunks_are_asked_for_by_their_file_and_their_numbers() {
     let (_temp, source, root) = sample_tree("sync-numbers");
     let dest = MemoryStore::new();
     let mut peer = TestPeer::new(&source);
     fetch(&dest, &root, &mut peer).unwrap();
     let model = target_at(&source, &root, "weights/model.bin");
-    // The file has 63 pieces, and two names. All of its pieces are asked
+    // The file has 63 chunks, and two names. All of its chunks are asked
     // for once, in one request of 45 bytes.
     let for_model: Vec<&Vec<u8>> = peer
         .wire
@@ -78,7 +78,7 @@ fn pieces_are_asked_for_by_their_file_and_their_numbers() {
         .filter(|request| {
             matches!(
                 Request::decode(request).unwrap(),
-                Request::Pieces { file, .. } if file == model.hash
+                Request::Chunks { file, .. } if file == model.hash
             )
         })
         .collect();
@@ -86,7 +86,7 @@ fn pieces_are_asked_for_by_their_file_and_their_numbers() {
     assert_eq!(for_model[0].len(), 45);
     assert_eq!(
         Request::decode(for_model[0]).unwrap(),
-        Request::Pieces {
+        Request::Chunks {
             file: model.hash,
             start: 0,
             count: 63
@@ -103,8 +103,8 @@ fn what_a_receiver_holds_is_not_asked_for_again() {
     let dest = MemoryStore::new();
     fetch(&dest, &first, &mut TestPeer::new(&source)).unwrap();
 
-    // A second tree: one piece of one file changed, a file that is there
-    // already under another name, and one new file of two pieces.
+    // A second tree: one chunk of one file changed, a file that is there
+    // already under another name, and one new file of two chunks.
     let mut model = bytes("model", 1_000);
     model[320..336].copy_from_slice(&bytes("changed", 16));
     write(folder.join("weights/model.bin"), &model).unwrap();
@@ -115,15 +115,15 @@ fn what_a_receiver_holds_is_not_asked_for_again() {
     let mut peer = TestPeer::new(&source);
     fetch(&dest, &second, &mut peer).unwrap();
     // The record, the two folders on the way to the changes, the lists of
-    // the changed file and the new one, and three pieces.
+    // the changed file and the new one, and three chunks.
     assert_eq!(peer.wire.frames_of(FRAME_RECORD), 1);
     assert_eq!(peer.wire.frames_of(FRAME_FOLDER_LIST), 2);
     assert_eq!(peer.wire.frames_of(FRAME_FILE_LIST), 2);
-    assert_eq!(peer.wire.frames_of(FRAME_PIECE), 3);
-    // The one changed piece of the file was asked for by its number.
+    assert_eq!(peer.wire.frames_of(FRAME_CHUNK), 3);
+    // The one changed chunk of the file was asked for by its number.
     let changed = target_at(&source, &second, "weights/model.bin");
     assert!(peer.wire.requests.contains(
-        &Request::Pieces {
+        &Request::Chunks {
             file: changed.hash,
             start: 20,
             count: 1
@@ -140,18 +140,18 @@ fn what_a_receiver_holds_is_not_asked_for_again() {
 }
 
 #[test]
-fn pieces_held_from_anywhere_else_are_skipped_by_their_hash() {
+fn chunks_held_from_anywhere_else_are_skipped_by_their_hash() {
     let (_temp, source, root) = sample_tree("sync-elsewhere");
     let model = target_at(&source, &root, "weights/model.bin");
     let dest = MemoryStore::new();
-    // The receiver has the file's bytes from somewhere else, as bare pieces.
+    // The receiver has the file's bytes from somewhere else, as bare chunks.
     for item in file_of(&source, &model).unwrap().items() {
-        let piece = source.get(Stored::Piece, &item.hash).unwrap().unwrap();
-        dest.put(Stored::Piece, &item.hash, &piece).unwrap();
+        let chunk = source.get(Stored::Chunk, &item.hash).unwrap().unwrap();
+        dest.put(Stored::Chunk, &item.hash, &chunk).unwrap();
     }
     let mut peer = TestPeer::new(&source);
     fetch(&dest, &root, &mut peer).unwrap();
-    assert_eq!(peer.wire.frames_of(FRAME_PIECE), 76 - 63);
+    assert_eq!(peer.wire.frames_of(FRAME_CHUNK), 76 - 63);
     verify(&dest, &root).unwrap();
 }
 
@@ -215,10 +215,10 @@ fn one_name_is_looked_up_without_the_folder() {
         assert!(remote.lookup("weights/../readme.txt").is_err());
     }
     // The record, and one small frame for each name on the way: no folder's
-    // whole list, no file's list, and no piece.
+    // whole list, no file's list, and no chunk.
     assert_eq!(peer.wire.frames_of(FRAME_RECORD), 1);
     assert_eq!(
-        peer.wire.frames_of(FRAME_FOLDER_RUN),
+        peer.wire.frames_of(FRAME_FOLDER_BRANCH),
         peer.wire.frames.len() - 1
     );
     assert!(peer.wire.frames.iter().all(|frame| frame.len() < 600));
@@ -236,13 +236,13 @@ fn a_stretch_of_a_file_is_read_without_the_rest() {
         remote.read(&model, 100, 333, &mut out).unwrap();
         assert_eq!(out, &content[100..433]);
     }
-    // Bytes 100 to 432 lie in pieces 6 to 27. The record, one run of the
-    // file's list, and those 22 pieces came, and nothing else.
-    assert_eq!(peer.wire.frames_of(FRAME_FILE_RUN), 1);
-    assert_eq!(peer.wire.frames_of(FRAME_PIECE), 22);
+    // Bytes 100 to 432 lie in chunks 6 to 27. The record, one branch of the
+    // file's list, and those 22 chunks came, and nothing else.
+    assert_eq!(peer.wire.frames_of(FRAME_FILE_BRANCH), 1);
+    assert_eq!(peer.wire.frames_of(FRAME_CHUNK), 22);
     assert_eq!(peer.wire.frames.len(), 24);
     assert!(peer.wire.requests.contains(
-        &Request::Pieces {
+        &Request::Chunks {
             file: model.hash,
             start: 6,
             count: 22
@@ -295,7 +295,7 @@ fn every_stretch_of_a_small_file_reads_back_from_a_peer() {
 }
 
 #[test]
-fn a_run_of_a_folders_entries_is_listed() {
+fn a_branch_of_a_folders_entries_is_listed() {
     let (_temp, source, root) = sample_tree("sync-entries");
     let weights = target_at(&source, &root, "weights");
     let nothing = target_at(&source, &root, "nothing-here");
@@ -324,13 +324,13 @@ fn a_run_of_a_folders_entries_is_listed() {
 }
 
 #[test]
-fn a_peer_says_which_pieces_it_holds() {
+fn a_peer_says_which_chunks_it_holds() {
     let (_temp, source, root) = sample_tree("sync-have");
     let model = target_at(&source, &root, "weights/model.bin");
     let list = file_of(&source, &model).unwrap();
     for gone in [3, 7, 62] {
         source
-            .remove(Stored::Piece, &list.items()[gone].hash)
+            .remove(Stored::Chunk, &list.items()[gone].hash)
             .unwrap();
     }
     let mut peer = TestPeer::new(&source);
@@ -351,7 +351,7 @@ fn a_tree_goes_through_a_bundle_and_back() {
     assert_eq!(bundle[..8], BUNDLE_MAGIC);
     // Each thing once: 88 frames, each with four bytes for its length.
     let bytes_kept: u64 = [
-        Stored::Piece,
+        Stored::Chunk,
         Stored::FileList,
         Stored::FolderList,
         Stored::Record,
@@ -426,9 +426,9 @@ fn a_responder_says_what_it_does_not_hold_and_what_lies_outside() {
         Request::Record(Root::from_hash(unknown)),
         Request::Folder(unknown),
         Request::File(unknown),
-        Request::Piece(unknown),
+        Request::Chunk(unknown),
         Request::Have(unknown),
-        Request::FolderRun {
+        Request::FolderBranch {
             folder: unknown,
             start: 0,
             count: 1,
@@ -437,7 +437,7 @@ fn a_responder_says_what_it_does_not_hold_and_what_lies_outside() {
             folder: unknown,
             name: "a".to_owned(),
         },
-        Request::FileRun {
+        Request::FileBranch {
             file: unknown,
             start: 0,
             count: 1,
@@ -447,7 +447,7 @@ fn a_responder_says_what_it_does_not_hold_and_what_lies_outside() {
             offset: 0,
             length: 1,
         },
-        Request::Pieces {
+        Request::Chunks {
             file: unknown,
             start: 0,
             count: 1,
@@ -459,12 +459,12 @@ fn a_responder_says_what_it_does_not_hold_and_what_lies_outside() {
         refused(request, Refusal::NotHeld);
     }
     for request in [
-        Request::FolderRun {
+        Request::FolderBranch {
             folder: weights.hash,
             start: 3,
             count: 1,
         },
-        Request::FileRun {
+        Request::FileBranch {
             file: model.hash,
             start: 63,
             count: 1,
@@ -474,7 +474,7 @@ fn a_responder_says_what_it_does_not_hold_and_what_lies_outside() {
             offset: 1_000,
             length: 1,
         },
-        Request::Pieces {
+        Request::Chunks {
             file: model.hash,
             start: 63,
             count: 1,
@@ -484,7 +484,7 @@ fn a_responder_says_what_it_does_not_hold_and_what_lies_outside() {
     }
 
     // What reaches past the end is cut off at the end.
-    let frames = answer(Request::Pieces {
+    let frames = answer(Request::Chunks {
         file: model.hash,
         start: 60,
         count: 10,
@@ -495,18 +495,18 @@ fn a_responder_says_what_it_does_not_hold_and_what_lies_outside() {
         offset: 990,
         length: 10_000,
     });
-    let Frame::FileRun(run) = Frame::decode(&frames[0]).unwrap() else {
-        panic!("no run");
+    let Frame::FileBranch(branch) = Frame::decode(&frames[0]).unwrap() else {
+        panic!("no branch");
     };
-    assert_eq!((run.start(), run.items().len()), (61, 2));
-    assert_eq!(run.check(&model, None).unwrap(), 976);
+    assert_eq!((branch.start(), branch.items().len()), (61, 2));
+    assert_eq!(branch.check(&model, None).unwrap(), 976);
 
-    // Pieces come in order, up to the first one that is not held.
+    // Chunks come in order, up to the first one that is not held.
     let list = file_of(&source, &model).unwrap();
     source
-        .remove(Stored::Piece, &list.items()[12].hash)
+        .remove(Stored::Chunk, &list.items()[12].hash)
         .unwrap();
-    let frames = answer(Request::Pieces {
+    let frames = answer(Request::Chunks {
         file: model.hash,
         start: 10,
         count: 5,
@@ -514,11 +514,11 @@ fn a_responder_says_what_it_does_not_hold_and_what_lies_outside() {
     assert_eq!(frames.len(), 3);
     assert!(matches!(
         Frame::decode(&frames[0]).unwrap(),
-        Frame::Piece(_)
+        Frame::Chunk(_)
     ));
     assert!(matches!(
         Frame::decode(&frames[1]).unwrap(),
-        Frame::Piece(_)
+        Frame::Chunk(_)
     ));
     assert_eq!(
         Frame::decode(&frames[2]).unwrap(),

@@ -2,7 +2,7 @@
 //!
 //! Nothing here is shared with the library but SHA-256. Each function is the
 //! rule as `spec/FORMAT.md` states it, with no shortcut: a tree is hashed by
-//! halving, an opening is found by walking. It does two jobs. It says what
+//! halving, a branch is found by walking. It does two jobs. It says what
 //! the library's hashes have to be, from another hand. And it forges: it
 //! hashes lists that the library refuses to make, such as a folder that is
 //! out of order on purpose, the way an author with code of his own could.
@@ -168,7 +168,7 @@ impl Leaves {
     }
 
     /// The nodes to carry when items `start` up to `end` are shown: one for
-    /// each run that is left out, in the order a checker meets them, each
+    /// each branch that is left out, in the order a checker meets them, each
     /// with the first name under it. The node that begins the list has no
     /// name: it is in no right half, so no fork hashes one for it.
     pub fn carried(&self, start: usize, end: usize) -> Vec<(Node, Vec<u8>)> {
@@ -272,20 +272,20 @@ pub fn record_bytes(
     out
 }
 
-/// The extra data of a record that says only how the tree was cut.
-pub fn cut_tag(tag: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+/// The extra data of a record that says only how the tree was chunked.
+pub fn chunking_tag(tag: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     vec![(b"chunking".to_vec(), tag.as_bytes().to_vec())]
 }
 
 /// The frame that shows items `start` up to `end` of a file's list.
-pub fn file_run_frame(items: &[Item], start: usize, end: usize) -> Vec<u8> {
-    file_run_frame_as(items.len() as u64, start as u64, &items[start..end], &{
+pub fn file_branch_frame(items: &[Item], start: usize, end: usize) -> Vec<u8> {
+    file_branch_frame_as(items.len() as u64, start as u64, &items[start..end], &{
         file_leaves(items).carried(start, end)
     })
 }
 
-/// A file-run frame from its parts, whatever they say.
-pub fn file_run_frame_as(
+/// A file-branch frame from its parts, whatever they say.
+pub fn file_branch_frame_as(
     count: u64,
     start: u64,
     shown: &[Item],
@@ -305,8 +305,8 @@ pub fn file_run_frame_as(
 }
 
 /// The frame that shows entries `start` up to `end` of a folder's list.
-pub fn folder_run_frame(entries: &[Entry], start: usize, end: usize) -> Vec<u8> {
-    folder_run_frame_as(
+pub fn folder_branch_frame(entries: &[Entry], start: usize, end: usize) -> Vec<u8> {
+    folder_branch_frame_as(
         entries.len() as u64,
         start as u64,
         &entries[start..end],
@@ -314,8 +314,8 @@ pub fn folder_run_frame(entries: &[Entry], start: usize, end: usize) -> Vec<u8> 
     )
 }
 
-/// A folder-run frame from its parts, whatever they say.
-pub fn folder_run_frame_as(
+/// A folder-branch frame from its parts, whatever they say.
+pub fn folder_branch_frame_as(
     count: u64,
     start: u64,
     shown: &[Entry],

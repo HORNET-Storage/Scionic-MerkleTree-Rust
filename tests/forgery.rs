@@ -10,14 +10,14 @@ mod support;
 
 use scionic_merkletree::{
     export, fetch, file_of, folder_of, import, lookup, read_file, verify, Builder, Entry, Error,
-    ExtraData, FileList, FileRun, FolderList, FolderRun, Frame, Hash, Intake, Kind, MemoryStore,
-    Record, Remote, Request, Responder, Result, Root, Store, Stored, Summary, Target, Totals,
-    FRAME_FILE_LIST, FRAME_FILE_RUN, FRAME_FOLDER_LIST, FRAME_FOLDER_RUN, FRAME_PIECE,
-    FRAME_RECORD,
+    ExtraData, FileBranch, FileList, FolderBranch, FolderList, Frame, Hash, Intake, Kind,
+    MemoryStore, Record, Remote, Request, Responder, Result, Root, Store, Stored, Summary, Target,
+    Totals, FRAME_CHUNK, FRAME_FILE_BRANCH, FRAME_FILE_LIST, FRAME_FOLDER_BRANCH,
+    FRAME_FOLDER_LIST, FRAME_RECORD,
 };
 use std::cell::Cell;
 use support::oracle;
-use support::{bytes, contents, sample_tree, small_pieces, ScriptedPeer, TestPeer};
+use support::{bytes, contents, sample_tree, small_chunks, ScriptedPeer, TestPeer};
 
 fn target_at(store: &MemoryStore, root: &Root, path: &str) -> Target {
     lookup(store, root, path).unwrap().unwrap().target()
@@ -35,7 +35,7 @@ fn entry(name: &str, target: Target) -> Entry {
 fn assert_clean(store: &MemoryStore) {
     for (kind, hash, bytes) in contents(store) {
         match kind {
-            Stored::Piece => assert_eq!(Hash::of(&bytes), hash),
+            Stored::Chunk => assert_eq!(Hash::of(&bytes), hash),
             Stored::FileList => assert_eq!(*FileList::decode(&bytes).unwrap().hash(), hash),
             Stored::FolderList => assert_eq!(*FolderList::decode(&bytes).unwrap().hash(), hash),
             Stored::Record => {
@@ -102,14 +102,14 @@ fn any_changed_byte_of_any_frame_is_refused() {
 }
 
 #[test]
-fn every_byte_of_a_run_is_covered_by_the_hash_it_is_held_against() {
-    // A run shows a part of a list, and carries nodes for the rest. If one of
-    // its bytes could change and the run still pass, two different runs would
+fn every_byte_of_a_branch_is_covered_by_the_hash_it_is_held_against() {
+    // A branch shows a part of a list, and carries nodes for the rest. If one of
+    // its bytes could change and the branch still pass, two different branches would
     // show the same thing, and that byte would be nobody's to vouch for. So
-    // every byte of every run of a list of nine is changed here, one at a
+    // every byte of every branch of a list of nine is changed here, one at a
     // time, in its lowest bit and in its highest.
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let file = builder.file_from_bytes(&bytes("covered", 9 * 16)).unwrap();
     let entries: Vec<Entry> = (0..9)
         .map(|index| entry(&format!("n{index:02}"), file))
@@ -118,38 +118,38 @@ fn every_byte_of_a_run_is_covered_by_the_hash_it_is_held_against() {
     let file_list = file_of(&store, &file).unwrap();
     let folder_list = folder_of(&store, &folder).unwrap();
     assert_eq!((file_list.count(), folder_list.count()), (9, 9));
-    fn each_change(run: &[u8], what: &str, taken: impl Fn(&[u8]) -> bool) {
-        assert!(taken(run), "{what}: as it was made");
-        for at in 0..run.len() {
+    fn each_change(branch: &[u8], what: &str, taken: impl Fn(&[u8]) -> bool) {
+        assert!(taken(branch), "{what}: as it was made");
+        for at in 0..branch.len() {
             for bit in [0x01, 0x80] {
-                let mut changed = run.to_vec();
+                let mut changed = branch.to_vec();
                 changed[at] ^= bit;
-                assert!(!taken(&changed), "{what}: byte {at} of {}", run.len());
+                assert!(!taken(&changed), "{what}: byte {at} of {}", branch.len());
             }
         }
     }
     for start in 0..9_u64 {
         for end in start + 1..=9 {
-            let run = folder_list.open(start, end).unwrap().encode();
-            each_change(&run, &format!("entries {start}..{end}"), |bytes| {
-                FolderRun::decode(bytes)
-                    .and_then(|run| run.check(&folder))
+            let branch = folder_list.open(start, end).unwrap().encode();
+            each_change(&branch, &format!("entries {start}..{end}"), |bytes| {
+                FolderBranch::decode(bytes)
+                    .and_then(|branch| branch.check(&folder))
                     .is_ok()
             });
-            let run = file_list.open(start, end).unwrap().encode();
-            each_change(&run, &format!("pieces {start}..{end}"), |bytes| {
-                FileRun::decode(bytes)
-                    .and_then(|run| run.check(&file, None))
+            let branch = file_list.open(start, end).unwrap().encode();
+            each_change(&branch, &format!("chunks {start}..{end}"), |bytes| {
+                FileBranch::decode(bytes)
+                    .and_then(|branch| branch.check(&file, None))
                     .is_ok()
             });
         }
     }
-    // The answer to a name is a run too, whether the name is there or not.
+    // The answer to a name is a branch too, whether the name is there or not.
     for name in ["n00", "n04", "n08", "a", "n04x", "z"] {
         let answer = folder_list.open_name(name).unwrap().encode();
         each_change(&answer, &format!("the answer for {name:?}"), |bytes| {
-            FolderRun::decode(bytes)
-                .and_then(|run| run.check_name(&folder, name).map(|_| ()))
+            FolderBranch::decode(bytes)
+                .and_then(|branch| branch.check_name(&folder, name).map(|_| ()))
                 .is_ok()
         });
     }
@@ -161,7 +161,7 @@ fn a_made_up_child_under_a_folder_or_a_file_is_refused() {
     let weights = target_at(&source, &root, "weights");
     let model = target_at(&source, &root, "weights/model.bin");
     let made_up = oracle::Entry::file("zz-made-up", oracle::sha(&[b"made up"]), 7);
-    let made_up_item = oracle::Item::of(b"a made-up piece");
+    let made_up_item = oracle::Item::of(b"a made-up chunk");
 
     // One more entry at the end of a folder's list, one more item at the
     // end of a file's list, and one less of each.
@@ -241,16 +241,16 @@ fn a_made_up_child_under_a_folder_or_a_file_is_refused() {
         .collect();
     four.push(made_up.clone());
     for (start, end) in [(0, 4), (3, 4), (0, 1)] {
-        let forged = oracle::folder_run_frame(&four, start, end);
-        let Frame::FolderRun(run) = Frame::decode(&forged).unwrap() else {
-            panic!("no run");
+        let forged = oracle::folder_branch_frame(&four, start, end);
+        let Frame::FolderBranch(branch) = Frame::decode(&forged).unwrap() else {
+            panic!("no branch");
         };
-        assert!(run.check(&weights).is_err(), "{start}..{end}");
-        assert!(run.check_name(&weights, "zz-made-up").is_err());
+        assert!(branch.check(&weights).is_err(), "{start}..{end}");
+        assert!(branch.check_name(&weights, "zz-made-up").is_err());
     }
     let mut peer = TestPeer::tampering(&source, move |request, frames| {
         if request[0] == 0x33 {
-            vec![oracle::folder_run_frame(&four, 3, 4)]
+            vec![oracle::folder_branch_frame(&four, 3, 4)]
         } else {
             frames
         }
@@ -259,7 +259,7 @@ fn a_made_up_child_under_a_folder_or_a_file_is_refused() {
     assert!(remote.entry(&weights, "zz-made-up").is_err());
     assert!(remote.lookup("weights/zz-made-up").is_err());
 
-    // The same for a file: a made-up list of 64 pieces that holds the real
+    // The same for a file: a made-up list of 64 chunks that holds the real
     // 63 is another file.
     let real = file_of(&source, &model).unwrap();
     let mut longer: Vec<oracle::Item> = real
@@ -272,15 +272,15 @@ fn a_made_up_child_under_a_folder_or_a_file_is_refused() {
         .collect();
     longer.push(made_up_item);
     for (start, end) in [(0, 64), (63, 64), (5, 6)] {
-        let forged = oracle::file_run_frame(&longer, start, end);
-        let run = FileRun::decode(&forged[1..]).unwrap();
-        assert!(run.check(&model, None).is_err(), "{start}..{end}");
+        let forged = oracle::file_branch_frame(&longer, start, end);
+        let branch = FileBranch::decode(&forged[1..]).unwrap();
+        assert!(branch.check(&model, None).is_err(), "{start}..{end}");
     }
 }
 
 #[test]
-fn a_real_childs_opening_does_not_carry_another_child() {
-    let (_temp, source, root) = sample_tree("forge-opening");
+fn a_real_childs_branch_does_not_carry_another_child() {
+    let (_temp, source, root) = sample_tree("forge-branch");
     let weights = target_at(&source, &root, "weights");
     let model = target_at(&source, &root, "weights/model.bin");
     let list = folder_of(&source, &weights).unwrap();
@@ -296,12 +296,13 @@ fn a_real_childs_opening_does_not_carry_another_child() {
     );
     let honest = honest.encode();
 
-    // The entry that is shown starts 20 bytes into the run: its kind, its
+    // The entry that is shown starts 20 bytes into the branch: its kind, its
     // size, its hash, and then its name.
     let with = |at: usize, value: u8| {
         let mut forged = honest.clone();
         forged[at] = value;
-        FolderRun::decode(&forged).and_then(|run| run.check_name(&weights, "model.bin").map(|_| ()))
+        FolderBranch::decode(&forged)
+            .and_then(|branch| branch.check_name(&weights, "model.bin").map(|_| ()))
     };
     assert!(with(20, 2).is_err(), "the file shown as a folder");
     assert!(with(28, honest[28] ^ 1).is_err(), "another size");
@@ -311,8 +312,8 @@ fn a_real_childs_opening_does_not_carry_another_child() {
     assert!(with(15, honest[15] ^ 1).is_err(), "another place");
     assert!(with(7, honest[7] + 1).is_err(), "another count");
 
-    // The neighbour's opening, with the neighbour passed off under the name
-    // that was asked for, and the opening of the wrong place as proof that
+    // The neighbour's branch, with the neighbour passed off under the name
+    // that was asked for, and the branch of the wrong place as proof that
     // the name is not there.
     let asked = Cell::new("");
     let entries: Vec<oracle::Entry> = list
@@ -338,11 +339,11 @@ fn a_real_childs_opening_does_not_carry_another_child() {
         ] {
             asked.set(name);
             // As the place really is: right only when it is the name's place.
-            let plain = oracle::folder_run_frame(&entries, place, place + 1);
+            let plain = oracle::folder_branch_frame(&entries, place, place + 1);
             // With the entry renamed to what was asked for.
             let mut renamed = entries[place].clone();
             renamed.name = name.as_bytes().to_vec();
-            let passed_off = oracle::folder_run_frame_as(
+            let passed_off = oracle::folder_branch_frame_as(
                 3,
                 place as u64,
                 &[renamed],
@@ -373,21 +374,24 @@ fn a_real_childs_opening_does_not_carry_another_child() {
     }
     assert_eq!(model_place, 1);
 
-    // A file's run with one item changed, and the run of other pieces than
+    // A file's branch with one item changed, and the branch of other chunks than
     // those that hold the bytes asked for.
     let file_list = file_of(&source, &model).unwrap();
-    let run = file_list.open(6, 9).unwrap().encode();
+    let branch = file_list.open(6, 9).unwrap().encode();
     assert_eq!(
-        FileRun::decode(&run).unwrap().check(&model, None).unwrap(),
+        FileBranch::decode(&branch)
+            .unwrap()
+            .check(&model, None)
+            .unwrap(),
         96
     );
     for at in [20, 51, 52, 55] {
-        let mut forged = run.clone();
+        let mut forged = branch.clone();
         forged[at] ^= 1;
-        let checked = FileRun::decode(&forged).and_then(|run| run.check(&model, None));
+        let checked = FileBranch::decode(&forged).and_then(|branch| branch.check(&model, None));
         assert!(checked.is_err(), "byte {at}");
     }
-    let elsewhere = frame_with(FRAME_FILE_RUN, &file_list.open(0, 3).unwrap().encode());
+    let elsewhere = frame_with(FRAME_FILE_BRANCH, &file_list.open(0, 3).unwrap().encode());
     let mut peer = TestPeer::tampering(&source, move |request, frames| {
         if request[0] == 0x36 {
             vec![elsewhere.clone()]
@@ -405,7 +409,7 @@ fn a_real_childs_opening_does_not_carry_another_child() {
 }
 
 #[test]
-fn a_file_is_never_taken_for_a_folder_nor_a_list_for_a_piece() {
+fn a_file_is_never_taken_for_a_folder_nor_a_list_for_a_chunk() {
     let (_temp, source, root) = sample_tree("forge-kinds");
     let weights = target_at(&source, &root, "weights");
     let model = target_at(&source, &root, "weights/model.bin");
@@ -417,13 +421,13 @@ fn a_file_is_never_taken_for_a_folder_nor_a_list_for_a_piece() {
         FRAME_FOLDER_LIST,
         &kept(&source, Stored::FolderList, &weights.hash),
     );
-    let piece_frame = frame_with(FRAME_PIECE, &bytes("model", 16));
+    let chunk_frame = frame_with(FRAME_CHUNK, &bytes("model", 16));
 
     // Each kind of question, answered with a true part of the tree that is
     // of another kind.
     for (asked, answers) in [
-        (0x31, [&file_frame, &piece_frame]),
-        (0x34, [&folder_frame, &piece_frame]),
+        (0x31, [&file_frame, &chunk_frame]),
+        (0x34, [&folder_frame, &chunk_frame]),
         (0x37, [&file_frame, &folder_frame]),
     ] {
         for answer in answers {
@@ -461,52 +465,52 @@ fn a_file_is_never_taken_for_a_folder_nor_a_list_for_a_piece() {
     assert!(matches!(result, Err(Error::NotWanted { .. })));
 
     // A file whose bytes are another file's list, to the letter. It is kept
-    // as a piece, under the plain hash of its bytes, and never as a list.
+    // as a chunk, under the plain hash of its bytes, and never as a list.
     let list_bytes = kept(&source, Stored::FileList, &model.hash);
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, scionic_merkletree::Cutting::fixed(4096).unwrap());
+    let mut builder = Builder::new(&store, scionic_merkletree::Chunking::fixed(4096).unwrap());
     let odd = builder.file_from_bytes(&list_bytes).unwrap();
     let odd_root = builder.finish(odd, ExtraData::new()).unwrap();
     let dest = MemoryStore::new();
     fetch(&dest, &odd_root, &mut TestPeer::new(&store)).unwrap();
     let plain = Hash::of(&list_bytes);
-    assert!(dest.has(Stored::Piece, &plain).unwrap());
+    assert!(dest.has(Stored::Chunk, &plain).unwrap());
     assert!(!dest.has(Stored::FileList, &plain).unwrap());
     assert!(!dest.has(Stored::FileList, &model.hash).unwrap());
     assert_ne!(plain, model.hash);
 }
 
 #[test]
-fn a_file_is_not_given_another_files_pieces() {
-    let (_temp, source, root) = sample_tree("forge-pieces");
+fn a_file_is_not_given_another_files_chunks() {
+    let (_temp, source, root) = sample_tree("forge-chunks");
     let model = target_at(&source, &root, "weights/model.bin");
     let shard = target_at(&source, &root, "weights/shards/a.bin");
-    let shard_pieces: Vec<Vec<u8>> = file_of(&source, &shard)
+    let shard_chunks: Vec<Vec<u8>> = file_of(&source, &shard)
         .unwrap()
         .items()
         .iter()
-        .map(|item| frame_with(FRAME_PIECE, &kept(&source, Stored::Piece, &item.hash)))
+        .map(|item| frame_with(FRAME_CHUNK, &kept(&source, Stored::Chunk, &item.hash)))
         .collect();
 
-    // A whole fetch: the pieces of one file, sent when another file's were
-    // asked for. They are true pieces of the tree, and they are not what
+    // A whole fetch: the chunks of one file, sent when another file's were
+    // asked for. They are true chunks of the tree, and they are not what
     // was asked for.
-    let pieces = shard_pieces.clone();
+    let chunks = shard_chunks.clone();
     let (result, _dest) =
         fetch_tampered(
             &source,
             &root,
             move |request, frames| match Request::decode(request).unwrap() {
-                Request::Pieces { file, .. } if file == model.hash => pieces.clone(),
+                Request::Chunks { file, .. } if file == model.hash => chunks.clone(),
                 _ => frames,
             },
         );
     assert!(matches!(result, Err(Error::NotWanted { .. })));
 
-    // A stretch of one file, answered with another file's pieces, and with
-    // the file's own pieces in another order.
+    // A stretch of one file, answered with another file's chunks, and with
+    // the file's own chunks in another order.
     for swap in [false, true] {
-        let pieces = shard_pieces.clone();
+        let chunks = shard_chunks.clone();
         let mut peer = TestPeer::tampering(&source, move |request, mut frames| {
             if request[0] != 0x37 {
                 return frames;
@@ -515,7 +519,7 @@ fn a_file_is_not_given_another_files_pieces() {
                 frames.swap(0, 1);
                 frames
             } else {
-                pieces.clone()
+                chunks.clone()
             }
         });
         let mut remote = Remote::open(&mut peer, &root).unwrap();
@@ -524,12 +528,12 @@ fn a_file_is_not_given_another_files_pieces() {
             remote.read(&model, 0, 64, &mut out).is_err(),
             "swap: {swap}"
         );
-        assert!(out.is_empty(), "no byte of another piece is handed out");
+        assert!(out.is_empty(), "no byte of another chunk is handed out");
     }
 
-    // A stretch of one file, answered with the run of another file's list.
-    let other_run = frame_with(
-        FRAME_FILE_RUN,
+    // A stretch of one file, answered with the branch of another file's list.
+    let other_branch = frame_with(
+        FRAME_FILE_BRANCH,
         &file_of(&source, &shard)
             .unwrap()
             .open(0, 4)
@@ -538,7 +542,7 @@ fn a_file_is_not_given_another_files_pieces() {
     );
     let mut peer = TestPeer::tampering(&source, move |request, frames| {
         if request[0] == 0x36 {
-            vec![other_run.clone()]
+            vec![other_branch.clone()]
         } else {
             frames
         }
@@ -552,7 +556,7 @@ fn a_file_is_not_given_another_files_pieces() {
 #[test]
 fn a_record_for_another_root_is_refused() {
     let (_temp, source, root) = sample_tree("forge-record");
-    let mut builder = Builder::new(&source, small_pieces());
+    let mut builder = Builder::new(&source, small_chunks());
     let other_file = builder.file_from_bytes(b"another tree").unwrap();
     let other = builder.finish(other_file, ExtraData::new()).unwrap();
     let other_record = kept(&source, Stored::Record, other.as_hash());
@@ -596,12 +600,12 @@ fn nothing_is_kept_before_it_is_tied_to_the_root() {
         FRAME_FILE_LIST,
         &kept(&source, Stored::FileList, &readme.hash),
     );
-    let readme_piece = frame_with(FRAME_PIECE, b"a small file");
+    let readme_chunk = frame_with(FRAME_CHUNK, b"a small file");
     let deep_list = frame_with(
         FRAME_FILE_LIST,
         &kept(&source, Stored::FileList, &shard.hash),
     );
-    let made_up_piece = frame_with(FRAME_PIECE, b"no part of this tree");
+    let made_up_chunk = frame_with(FRAME_CHUNK, b"no part of this tree");
 
     let dest = MemoryStore::new();
     let refused = |frame: &[u8], what: &str| {
@@ -627,7 +631,7 @@ fn nothing_is_kept_before_it_is_tied_to_the_root() {
     for (frame, what) in [
         (&top_list, "the top folder"),
         (&readme_list, "a file's list"),
-        (&readme_piece, "a piece"),
+        (&readme_chunk, "a chunk"),
     ] {
         refused(frame, what);
     }
@@ -636,21 +640,21 @@ fn nothing_is_kept_before_it_is_tied_to_the_root() {
     // The record's totals are there to be looked at before anything more is
     // taken.
     let intake = Intake::new(&dest, root).unwrap();
-    assert_eq!(intake.record().unwrap().totals().pieces, 76);
+    assert_eq!(intake.record().unwrap().totals().chunks, 76);
     assert_eq!(intake.outstanding(), 1, "the top folder");
 
     // After the record, only the top folder is named.
     refused(&readme_list, "a file's list before its folder");
-    refused(&readme_piece, "a piece before its file's list");
+    refused(&readme_chunk, "a chunk before its file's list");
     refused(&deep_list, "a list from further down");
     taken(&top_list, "the top folder");
-    // Now the top folder's files are named, and their pieces are not yet.
-    refused(&readme_piece, "a piece before its file's list");
+    // Now the top folder's files are named, and their chunks are not yet.
+    refused(&readme_chunk, "a chunk before its file's list");
     refused(&deep_list, "a list from further down");
-    refused(&made_up_piece, "a made-up piece");
+    refused(&made_up_chunk, "a made-up chunk");
     taken(&readme_list, "a file's list");
-    refused(&made_up_piece, "a made-up piece");
-    taken(&readme_piece, "a piece");
+    refused(&made_up_chunk, "a made-up chunk");
+    taken(&readme_chunk, "a chunk");
 
     assert_only_from(&dest, &source);
     assert!(matches!(
@@ -658,15 +662,15 @@ fn nothing_is_kept_before_it_is_tied_to_the_root() {
         Err(Error::Missing { .. })
     ));
 
-    // A bundle with a made-up piece in it is refused where the piece comes,
-    // be the piece as long as a piece of this tree or longer.
+    // A bundle with a made-up chunk in it is refused where the chunk comes,
+    // be the chunk as long as a chunk of this tree or longer.
     let mut bundle = Vec::new();
     export(&source, &root, &mut bundle).unwrap();
-    let short_piece = frame_with(FRAME_PIECE, b"not of this tree");
-    for piece in [&short_piece, &made_up_piece] {
+    let short_chunk = frame_with(FRAME_CHUNK, b"not of this tree");
+    for chunk in [&short_chunk, &made_up_chunk] {
         let mut extra = bundle.clone();
-        extra.extend_from_slice(&(piece.len() as u32).to_be_bytes());
-        extra.extend_from_slice(piece);
+        extra.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+        extra.extend_from_slice(chunk);
         let fresh = MemoryStore::new();
         assert!(matches!(
             import(&fresh, &root, &mut extra.as_slice()),
@@ -691,9 +695,9 @@ fn a_peer_whose_own_store_is_wrong_is_found_out() {
     let shard = target_at(&source, &root, "weights/shards/a.bin");
     let weights = target_at(&source, &root, "weights");
     let data = target_at(&source, &root, "data");
-    let piece = file_of(&source, &model).unwrap().items()[9];
+    let chunk = file_of(&source, &model).unwrap().items()[9];
     let cases = [
-        (Stored::Piece, piece.hash, bytes("wrong", 16)),
+        (Stored::Chunk, chunk.hash, bytes("wrong", 16)),
         (
             Stored::FileList,
             model.hash,
@@ -735,11 +739,11 @@ fn a_file_never_comes_back_short() {
     let list = file_of(&source, &model).unwrap();
     let last = *list.items().last().unwrap();
 
-    // A peer that never sends the file's last piece.
+    // A peer that never sends the file's last chunk.
     let (result, dest) = fetch_tampered(&source, &root, move |_, frames| {
         frames
             .into_iter()
-            .filter(|frame| frame[0] != FRAME_PIECE || Hash::of(&frame[1..]) != last.hash)
+            .filter(|frame| frame[0] != FRAME_CHUNK || Hash::of(&frame[1..]) != last.hash)
             .collect()
     });
     assert!(matches!(result, Err(Error::Peer { .. })));
@@ -751,12 +755,12 @@ fn a_file_never_comes_back_short() {
     assert!(out.is_empty(), "an error, and never a shorter file");
     assert!(verify(&dest, &root).is_err());
 
-    // The last piece, one byte short.
+    // The last chunk, one byte short.
     let (result, _dest) = fetch_tampered(&source, &root, move |_, frames| {
         frames
             .into_iter()
             .map(|mut frame| {
-                if frame[0] == FRAME_PIECE && Hash::of(&frame[1..]) == last.hash {
+                if frame[0] == FRAME_CHUNK && Hash::of(&frame[1..]) == last.hash {
                     frame.pop();
                 }
                 frame
@@ -765,7 +769,7 @@ fn a_file_never_comes_back_short() {
     });
     assert!(result.is_err());
 
-    // A made-up file that is the real one without its last piece. It is
+    // A made-up file that is the real one without its last chunk. It is
     // whole and well formed, it is shorter, and it is another file.
     let shorter: Vec<oracle::Item> = list.items()[..62]
         .iter()
@@ -785,10 +789,10 @@ fn a_file_never_comes_back_short() {
             },
         );
     assert!(matches!(result, Err(Error::NotWanted { .. })));
-    let shorter_run = oracle::file_run_frame(&shorter, 0, 62);
+    let shorter_branch = oracle::file_branch_frame(&shorter, 0, 62);
     let mut peer = TestPeer::tampering(&source, move |request, frames| {
         if request[0] == 0x36 {
-            vec![shorter_run.clone()]
+            vec![shorter_branch.clone()]
         } else {
             frames
         }
@@ -798,7 +802,7 @@ fn a_file_never_comes_back_short() {
     assert!(remote.read(&model, 0, 1_000, &mut out).is_err());
     assert!(out.is_empty());
 
-    // A peer that sends fewer pieces than a stretch needs, and then none.
+    // A peer that sends fewer chunks than a stretch needs, and then none.
     let mut sent = 0;
     let mut peer = TestPeer::tampering(&source, move |request, frames| {
         if request[0] != 0x37 {
@@ -845,7 +849,7 @@ fn one_name_has_one_place_in_a_folder() {
             size,
             &folder_hash,
             (0, 0, oracle::folder_list_bytes(&entries).len() as u64),
-            &oracle::cut_tag("fixed-16"),
+            &oracle::chunking_tag("fixed-16"),
         );
         let root = Root::of_record(&record);
 
@@ -873,7 +877,7 @@ fn one_name_has_one_place_in_a_folder() {
                         if request[0] == 0x30 {
                             vec![record.clone()]
                         } else {
-                            vec![oracle::folder_run_frame(
+                            vec![oracle::folder_branch_frame(
                                 &entries,
                                 place.get(),
                                 place.get() + 1,
@@ -892,16 +896,16 @@ fn one_name_has_one_place_in_a_folder() {
             );
         }
 
-        // A run of several entries is accepted only where each of them is
-        // at its name's one place: never a run that shows a name twice.
+        // A branch of several entries is accepted only where each of them is
+        // at its name's one place: never a branch that shows a name twice.
         for start in 0..entries.len() {
             for end in start + 1..=entries.len() {
-                let frame = oracle::folder_run_frame(&entries, start, end);
-                let Ok(Frame::FolderRun(run)) = Frame::decode(&frame) else {
+                let frame = oracle::folder_branch_frame(&entries, start, end);
+                let Ok(Frame::FolderBranch(branch)) = Frame::decode(&frame) else {
                     continue;
                 };
-                if run.check(&folder).is_ok() {
-                    let shown: Vec<&str> = run.entries().iter().map(Entry::name).collect();
+                if branch.check(&folder).is_ok() {
+                    let shown: Vec<&str> = branch.entries().iter().map(Entry::name).collect();
                     let mut unique = shown.clone();
                     unique.dedup();
                     assert_eq!(shown, unique);
@@ -914,27 +918,28 @@ fn one_name_has_one_place_in_a_folder() {
 
 #[test]
 fn no_place_exists_beyond_the_count_and_a_fork_is_no_leaf() {
-    let pieces: Vec<Vec<u8>> = (0..5)
+    let chunks: Vec<Vec<u8>> = (0..5)
         .map(|index| bytes(&format!("p{index}"), 16))
         .collect();
-    let items: Vec<oracle::Item> = pieces.iter().map(|piece| oracle::Item::of(piece)).collect();
+    let items: Vec<oracle::Item> = chunks.iter().map(|chunk| oracle::Item::of(chunk)).collect();
     let (hash, size) = oracle::file_hash(&items);
     let file = Target {
         kind: Kind::File,
         hash: Hash::from_bytes(hash),
         size,
     };
-    let check = |frame: &[u8]| FileRun::decode(&frame[1..]).and_then(|run| run.check(&file, None));
-    assert_eq!(check(&oracle::file_run_frame(&items, 4, 5)).unwrap(), 64);
+    let check =
+        |frame: &[u8]| FileBranch::decode(&frame[1..]).and_then(|branch| branch.check(&file, None));
+    assert_eq!(check(&oracle::file_branch_frame(&items, 4, 5)).unwrap(), 64);
 
-    // The last piece, shown again at the place after the last. A tree that
+    // The last chunk, shown again at the place after the last. A tree that
     // fills up a level by repeating its last leaf would take this.
     let carried = oracle::file_leaves(&items).carried(4, 5);
     for (count, start) in [(5, 5), (6, 5), (6, 4), (4, 4), (8, 7)] {
-        let forged = oracle::file_run_frame_as(count, start, &items[4..], &carried);
-        assert!(check(&forged).is_err(), "as {count} pieces, at {start}");
+        let forged = oracle::file_branch_frame_as(count, start, &items[4..], &carried);
+        assert!(check(&forged).is_err(), "as {count} chunks, at {start}");
     }
-    // A file of six pieces whose sixth is the fifth again is another file.
+    // A file of six chunks whose sixth is the fifth again is another file.
     let mut six = items.clone();
     six.push(items[4].clone());
     assert_ne!(oracle::file_hash(&six).0, hash);
@@ -943,10 +948,10 @@ fn no_place_exists_beyond_the_count_and_a_fork_is_no_leaf() {
         oracle::file_leaves(&items).top().0
     );
     for (start, end) in [(0, 6), (5, 6), (4, 5)] {
-        assert!(check(&oracle::file_run_frame(&six, start, end)).is_err());
+        assert!(check(&oracle::file_branch_frame(&six, start, end)).is_err());
     }
 
-    // A fork passed off as a piece: a file of two "pieces" that are the
+    // A fork passed off as a chunk: a file of two "chunks" that are the
     // two forks under the top of a file of four.
     let four = &items[..4];
     let leaves = oracle::file_leaves(four);
@@ -963,11 +968,11 @@ fn no_place_exists_beyond_the_count_and_a_fork_is_no_leaf() {
             length: *size as u32,
         })
         .collect();
-    let as_two = oracle::file_run_frame(&forks, 0, 2);
-    let run = FileRun::decode(&as_two[1..]).unwrap();
-    assert!(run.check(&four_file, None).is_err());
+    let as_two = oracle::file_branch_frame(&forks, 0, 2);
+    let branch = FileBranch::decode(&as_two[1..]).unwrap();
+    assert!(branch.check(&four_file, None).is_err());
     assert_ne!(oracle::file_hash(&forks).0, four_hash);
-    // And a leaf passed off as a fork: the top of a file of one piece is
+    // And a leaf passed off as a fork: the top of a file of one chunk is
     // never the top of a file of two.
     let one = &items[..1];
     assert_ne!(
@@ -983,16 +988,16 @@ fn a_tree_that_holds_more_than_its_record_says_is_stopped() {
     let right = record.totals();
     for (field, totals) in [
         (
-            "pieces",
+            "chunks",
             Totals {
-                pieces: right.pieces - 1,
+                chunks: right.chunks - 1,
                 ..right
             },
         ),
         (
-            "piece bytes",
+            "chunk bytes",
             Totals {
-                piece_bytes: right.piece_bytes - 16,
+                chunk_bytes: right.chunk_bytes - 16,
                 ..right
             },
         ),
@@ -1004,7 +1009,8 @@ fn a_tree_that_holds_more_than_its_record_says_is_stopped() {
             },
         ),
     ] {
-        let forged = Record::new(record.top(), totals, record.cutting(), ExtraData::new()).unwrap();
+        let forged =
+            Record::new(record.top(), totals, record.chunking(), ExtraData::new()).unwrap();
         let forged_root = forged.root();
         source
             .put(Stored::Record, forged_root.as_hash(), &forged.encode())
@@ -1021,7 +1027,7 @@ fn a_tree_that_holds_more_than_its_record_says_is_stopped() {
 #[test]
 fn a_tree_that_is_too_deep_is_refused_however_it_arrives() {
     let source = MemoryStore::new();
-    let mut builder = Builder::new(&source, small_pieces());
+    let mut builder = Builder::new(&source, small_chunks());
     let file = builder.file_from_bytes(b"at the bottom").unwrap();
     let mut inner = builder.folder(vec![entry("file", file)]).unwrap();
     for _ in 1..128 {
@@ -1041,7 +1047,7 @@ fn a_tree_that_is_too_deep_is_refused_however_it_arrives() {
             list_bytes: totals.list_bytes + over.encoded_len(),
             ..totals
         },
-        small_pieces(),
+        small_chunks(),
         ExtraData::new(),
     )
     .unwrap();
@@ -1092,9 +1098,9 @@ fn malformed_input_is_an_error_and_never_a_crash() {
             FRAME_FILE_LIST,
             &kept(&source, Stored::FileList, &model.hash),
         ),
-        frame_with(FRAME_PIECE, b"a small file"),
+        frame_with(FRAME_CHUNK, b"a small file"),
         frame_with(
-            FRAME_FILE_RUN,
+            FRAME_FILE_BRANCH,
             &file_of(&source, &model)
                 .unwrap()
                 .open(3, 9)
@@ -1102,7 +1108,7 @@ fn malformed_input_is_an_error_and_never_a_crash() {
                 .encode(),
         ),
         frame_with(
-            FRAME_FOLDER_RUN,
+            FRAME_FOLDER_BRANCH,
             &folder_of(&source, &weights)
                 .unwrap()
                 .open(1, 2)
@@ -1114,7 +1120,7 @@ fn malformed_input_is_an_error_and_never_a_crash() {
     ];
     assert_eq!(honest[0][0], FRAME_RECORD);
 
-    // Every way of cutting a frame short, and every single byte of it
+    // Every way of chunking a frame short, and every single byte of it
     // changed in three ways.
     let mut forged: Vec<Vec<u8>> = Vec::new();
     for frame in &honest {
@@ -1153,10 +1159,10 @@ fn malformed_input_is_an_error_and_never_a_crash() {
         let _ = Record::decode(frame);
         let _ = FileList::decode(frame);
         let _ = FolderList::decode(frame);
-        let _ = FileRun::decode(frame).map(|run| run.check(&model, None));
-        let _ = FolderRun::decode(frame).map(|run| {
-            let _ = run.check(&weights);
-            run.check_name(&weights, "model.bin").map(|_| ())
+        let _ = FileBranch::decode(frame).map(|branch| branch.check(&model, None));
+        let _ = FolderBranch::decode(frame).map(|branch| {
+            let _ = branch.check(&weights);
+            branch.check_name(&weights, "model.bin").map(|_| ())
         });
         let _ = Root::parse(&String::from_utf8_lossy(frame));
         let _ = responder.answer(frame, &mut |_| Ok(()));

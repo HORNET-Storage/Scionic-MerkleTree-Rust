@@ -1,9 +1,9 @@
 //! Building a tree: from a folder or a file on disk, or part by part.
 
 use crate::disk::{Found, Held, Refused};
-use crate::fastcdc::{StreamCutter, FASTCDC_MAX_SIZE};
+use crate::fastcdc::{StreamChunker, FASTCDC_MAX_SIZE};
 use crate::format::{
-    check_name, Cutting, Entry, ExtraData, FileList, FolderList, Kind, PieceRef, Record, Target,
+    check_name, ChunkRef, Chunking, Entry, ExtraData, FileList, FolderList, Kind, Record, Target,
     MAX_FOLDER_DEPTH, TIMESTAMP_KEY,
 };
 use crate::hash::Root;
@@ -29,15 +29,15 @@ pub(crate) fn read_some(reader: &mut dyn Read, buffer: &mut [u8]) -> io::Result<
 }
 
 /// How much of a file a builder holds at a time when it works alone: two
-/// pieces of the longest kind.
+/// chunks of the longest kind.
 const ROOM_ALONE: usize = 2 * FASTCDC_MAX_SIZE;
 
 /// How much of a file a builder holds at a time when other threads help it:
-/// enough pieces to give each of them some.
+/// enough chunks to give each of them some.
 const ROOM_WITH_HELP: usize = 8 * FASTCDC_MAX_SIZE;
 
-/// How many pieces of a file that lies in memory are handed on at a time.
-const PIECES_AT_A_TIME: usize = 64;
+/// How many chunks of a file that lies in memory are handed on at a time.
+const CHUNKS_AT_A_TIME: usize = 64;
 
 fn cores() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
@@ -45,8 +45,8 @@ fn cores() -> usize {
 
 /// The threads that are free to help with a long file.
 ///
-/// A file is cut on the thread that asks for it, because where one piece
-/// ends decides where the next begins. Hashing and keeping the pieces is the
+/// A file is chunked on the thread that asks for it, because where one chunk
+/// ends decides where the next begins. Hashing and keeping the chunks is the
 /// greater part of the work and needs no order, so it is shared out among
 /// that thread and the helpers that are free.
 pub(crate) struct Helpers {
@@ -102,45 +102,45 @@ impl Helpers {
 /// Builds a tree part by part: files from their bytes, folders from their
 /// entries, and at the end the record.
 ///
-/// Everything goes into the store as it is made. A piece, a file or a folder
+/// Everything goes into the store as it is made. A chunk, a file or a folder
 /// that the store holds already is not written again.
 pub struct Builder<'s> {
     store: &'s dyn Store,
-    cutting: Cutting,
-    cutter: StreamCutter,
+    chunking: Chunking,
+    chunker: StreamChunker,
     helpers: Arc<Helpers>,
 }
 
 impl<'s> Builder<'s> {
     /// A builder that uses one thread for each core on a long file.
-    pub fn new(store: &'s dyn Store, cutting: Cutting) -> Self {
-        Self::sharing(store, cutting, Helpers::for_threads(0))
+    pub fn new(store: &'s dyn Store, chunking: Chunking) -> Self {
+        Self::sharing(store, chunking, Helpers::for_threads(0))
     }
 
-    fn sharing(store: &'s dyn Store, cutting: Cutting, helpers: Arc<Helpers>) -> Self {
+    fn sharing(store: &'s dyn Store, chunking: Chunking, helpers: Arc<Helpers>) -> Self {
         Self {
             store,
-            cutting,
-            cutter: StreamCutter::new(),
+            chunking,
+            chunker: StreamChunker::new(),
             helpers,
         }
     }
 
-    /// How many threads hash and keep the pieces of one file: 1 is the
+    /// How many threads hash and keep the chunks of one file: 1 is the
     /// calling thread alone, and zero is one thread for each core. A file is
-    /// always cut on the calling thread. With help, a builder holds up to
+    /// always chunked on the calling thread. With help, a builder holds up to
     /// 64 MiB of a long file at a time; alone it holds up to 16 MiB.
     pub fn threads(mut self, threads: usize) -> Self {
         self.helpers = Helpers::for_threads(threads);
         self
     }
 
-    /// How this builder cuts files.
-    pub fn cutting(&self) -> Cutting {
-        self.cutting
+    /// How this builder chunks files.
+    pub fn chunking(&self) -> Chunking {
+        self.chunking
     }
 
-    /// Cuts everything `reader` gives into pieces, keeps the pieces and the
+    /// Splits everything `reader` gives into chunks, keeps the chunks and the
     /// file's list, and says what the file is. The file is never held in
     /// memory whole: only a window of it, as [`Builder::threads`] says.
     pub fn file(&mut self, reader: &mut dyn Read) -> Result<Target> {
@@ -152,12 +152,12 @@ impl<'s> Builder<'s> {
         })
     }
 
-    /// The file with these bytes. They are cut where they lie, and nothing
+    /// The file with these bytes. They are chunked where they lie, and nothing
     /// is copied on the way to the store.
     pub fn file_from_bytes(&mut self, bytes: &[u8]) -> Result<Target> {
         let mut items = Vec::new();
-        for pieces in self.cutting.cut(bytes).chunks(PIECES_AT_A_TIME) {
-            keep_pieces(self.store, &self.helpers, pieces, &mut items)?;
+        for chunks in self.chunking.cut(bytes).chunks(CHUNKS_AT_A_TIME) {
+            keep_chunks(self.store, &self.helpers, chunks, &mut items)?;
         }
         self.keep_list(items)
     }
@@ -179,15 +179,15 @@ impl<'s> Builder<'s> {
             ROOM_ALONE
         };
         let mut items = Vec::new();
-        self.cutter.cut(self.cutting, room, read, |pieces| {
-            keep_pieces(store, helpers, pieces, &mut items)
+        self.chunker.cut(self.chunking, room, read, |chunks| {
+            keep_chunks(store, helpers, chunks, &mut items)
         })?;
         self.keep_list(items)
     }
 
-    /// Keeps the list of a file whose pieces are kept, and says what the
+    /// Keeps the list of a file whose chunks are kept, and says what the
     /// file is.
-    fn keep_list(&self, items: Vec<PieceRef>) -> Result<Target> {
+    fn keep_list(&self, items: Vec<ChunkRef>) -> Result<Target> {
         let list = FileList::new(items)?;
         if !self.store.has(Stored::FileList, list.hash())? {
             self.store
@@ -212,12 +212,12 @@ impl<'s> Builder<'s> {
     /// tree's root. The store must hold every list under `top`.
     ///
     /// The whole tree is checked before its record is kept: its sizes, how
-    /// its files are cut, and how deep its folders sit. The checks are the
+    /// its files are chunked, and how deep its folders sit. The checks are the
     /// ones a tree goes through when it is taken in, and the totals in the
     /// record are what those checks counted.
     pub fn finish(self, top: Target, extra: ExtraData) -> Result<Root> {
-        let totals = Intake::measure(self.store, top, self.cutting)?;
-        let record = Record::new(top, totals, self.cutting, extra)?;
+        let totals = Intake::measure(self.store, top, self.chunking)?;
+        let record = Record::new(top, totals, self.chunking, extra)?;
         let bytes = record.encode();
         let root = Root::of_record(&bytes);
         self.store.put(Stored::Record, root.as_hash(), &bytes)?;
@@ -225,29 +225,29 @@ impl<'s> Builder<'s> {
     }
 }
 
-/// Hashes and keeps one piece, and says what it is. A piece that the store
+/// Hashes and keeps one chunk, and says what it is. A chunk that the store
 /// holds already is not written again.
-fn keep_piece(store: &dyn Store, piece: &[u8]) -> Result<PieceRef> {
-    let item = PieceRef::of(piece)?;
-    if !store.has(Stored::Piece, &item.hash)? {
-        store.put(Stored::Piece, &item.hash, piece)?;
+fn keep_chunk(store: &dyn Store, chunk: &[u8]) -> Result<ChunkRef> {
+    let item = ChunkRef::of(chunk)?;
+    if !store.has(Stored::Chunk, &item.hash)? {
+        store.put(Stored::Chunk, &item.hash, chunk)?;
     }
     Ok(item)
 }
 
-/// Hashes and keeps pieces that follow one another in a file, and adds what
+/// Hashes and keeps chunks that follow one another in a file, and adds what
 /// they are to `items`, in their order. Helpers that are free take a share.
-fn keep_pieces(
+fn keep_chunks(
     store: &dyn Store,
     helpers: &Helpers,
-    pieces: &[&[u8]],
-    items: &mut Vec<PieceRef>,
+    chunks: &[&[u8]],
+    items: &mut Vec<ChunkRef>,
 ) -> Result<()> {
-    // A helper is worth starting only for a few pieces of its own.
-    let helping = helpers.take(pieces.len() / 2);
+    // A helper is worth starting only for a few chunks of its own.
+    let helping = helpers.take(chunks.len() / 2);
     if helping == 0 {
-        for piece in pieces {
-            items.push(keep_piece(store, piece)?);
+        for chunk in chunks {
+            items.push(keep_chunk(store, chunk)?);
         }
         return Ok(());
     }
@@ -256,17 +256,17 @@ fn keep_pieces(
         let mut kept = Vec::new();
         loop {
             let index = next.fetch_add(1, Ordering::Relaxed);
-            let Some(piece) = pieces.get(index) else {
+            let Some(chunk) = chunks.get(index) else {
                 return kept;
             };
-            let item = keep_piece(store, piece);
+            let item = keep_chunk(store, chunk);
             if item.is_err() {
-                next.store(pieces.len(), Ordering::Relaxed);
+                next.store(chunks.len(), Ordering::Relaxed);
             }
             kept.push((index, item));
         }
     };
-    let kept: Vec<(usize, Result<PieceRef>)> = std::thread::scope(|scope| {
+    let kept: Vec<(usize, Result<ChunkRef>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..helping).map(|_| scope.spawn(work)).collect();
         let mut kept = work();
         for handle in handles {
@@ -278,13 +278,13 @@ fn keep_pieces(
         kept
     });
     helpers.give(helping);
-    let mut found: Vec<Option<PieceRef>> = vec![None; pieces.len()];
+    let mut found: Vec<Option<ChunkRef>> = vec![None; chunks.len()];
     for (index, item) in kept {
         found[index] = Some(item?);
     }
     for item in found {
         items.push(item.ok_or(Error::Invariant {
-            detail: "a piece was left out of a file",
+            detail: "a chunk was left out of a file",
         })?);
     }
     Ok(())
@@ -305,7 +305,7 @@ pub enum Links {
 /// How a tree is built from disk.
 #[derive(Clone, Debug, Default)]
 pub struct BuildOptions {
-    cutting: Option<Cutting>,
+    chunking: Option<Chunking>,
     extra: ExtraData,
     timestamp: bool,
     workers: usize,
@@ -317,10 +317,10 @@ impl BuildOptions {
         Self::default()
     }
 
-    /// How files are cut. Without this they are cut by content, as every
+    /// How files are chunked. Without this they are chunked by content, as every
     /// tree outside a test should be.
-    pub fn cutting(mut self, cutting: Cutting) -> Self {
-        self.cutting = Some(cutting);
+    pub fn chunking(mut self, chunking: Chunking) -> Self {
+        self.chunking = Some(chunking);
         self
     }
 
@@ -338,8 +338,8 @@ impl BuildOptions {
     }
 
     /// How many threads build the tree. Zero is one for each core. Files
-    /// are cut several at once, and a thread that has no file of its own
-    /// helps to hash the pieces of a long one.
+    /// are chunked several at once, and a thread that has no file of its own
+    /// helps to hash the chunks of a long one.
     pub fn workers(mut self, workers: usize) -> Self {
         self.workers = workers;
         self
@@ -374,13 +374,13 @@ pub fn build_with(
     entry_extra: &EntryExtra<'_>,
 ) -> Result<Root> {
     let path = path.as_ref();
-    let cutting = options.cutting.unwrap_or(Cutting::FastCdcV1);
+    let chunking = options.chunking.unwrap_or(Chunking::FastCdcV1);
     let mut extra = options.extra.clone();
     if options.timestamp {
         extra.insert(TIMESTAMP_KEY, timestamp(SystemTime::now())?)?;
     }
     let metadata = fs::metadata(path).map_err(|error| io_error("look at", path, error))?;
-    let mut builder = Builder::new(store, cutting).threads(options.workers);
+    let mut builder = Builder::new(store, chunking).threads(options.workers);
     if !metadata.is_dir() {
         let top = builder.file_at(path)?;
         return builder.finish(top, extra);
@@ -390,7 +390,7 @@ pub fn build_with(
     // and so is every folder under it while it is read.
     let top = Held::open(path).map_err(|error| io_error("open", path, error))?;
     let (folders, file_targets) =
-        walk_and_cut(store, cutting, &top, options.links, options.workers)?;
+        walk_and_chunk(store, chunking, &top, options.links, options.workers)?;
     // A folder is found after the folder it is in, so going backwards every
     // folder is made after the folders inside it.
     let mut folder_targets: Vec<Option<Target>> = vec![None; folders.len()];
@@ -443,12 +443,12 @@ struct Child {
 /// place among the folders.
 type OnTheWay = (Arc<Held>, Vec<(String, usize)>);
 
-/// How many folders' files may wait for the threads that cut. A folder is
-/// kept open while it has files that are not cut yet, so this bounds how many
+/// How many folders' files may wait for the threads that chunk. A folder is
+/// kept open while it has files that are not chunked yet, so this bounds how many
 /// folders are open at a time.
 const FOLDERS_AHEAD: usize = 16;
 
-/// The files that the walk found in one folder, for the threads to cut. The
+/// The files that the walk found in one folder, for the threads to chunk. The
 /// folder is held open, and each file is opened from it by its name.
 struct Batch {
     folder: Arc<Held>,
@@ -484,10 +484,10 @@ fn changed(path: &Path, refused: Refused) -> Error {
     }
 }
 
-/// Cuts and keeps the file `name` of a folder that is held open. The file is
+/// Chunks and keeps the file `name` of a folder that is held open. The file is
 /// opened from the folder itself. Once `stop` is set, the file is given up,
 /// however much of it is left.
-fn cut_file_in(
+fn chunk_file_in(
     builder: &mut Builder<'_>,
     folder: &Held,
     name: &str,
@@ -664,10 +664,10 @@ fn wait<'a, T>(told: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The folders whose files wait for the threads that cut, between the
+/// The folders whose files wait for the threads that chunk, between the
 /// thread that walks and those threads.
 ///
-/// Nobody waits here for a thread that is gone. A file that cannot be cut, a
+/// Nobody waits here for a thread that is gone. A file that cannot be chunked, a
 /// walk that fails and a thread that falls over each set `failed`, and wake
 /// whoever waits.
 struct Waiting {
@@ -676,7 +676,7 @@ struct Waiting {
     more: Condvar,
     /// Told when a folder's files are all taken, so that the walk may go on.
     room: Condvar,
-    /// Nothing more is to be cut.
+    /// Nothing more is to be chunked.
     failed: AtomicBool,
 }
 
@@ -726,7 +726,7 @@ impl Waiting {
         Ok(())
     }
 
-    /// For a thread that cuts: a folder that has files left to take. None
+    /// For a thread that chunks: a folder that has files left to take. None
     /// when the walk is over and every file is taken, or when the build has
     /// failed.
     fn next(&self) -> Option<Arc<Batch>> {
@@ -749,7 +749,7 @@ impl Waiting {
         }
     }
 
-    /// Nothing more is to be cut. Set with the lock held, so that no thread
+    /// Nothing more is to be chunked. Set with the lock held, so that no thread
     /// can look, miss it, and then wait.
     fn fail(&self) {
         let state = lock(&self.state);
@@ -778,12 +778,12 @@ impl Drop for Working<'_> {
     }
 }
 
-/// Finds every folder and every file under `top`, and cuts and keeps the
+/// Finds every folder and every file under `top`, and chunks and keeps the
 /// files while they are found, several at once. Gives the folders, and what
 /// each file is.
-fn walk_and_cut(
+fn walk_and_chunk(
     store: &dyn Store,
-    cutting: Cutting,
+    chunking: Chunking,
     top: &Arc<Held>,
     links: Links,
     threads: usize,
@@ -793,20 +793,20 @@ fn walk_and_cut(
         threads => threads,
     };
     // A thread that has no file left gives itself up to help with the long
-    // files that are still being cut.
+    // files that are still being chunked.
     let helpers = Helpers::new(0);
     if threads == 1 {
-        // One thread walks and cuts in turn.
-        let mut builder = Builder::sharing(store, cutting, helpers);
+        // One thread walks and chunks in turn.
+        let mut builder = Builder::sharing(store, chunking, helpers);
         let mut targets = Vec::new();
         let (folders, _) = walk(top, links, &mut |batch| {
             for (index, name) in &batch.files {
                 if *index != targets.len() {
                     return Err(Error::Invariant {
-                        detail: "a file was cut out of its turn",
+                        detail: "a file was chunked out of its turn",
                     });
                 }
-                targets.push(cut_file_in(&mut builder, &batch.folder, name, None)?);
+                targets.push(chunk_file_in(&mut builder, &batch.folder, name, None)?);
             }
             Ok(())
         })?;
@@ -815,7 +815,7 @@ fn walk_and_cut(
     let waiting = Waiting::new();
     let work = || -> Result<Vec<(usize, Target)>> {
         let _working = Working(&waiting);
-        let mut builder = Builder::sharing(store, cutting, Arc::clone(&helpers));
+        let mut builder = Builder::sharing(store, chunking, Arc::clone(&helpers));
         let mut done = Vec::new();
         let mut first_error = None;
         while let Some(batch) = waiting.next() {
@@ -826,7 +826,7 @@ fn walk_and_cut(
                     break;
                 }
                 let stop = Some(&waiting.failed);
-                match cut_file_in(&mut builder, &batch.folder, name, stop) {
+                match chunk_file_in(&mut builder, &batch.folder, name, stop) {
                     Ok(target) => done.push((*index, target)),
                     Err(error) => {
                         first_error.get_or_insert(error);
@@ -841,31 +841,31 @@ fn walk_and_cut(
             None => Ok(done),
         }
     };
-    let (walked, cut) = std::thread::scope(|scope| {
+    let (walked, chunked) = std::thread::scope(|scope| {
         let _working = Working(&waiting);
         let handles: Vec<_> = (0..threads).map(|_| scope.spawn(work)).collect();
         let walked = walk(top, links, &mut |batch| waiting.add(batch));
-        // A walk that failed stops the cutting too: a thread gives up the
+        // A walk that failed stops the chunking too: a thread gives up the
         // file it is on, however long that file is.
         if walked.is_err() {
             waiting.fail();
         }
         // With the walk over, the threads run out of files and end.
         waiting.end();
-        let cut: Vec<Result<Vec<(usize, Target)>>> = handles
+        let chunked: Vec<Result<Vec<(usize, Target)>>> = handles
             .into_iter()
             .map(|handle| match handle.join() {
                 Ok(result) => result,
                 Err(payload) => std::panic::resume_unwind(payload),
             })
             .collect();
-        (walked, cut)
+        (walked, chunked)
     });
     // The failure that came first in its thread is the one to tell. A thread
     // that only stopped for another's failure has nothing to tell.
     let mut done = Vec::new();
     let mut stopped = false;
-    for result in cut {
+    for result in chunked {
         match result {
             Ok(part) => done.extend(part),
             Err(error) if is_stopped(&error) => stopped = true,

@@ -1,10 +1,10 @@
 //! What a receiver asks, and the frames that answer it.
 //!
 //! A receiver asks from the top down: for the record of a root, for a folder's
-//! entries, for a file's list, and for pieces. It asks for pieces by the
-//! file's hash and their numbers in it, or for one piece by its hash.
+//! entries, for a file's list, and for chunks. It asks for chunks by the
+//! file's hash and their numbers in it, or for one chunk by its hash.
 //!
-//! An answer is one frame, or for pieces one frame for each piece. A frame
+//! An answer is one frame, or for chunks one frame for each chunk. A frame
 //! never says which hash it belongs under: the receiver works the hash out
 //! from the frame's bytes, and holds it against a hash it already trusts.
 //!
@@ -12,7 +12,7 @@
 //! Numbers are big-endian.
 
 use crate::format::{
-    check_name, FileRun, FolderRun, Reader, MAX_NAME_BYTES, MAX_PIECE_BYTES, RECORD_MARK,
+    check_name, FileBranch, FolderBranch, Reader, MAX_CHUNK_BYTES, MAX_NAME_BYTES, RECORD_MARK,
 };
 use crate::hash::{Hash, Root};
 use crate::tree::MAX_LIST_ITEMS;
@@ -25,26 +25,26 @@ pub const FRAME_RECORD: u8 = RECORD_MARK;
 pub const FRAME_FILE_LIST: u8 = 0x21;
 /// A folder's whole list.
 pub const FRAME_FOLDER_LIST: u8 = 0x22;
-/// A run of a file's list, with the nodes that stand for the rest.
-pub const FRAME_FILE_RUN: u8 = 0x23;
-/// A run of a folder's list, with the nodes that stand for the rest.
-pub const FRAME_FOLDER_RUN: u8 = 0x24;
-/// A piece's bytes.
-pub const FRAME_PIECE: u8 = 0x25;
-/// Which pieces of a file a peer holds.
+/// A branch of a file's list, with the nodes that stand for the rest.
+pub const FRAME_FILE_BRANCH: u8 = 0x23;
+/// A branch of a folder's list, with the nodes that stand for the rest.
+pub const FRAME_FOLDER_BRANCH: u8 = 0x24;
+/// A chunk's bytes.
+pub const FRAME_CHUNK: u8 = 0x25;
+/// Which chunks of a file a peer holds.
 pub const FRAME_HAVE: u8 = 0x26;
 /// The peer does not answer, and why.
 pub const FRAME_REFUSED: u8 = 0x27;
 
 const ASK_RECORD: u8 = 0x30;
 const ASK_FOLDER: u8 = 0x31;
-const ASK_FOLDER_RUN: u8 = 0x32;
+const ASK_FOLDER_BRANCH: u8 = 0x32;
 const ASK_FOLDER_NAME: u8 = 0x33;
 const ASK_FILE: u8 = 0x34;
-const ASK_FILE_RUN: u8 = 0x35;
+const ASK_FILE_BRANCH: u8 = 0x35;
 const ASK_FILE_BYTES: u8 = 0x36;
-const ASK_PIECES: u8 = 0x37;
-const ASK_PIECE: u8 = 0x38;
+const ASK_CHUNKS: u8 = 0x37;
+const ASK_CHUNK: u8 = 0x38;
 const ASK_HAVE: u8 = 0x39;
 
 /// What starts a bundle: a tree written out as one stream of frames.
@@ -74,7 +74,7 @@ pub enum Request {
     /// All of a folder's entries.
     Folder(Hash),
     /// `count` of a folder's entries, from place `start`.
-    FolderRun {
+    FolderBranch {
         folder: Hash,
         start: u64,
         count: u32,
@@ -83,26 +83,26 @@ pub enum Request {
     FolderName { folder: Hash, name: String },
     /// All of a file's list.
     File(Hash),
-    /// `count` items of a file's list, from piece number `start`.
-    FileRun { file: Hash, start: u64, count: u32 },
+    /// `count` items of a file's list, from chunk number `start`.
+    FileBranch { file: Hash, start: u64, count: u32 },
     /// The items of a file's list that hold `length` bytes from `offset`.
     FileBytes {
         file: Hash,
         offset: u64,
         length: u64,
     },
-    /// `count` pieces of a file, from piece number `start`.
-    Pieces { file: Hash, start: u64, count: u32 },
-    /// One piece, by its hash.
-    Piece(Hash),
-    /// Which pieces of a file the peer holds.
+    /// `count` chunks of a file, from chunk number `start`.
+    Chunks { file: Hash, start: u64, count: u32 },
+    /// One chunk, by its hash.
+    Chunk(Hash),
+    /// Which chunks of a file the peer holds.
     Have(Hash),
 }
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(49);
-        let run = |out: &mut Vec<u8>, tag: u8, hash: &Hash, start: u64, count: u32| {
+        let ranged = |out: &mut Vec<u8>, tag: u8, hash: &Hash, start: u64, count: u32| {
             out.push(tag);
             out.extend_from_slice(hash.as_bytes());
             out.extend_from_slice(&start.to_be_bytes());
@@ -115,19 +115,19 @@ impl Request {
         match self {
             Self::Record(root) => one(&mut out, ASK_RECORD, root.as_hash()),
             Self::Folder(folder) => one(&mut out, ASK_FOLDER, folder),
-            Self::FolderRun {
+            Self::FolderBranch {
                 folder,
                 start,
                 count,
-            } => run(&mut out, ASK_FOLDER_RUN, folder, *start, *count),
+            } => ranged(&mut out, ASK_FOLDER_BRANCH, folder, *start, *count),
             Self::FolderName { folder, name } => {
                 one(&mut out, ASK_FOLDER_NAME, folder);
                 out.extend_from_slice(&(name.len() as u16).to_be_bytes());
                 out.extend_from_slice(name.as_bytes());
             }
             Self::File(file) => one(&mut out, ASK_FILE, file),
-            Self::FileRun { file, start, count } => {
-                run(&mut out, ASK_FILE_RUN, file, *start, *count);
+            Self::FileBranch { file, start, count } => {
+                ranged(&mut out, ASK_FILE_BRANCH, file, *start, *count);
             }
             Self::FileBytes {
                 file,
@@ -138,10 +138,10 @@ impl Request {
                 out.extend_from_slice(&offset.to_be_bytes());
                 out.extend_from_slice(&length.to_be_bytes());
             }
-            Self::Pieces { file, start, count } => {
-                run(&mut out, ASK_PIECES, file, *start, *count);
+            Self::Chunks { file, start, count } => {
+                ranged(&mut out, ASK_CHUNKS, file, *start, *count);
             }
-            Self::Piece(piece) => one(&mut out, ASK_PIECE, piece),
+            Self::Chunk(chunk) => one(&mut out, ASK_CHUNK, chunk),
             Self::Have(file) => one(&mut out, ASK_HAVE, file),
         }
         out
@@ -157,26 +157,26 @@ impl Request {
             ASK_RECORD => Self::Record(Root::from_hash(hash)),
             ASK_FOLDER => Self::Folder(hash),
             ASK_FILE => Self::File(hash),
-            ASK_PIECE => Self::Piece(hash),
+            ASK_CHUNK => Self::Chunk(hash),
             ASK_HAVE => Self::Have(hash),
-            ASK_FOLDER_RUN | ASK_FILE_RUN | ASK_PIECES => {
+            ASK_FOLDER_BRANCH | ASK_FILE_BRANCH | ASK_CHUNKS => {
                 let start = reader.u64()?;
                 let count = reader.u32()?;
                 if count == 0 || start >= MAX_LIST_ITEMS {
                     return Err(invalid("a request asks for nothing, or beyond any list"));
                 }
                 match tag {
-                    ASK_FOLDER_RUN => Self::FolderRun {
+                    ASK_FOLDER_BRANCH => Self::FolderBranch {
                         folder: hash,
                         start,
                         count,
                     },
-                    ASK_FILE_RUN => Self::FileRun {
+                    ASK_FILE_BRANCH => Self::FileBranch {
                         file: hash,
                         start,
                         count,
                     },
-                    _ => Self::Pieces {
+                    _ => Self::Chunks {
                         file: hash,
                         start,
                         count,
@@ -230,7 +230,7 @@ impl Refusal {
     }
 }
 
-/// Which pieces of a file a peer holds: one bit a piece, in the file's
+/// Which chunks of a file a peer holds: one bit a chunk, in the file's
 /// order. A peer says this about itself, and nothing proves it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HaveMap {
@@ -239,42 +239,42 @@ pub struct HaveMap {
 }
 
 impl HaveMap {
-    /// A map for a file of `count` pieces, with none held.
+    /// A map for a file of `count` chunks, with none held.
     pub fn new(count: u64) -> Result<Self> {
         if count > MAX_LIST_ITEMS {
-            return Err(invalid("a map for more pieces than a file can have"));
+            return Err(invalid("a map for more chunks than a file can have"));
         }
         let length = count.div_ceil(8) as usize;
         let mut bits = Vec::new();
         bits.try_reserve_exact(length)
             .map_err(|_| Error::AllocationFailed {
-                resource: "a map of held pieces",
+                resource: "a map of held chunks",
                 requested: length as u64,
             })?;
         bits.resize(length, 0);
         Ok(Self { count, bits })
     }
 
-    /// How many pieces the file has.
+    /// How many chunks the file has.
     pub fn count(&self) -> u64 {
         self.count
     }
 
-    /// Whether piece `index` is held. A piece beyond the count is not.
+    /// Whether chunk `index` is held. A chunk beyond the count is not.
     pub fn get(&self, index: u64) -> bool {
         index < self.count && self.bits[(index / 8) as usize] & (0x80 >> (index % 8)) != 0
     }
 
-    /// Marks piece `index` as held.
+    /// Marks chunk `index` as held.
     pub fn set(&mut self, index: u64) -> Result<()> {
         if index >= self.count {
-            return Err(invalid("a piece beyond the end of the file"));
+            return Err(invalid("a chunk beyond the end of the file"));
         }
         self.bits[(index / 8) as usize] |= 0x80 >> (index % 8);
         Ok(())
     }
 
-    /// How many pieces are held.
+    /// How many chunks are held.
     pub fn held(&self) -> u64 {
         self.bits
             .iter()
@@ -289,13 +289,13 @@ impl HaveMap {
         out
     }
 
-    /// Reads a map. It has one bit for each piece and no more, and the bits
+    /// Reads a map. It has one bit for each chunk and no more, and the bits
     /// left over in its last byte are zero.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut reader = Reader::new(bytes, "a map of held pieces");
+        let mut reader = Reader::new(bytes, "a map of held chunks");
         let count = reader.u64()?;
         if count > MAX_LIST_ITEMS || reader.remaining() as u64 != count.div_ceil(8) {
-            return Err(invalid("a map of held pieces does not fit its count"));
+            return Err(invalid("a map of held chunks does not fit its count"));
         }
         let bits = reader.take(reader.remaining())?.to_vec();
         let spare = (8 - count % 8) % 8;
@@ -303,7 +303,7 @@ impl HaveMap {
             .last()
             .is_some_and(|last| last & ((1_u8 << spare) - 1) != 0)
         {
-            return Err(invalid("a map of held pieces has bits past its count"));
+            return Err(invalid("a map of held chunks has bits past its count"));
         }
         Ok(Self { count, bits })
     }
@@ -318,10 +318,10 @@ pub enum Frame<'a> {
     FileList(&'a [u8]),
     /// A folder's whole list.
     FolderList(&'a [u8]),
-    FileRun(FileRun),
-    FolderRun(FolderRun),
-    /// A piece's bytes.
-    Piece(&'a [u8]),
+    FileBranch(FileBranch),
+    FolderBranch(FolderBranch),
+    /// A chunk's bytes.
+    Chunk(&'a [u8]),
     Have(HaveMap),
     Refused(Refusal),
 }
@@ -338,13 +338,13 @@ impl<'a> Frame<'a> {
             FRAME_RECORD => Self::Record(bytes),
             FRAME_FILE_LIST => Self::FileList(body),
             FRAME_FOLDER_LIST => Self::FolderList(body),
-            FRAME_FILE_RUN => Self::FileRun(FileRun::decode(body)?),
-            FRAME_FOLDER_RUN => Self::FolderRun(FolderRun::decode(body)?),
-            FRAME_PIECE => {
-                if body.is_empty() || body.len() > MAX_PIECE_BYTES {
-                    return Err(invalid("a piece does not hold 1 byte to 8 MiB"));
+            FRAME_FILE_BRANCH => Self::FileBranch(FileBranch::decode(body)?),
+            FRAME_FOLDER_BRANCH => Self::FolderBranch(FolderBranch::decode(body)?),
+            FRAME_CHUNK => {
+                if body.is_empty() || body.len() > MAX_CHUNK_BYTES {
+                    return Err(invalid("a chunk does not hold 1 byte to 8 MiB"));
                 }
-                Self::Piece(body)
+                Self::Chunk(body)
             }
             FRAME_HAVE => Self::Have(HaveMap::decode(body)?),
             FRAME_REFUSED => match body {
@@ -374,17 +374,17 @@ pub fn folder_list_frame(list: &[u8]) -> Vec<u8> {
     framed(FRAME_FOLDER_LIST, list)
 }
 
-pub fn file_run_frame(run: &FileRun) -> Vec<u8> {
-    framed(FRAME_FILE_RUN, &run.encode())
+pub fn file_branch_frame(branch: &FileBranch) -> Vec<u8> {
+    framed(FRAME_FILE_BRANCH, &branch.encode())
 }
 
-pub fn folder_run_frame(run: &FolderRun) -> Vec<u8> {
-    framed(FRAME_FOLDER_RUN, &run.encode())
+pub fn folder_branch_frame(branch: &FolderBranch) -> Vec<u8> {
+    framed(FRAME_FOLDER_BRANCH, &branch.encode())
 }
 
-/// The frame for a piece's bytes.
-pub fn piece_frame(piece: &[u8]) -> Vec<u8> {
-    framed(FRAME_PIECE, piece)
+/// The frame for a chunk's bytes.
+pub fn chunk_frame(chunk: &[u8]) -> Vec<u8> {
+    framed(FRAME_CHUNK, chunk)
 }
 
 pub fn have_frame(map: &HaveMap) -> Vec<u8> {
@@ -500,7 +500,7 @@ mod tests {
         vec![
             Request::Record(Root::from_hash(hash)),
             Request::Folder(hash),
-            Request::FolderRun {
+            Request::FolderBranch {
                 folder: hash,
                 start: 3,
                 count: 9,
@@ -510,7 +510,7 @@ mod tests {
                 name: "model.safetensors".to_owned(),
             },
             Request::File(hash),
-            Request::FileRun {
+            Request::FileBranch {
                 file: hash,
                 start: 100,
                 count: 100,
@@ -520,12 +520,12 @@ mod tests {
                 offset: 500 << 30,
                 length: 1 << 30,
             },
-            Request::Pieces {
+            Request::Chunks {
                 file: hash,
                 start: 100,
                 count: 101,
             },
-            Request::Piece(hash),
+            Request::Chunk(hash),
             Request::Have(hash),
         ]
     }
@@ -549,14 +549,14 @@ mod tests {
             .collect();
         tags.dedup();
         assert_eq!(tags, (0x30..=0x39).collect::<Vec<u8>>());
-        // "Pieces 100 to 200 of this file" is 45 bytes, whatever the file.
+        // "Chunks 100 to 200 of this file" is 45 bytes, whatever the file.
         assert_eq!(every_request()[7].encode().len(), 45);
     }
 
     #[test]
     fn a_request_for_nothing_or_for_a_name_no_folder_holds_is_refused() {
         let hash = Hash::of(b"x");
-        let run = |tag: u8, start: u64, count: u32| {
+        let ranged = |tag: u8, start: u64, count: u32| {
             let mut bytes = vec![tag];
             bytes.extend_from_slice(hash.as_bytes());
             bytes.extend_from_slice(&start.to_be_bytes());
@@ -564,9 +564,9 @@ mod tests {
             Request::decode(&bytes)
         };
         for tag in [0x32, 0x35, 0x37] {
-            assert!(run(tag, 0, 1).is_ok());
-            assert!(run(tag, 0, 0).is_err());
-            assert!(run(tag, MAX_LIST_ITEMS, 1).is_err());
+            assert!(ranged(tag, 0, 1).is_ok());
+            assert!(ranged(tag, 0, 0).is_err());
+            assert!(ranged(tag, MAX_LIST_ITEMS, 1).is_err());
         }
         let named = |name: &[u8]| {
             let mut bytes = vec![0x33];
@@ -595,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn a_map_of_held_pieces_has_one_bit_a_piece() {
+    fn a_map_of_held_chunks_has_one_bit_a_chunk() {
         let mut map = HaveMap::new(11).unwrap();
         assert_eq!(map.encode().len(), 8 + 2);
         for index in [0, 3, 10] {
@@ -635,8 +635,8 @@ mod tests {
     #[test]
     fn frames_are_told_apart_by_their_first_byte() {
         assert_eq!(
-            Frame::decode(&piece_frame(b"abc")).unwrap(),
-            Frame::Piece(b"abc")
+            Frame::decode(&chunk_frame(b"abc")).unwrap(),
+            Frame::Chunk(b"abc")
         );
         assert_eq!(
             Frame::decode(&file_list_frame(&[7; 36])).unwrap(),
@@ -672,9 +672,9 @@ mod tests {
         ] {
             assert!(Frame::decode(bad).is_err(), "{bad:?}");
         }
-        let too_long = piece_frame(&vec![0; MAX_PIECE_BYTES + 1]);
+        let too_long = chunk_frame(&vec![0; MAX_CHUNK_BYTES + 1]);
         assert!(Frame::decode(&too_long).is_err());
-        assert!(Frame::decode(&piece_frame(&vec![0; MAX_PIECE_BYTES])).is_ok());
+        assert!(Frame::decode(&chunk_frame(&vec![0; MAX_CHUNK_BYTES])).is_ok());
     }
 
     #[test]

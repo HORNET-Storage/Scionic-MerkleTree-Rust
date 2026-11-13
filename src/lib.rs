@@ -2,10 +2,10 @@
 //! Scionic Merkle trees.
 //!
 //! A tree holds a folder of files, or one file, under one root hash. A file is
-//! a list of pieces, a folder is a list of names, and the root covers all of
-//! it. Identical pieces, files and folders have identical hashes wherever they
+//! a list of chunks, a folder is a list of names, and the root covers all of
+//! it. Identical chunks, files and folders have identical hashes wherever they
 //! are, so a store keeps each of them once. A sender can show a part of a tree
-//! without the rest: one name in a folder, one piece of a file, or a stretch of
+//! without the rest: one name in a folder, one chunk of a file, or a stretch of
 //! a file's bytes.
 //!
 //! `spec/FORMAT.md` in this repository says exactly what each hash covers.
@@ -31,11 +31,11 @@ pub use fastcdc::{
     FASTCDC_STRICT_MASK, FASTCDC_TARGET_SIZE,
 };
 pub use format::{
-    check_name, file_hash, folder_hash, Cutting, Entry, ExtraData, FileList, FileRun, FolderList,
-    FolderRun, Kind, OpenFile, OpenFolder, PieceRef, Record, Target, Totals, CUTTING_FASTCDC_V1,
-    CUTTING_KEY, LIST_ITEM_BYTES, MAX_CARRIED_NODES, MAX_ENTRY_BYTES, MAX_EXTRA_BYTES,
-    MAX_EXTRA_NAME_BYTES, MAX_EXTRA_VALUES, MAX_EXTRA_VALUE_BYTES, MAX_FOLDER_DEPTH,
-    MAX_NAME_BYTES, MAX_PIECE_BYTES, MAX_RECORD_BYTES, TIMESTAMP_KEY,
+    check_name, file_hash, folder_hash, ChunkRef, Chunking, Entry, ExtraData, FileBranch, FileList,
+    FolderBranch, FolderList, Kind, OpenFile, OpenFolder, Record, Target, Totals,
+    CHUNKING_FASTCDC_V1, CHUNKING_KEY, LIST_ITEM_BYTES, MAX_CARRIED_NODES, MAX_CHUNK_BYTES,
+    MAX_ENTRY_BYTES, MAX_EXTRA_BYTES, MAX_EXTRA_NAME_BYTES, MAX_EXTRA_VALUES,
+    MAX_EXTRA_VALUE_BYTES, MAX_FOLDER_DEPTH, MAX_NAME_BYTES, MAX_RECORD_BYTES, TIMESTAMP_KEY,
 };
 pub use hash::{Hash, Root};
 pub use intake::{verify, verify_with, Accepted, Arrived, Intake, Summary, VerifyOptions};
@@ -50,10 +50,10 @@ pub use sync::{
     REQUESTS_AHEAD_BYTES,
 };
 pub use wire::{
-    file_list_frame, file_run_frame, folder_list_frame, folder_run_frame, have_frame, piece_frame,
-    read_frame, refused_frame, write_frame, Frame, HaveMap, Refusal, Request, BUNDLE_MAGIC,
-    FRAME_FILE_LIST, FRAME_FILE_RUN, FRAME_FOLDER_LIST, FRAME_FOLDER_RUN, FRAME_HAVE, FRAME_PIECE,
-    FRAME_RECORD, FRAME_REFUSED, MAX_REQUEST_BYTES,
+    chunk_frame, file_branch_frame, file_list_frame, folder_branch_frame, folder_list_frame,
+    have_frame, read_frame, refused_frame, write_frame, Frame, HaveMap, Refusal, Request,
+    BUNDLE_MAGIC, FRAME_CHUNK, FRAME_FILE_BRANCH, FRAME_FILE_LIST, FRAME_FOLDER_BRANCH,
+    FRAME_FOLDER_LIST, FRAME_HAVE, FRAME_RECORD, FRAME_REFUSED, MAX_REQUEST_BYTES,
 };
 
 use std::fmt;

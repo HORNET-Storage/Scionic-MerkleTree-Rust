@@ -6,8 +6,8 @@
 //!
 //! * the record must hash to the root that was asked for;
 //! * a list is taken only when a list that is already checked names it, and
-//!   only when it has the hash, the size and the piece lengths it has to;
-//! * a piece is taken only when a file's list that is already checked names
+//!   only when it has the hash, the size and the chunk lengths it has to;
+//! * a chunk is taken only when a file's list that is already checked names
 //!   it, and only with the bytes and the length that list gives it;
 //! * at the end nothing may be missing, folders may not sit too deep, and
 //!   the record's totals must be those of the tree.
@@ -16,21 +16,21 @@
 //! A frame never says which hash it belongs under. Its hash is worked out
 //! from its bytes.
 
-use crate::fastcdc::StreamCutter;
+use crate::fastcdc::StreamChunker;
 use crate::format::{
-    Cutting, FileList, FolderList, Kind, PieceRef, Record, Target, Totals, LIST_ITEM_BYTES,
-    MAX_FOLDER_DEPTH, MAX_PIECE_BYTES, MAX_RECORD_BYTES,
+    ChunkRef, Chunking, FileList, FolderList, Kind, Record, Target, Totals, LIST_ITEM_BYTES,
+    MAX_CHUNK_BYTES, MAX_FOLDER_DEPTH, MAX_RECORD_BYTES,
 };
 use crate::hash::{Hash, Root};
 use crate::store::{load_record, missing, Store, Stored};
-use crate::wire::{Request, FRAME_FILE_LIST, FRAME_FOLDER_LIST, FRAME_PIECE, FRAME_RECORD};
+use crate::wire::{Request, FRAME_CHUNK, FRAME_FILE_LIST, FRAME_FOLDER_LIST, FRAME_RECORD};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// The most pieces one request asks for.
-const PIECES_PER_REQUEST: u32 = 64;
+/// The most chunks one request asks for.
+const CHUNKS_PER_REQUEST: u32 = 64;
 
 fn invalid(detail: &str) -> Error {
     Error::InvalidData {
@@ -44,7 +44,7 @@ pub enum Arrived {
     Record,
     FolderList(Hash),
     FileList(Hash),
-    Piece(Hash),
+    Chunk(Hash),
 }
 
 /// What became of a frame that an intake accepted.
@@ -68,7 +68,7 @@ pub struct Summary {
 /// How a held tree is checked, beyond what is always checked.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VerifyOptions {
-    recut: bool,
+    rechunk: bool,
     discard: bool,
     workers: usize,
 }
@@ -78,15 +78,15 @@ impl VerifyOptions {
         Self::default()
     }
 
-    /// Also cuts every file's bytes again, and refuses a file whose list is
-    /// not the one the cutter gives. With this, the same bytes always have
+    /// Also chunks every file's bytes again, and refuses a file whose list is
+    /// not the one the chunker gives. With this, the same bytes always have
     /// the same file hash. It costs one more pass over the bytes.
-    pub fn recut(mut self, on: bool) -> Self {
-        self.recut = on;
+    pub fn rechunk(mut self, on: bool) -> Self {
+        self.rechunk = on;
         self
     }
 
-    /// Removes from the store what is damaged there: a piece, a list or a
+    /// Removes from the store what is damaged there: a chunk, a list or a
     /// record whose bytes are not what its hash says. The check then ends
     /// with one of them as missing, and a fetch of the tree brings them all
     /// again. Without this the check stops at a damaged thing and names it,
@@ -96,7 +96,7 @@ impl VerifyOptions {
         self
     }
 
-    /// How many pieces are hashed at once. Zero is one for each core.
+    /// How many chunks are hashed at once. Zero is one for each core.
     pub fn workers(mut self, workers: usize) -> Self {
         self.workers = workers;
         self
@@ -105,8 +105,8 @@ impl VerifyOptions {
 
 #[derive(Clone, Copy, Default)]
 struct Mode {
-    /// Cut again the files that are held whole.
-    recut: bool,
+    /// Chunk again the files that are held whole.
+    rechunk: bool,
     /// Remove from the store what is damaged there, and want it again.
     discard: bool,
 }
@@ -125,10 +125,10 @@ struct FileSlot {
     held: bool,
 }
 
-struct PieceSlot {
+struct ChunkSlot {
     length: u32,
-    /// Where the piece was first listed, while it is not held: the file,
-    /// by the order it was named in, and the piece's number there.
+    /// Where the chunk was first listed, while it is not held: the file,
+    /// by the order it was named in, and the chunk's number there.
     wanted_at: Option<(u64, u64)>,
 }
 
@@ -152,22 +152,22 @@ pub struct Intake<'s> {
     root: Root,
     mode: Mode,
     record: Option<Record>,
-    /// How the files are cut, for a tree that has no record yet.
-    measuring: Option<Cutting>,
+    /// How the files are chunked, for a tree that has no record yet.
+    measuring: Option<Chunking>,
     folders: HashMap<Hash, FolderSlot>,
     files: HashMap<Hash, FileSlot>,
-    pieces: HashMap<Hash, PieceSlot>,
+    chunks: HashMap<Hash, ChunkSlot>,
     /// Lists that are named and not held, in the order they were named.
     wanted_lists: BTreeMap<u64, Target>,
-    /// Pieces that are named and not held, by where they were first listed.
-    wanted_pieces: BTreeMap<(u64, u64), Hash>,
+    /// Chunks that are named and not held, by where they were first listed.
+    wanted_chunks: BTreeMap<(u64, u64), Hash>,
     file_by_order: HashMap<u64, Hash>,
     next_order: u64,
     counted: Totals,
     pending: Vec<Target>,
-    /// The files to cut again, once their pieces are hashed.
-    to_recut: Vec<Hash>,
-    cutter: Option<StreamCutter>,
+    /// The files to chunk again, once their chunks are hashed.
+    to_rechunk: Vec<Hash>,
+    chunker: Option<StreamChunker>,
     /// A step that changes what the intake knows failed half way.
     failed: bool,
 }
@@ -192,15 +192,15 @@ impl<'s> Intake<'s> {
             measuring: None,
             folders: HashMap::new(),
             files: HashMap::new(),
-            pieces: HashMap::new(),
+            chunks: HashMap::new(),
             wanted_lists: BTreeMap::new(),
-            wanted_pieces: BTreeMap::new(),
+            wanted_chunks: BTreeMap::new(),
             file_by_order: HashMap::new(),
             next_order: 0,
             counted: Totals::default(),
             pending: Vec::new(),
-            to_recut: Vec::new(),
-            cutter: None,
+            to_rechunk: Vec::new(),
+            chunker: None,
             failed: false,
         }
     }
@@ -221,12 +221,12 @@ impl<'s> Intake<'s> {
 
     /// Checks every list under `top` as an intake checks it, for a tree that
     /// has no record yet, and counts what its record has to say: each
-    /// different piece and each different list, once. The store must hold
+    /// different chunk and each different list, once. The store must hold
     /// every list. This is how a builder comes by a record's totals, so a
     /// tree that is built has passed the checks of a tree that is taken in.
-    pub(crate) fn measure(store: &'s dyn Store, top: Target, cutting: Cutting) -> Result<Totals> {
+    pub(crate) fn measure(store: &'s dyn Store, top: Target, chunking: Chunking) -> Result<Totals> {
         let mut intake = Self::bare(store, Root::from_hash(Hash::ZERO), Mode::default());
-        intake.measuring = Some(cutting);
+        intake.measuring = Some(chunking);
         intake.refer(top)?;
         intake.drain()?;
         intake.lists_held()?;
@@ -245,10 +245,10 @@ impl<'s> Intake<'s> {
         self.record.as_ref()
     }
 
-    /// How many lists and pieces are named and not held yet. The record
+    /// How many lists and chunks are named and not held yet. The record
     /// counts as one while it is not in.
     pub fn outstanding(&self) -> usize {
-        usize::from(self.record.is_none()) + self.wanted_lists.len() + self.wanted_pieces.len()
+        usize::from(self.record.is_none()) + self.wanted_lists.len() + self.wanted_chunks.len()
     }
 
     /// How many bytes of lists the record still leaves room for.
@@ -263,18 +263,18 @@ impl<'s> Intake<'s> {
         usize::try_from(left).unwrap_or(usize::MAX)
     }
 
-    /// The longest piece the tree's way of cutting allows.
-    fn longest_piece(&self) -> usize {
-        match self.record.as_ref().map(Record::cutting) {
-            Some(Cutting::Fixed(length)) => length.get() as usize,
-            _ => MAX_PIECE_BYTES,
+    /// The longest chunk the tree's way of chunking allows.
+    fn longest_chunk(&self) -> usize {
+        match self.record.as_ref().map(Record::chunking) {
+            Some(Chunking::Fixed(length)) => length.get() as usize,
+            _ => MAX_CHUNK_BYTES,
         }
     }
 
     /// The longest frame that a stream of this tree can hold, whatever comes
     /// next: for a reader of a stream that was not asked frame by frame, as
     /// a bundle is. Before the record it is the longest record. After it,
-    /// it is the longest of a record, a piece, and all the bytes of lists
+    /// it is the longest of a record, a chunk, and all the bytes of lists
     /// that the record gives the tree. What the store holds already may
     /// come too, and is passed over, so this does not shrink as lists come.
     pub fn frame_limit(&self) -> usize {
@@ -283,7 +283,7 @@ impl<'s> Intake<'s> {
         };
         usize::try_from(record.totals().list_bytes)
             .unwrap_or(usize::MAX)
-            .max(self.longest_piece())
+            .max(self.longest_chunk())
             .saturating_add(1)
             .max(MAX_RECORD_BYTES)
     }
@@ -292,14 +292,14 @@ impl<'s> Intake<'s> {
     /// peer that sends a longer one is not answering what was asked, and its
     /// frame need not be read: a file's list is no longer than the file's
     /// size allows, no list is longer than the record leaves room for, and a
-    /// piece is no longer than the tree's way of cutting allows.
+    /// chunk is no longer than the tree's way of chunking allows.
     pub fn answer_limit(&self, request: &Request) -> usize {
         let limit = match request {
             Request::Record(_) => MAX_RECORD_BYTES,
             Request::Folder(_) => self.lists_left().saturating_add(1),
             Request::File(file) => {
                 let most = match (&self.record, self.files.get(file)) {
-                    (Some(record), Some(slot)) => record.cutting().count_bounds(slot.size).1,
+                    (Some(record), Some(slot)) => record.chunking().count_bounds(slot.size).1,
                     _ => 0,
                 };
                 usize::try_from(most)
@@ -308,7 +308,7 @@ impl<'s> Intake<'s> {
                     .min(self.lists_left())
                     .saturating_add(1)
             }
-            Request::Pieces { .. } | Request::Piece(_) => self.longest_piece() + 1,
+            Request::Chunks { .. } | Request::Chunk(_) => self.longest_chunk() + 1,
             _ => 0,
         };
         // A refusal takes two bytes, and is always let through.
@@ -328,11 +328,11 @@ impl<'s> Intake<'s> {
         })
     }
 
-    /// How the tree's files are cut.
-    fn cutting(&self) -> Result<Cutting> {
+    /// How the tree's files are chunked.
+    fn chunking(&self) -> Result<Chunking> {
         match self.measuring {
-            Some(cutting) => Ok(cutting),
-            None => Ok(self.recorded()?.cutting()),
+            Some(chunking) => Ok(chunking),
+            None => Ok(self.recorded()?.chunking()),
         }
     }
 
@@ -361,26 +361,26 @@ impl<'s> Intake<'s> {
         }
     }
 
-    /// Whether the store holds the piece that `item` names. The piece's
+    /// Whether the store holds the chunk that `item` names. The chunk's
     /// bytes are counted here, not hashed.
-    fn holds(&self, item: &PieceRef) -> Result<bool> {
-        let size = match self.store.size(Stored::Piece, &item.hash)? {
+    fn holds(&self, item: &ChunkRef) -> Result<bool> {
+        let size = match self.store.size(Stored::Chunk, &item.hash)? {
             None => return Ok(false),
             Some(size) if size == u64::from(item.length) => return Ok(true),
             Some(size) => size,
         };
-        // Either the store's bytes are damaged, or the list gives the piece
+        // Either the store's bytes are damaged, or the list gives the chunk
         // a length it does not have. Only damaged bytes are ever removed: a
-        // list that names a sound piece wrongly must not cost the store it.
-        match self.store.get(Stored::Piece, &item.hash)? {
+        // list that names a sound chunk wrongly must not cost the store it.
+        match self.store.get(Stored::Chunk, &item.hash)? {
             None => Ok(false),
             Some(bytes) if Hash::of(&bytes) == item.hash => Err(Error::SizeMismatch {
-                what: "a held piece",
+                what: "a held chunk",
                 expected: u64::from(item.length),
                 actual: size,
             }),
             Some(_) => {
-                self.damaged(Stored::Piece, &item.hash, "a stored piece")?;
+                self.damaged(Stored::Chunk, &item.hash, "a stored chunk")?;
                 Ok(false)
             }
         }
@@ -512,35 +512,35 @@ impl<'s> Intake<'s> {
         Ok(())
     }
 
-    fn count_piece(&mut self, length: u32) -> Result<()> {
-        self.counted.pieces = self
+    fn count_chunk(&mut self, length: u32) -> Result<()> {
+        self.counted.chunks = self
             .counted
-            .pieces
+            .chunks
             .checked_add(1)
-            .ok_or(Error::SizeOverflow { field: "pieces" })?;
-        self.counted.piece_bytes = self
+            .ok_or(Error::SizeOverflow { field: "chunks" })?;
+        self.counted.chunk_bytes = self
             .counted
-            .piece_bytes
+            .chunk_bytes
             .checked_add(u64::from(length))
             .ok_or(Error::SizeOverflow {
-                field: "piece bytes",
+                field: "chunk bytes",
             })?;
         let Some(record) = &self.record else {
             return Ok(());
         };
         let recorded = record.totals();
-        if self.counted.pieces > recorded.pieces {
+        if self.counted.chunks > recorded.chunks {
             return Err(Error::TotalsMismatch {
-                field: "pieces",
-                recorded: recorded.pieces,
-                counted: self.counted.pieces,
+                field: "chunks",
+                recorded: recorded.chunks,
+                counted: self.counted.chunks,
             });
         }
-        if self.counted.piece_bytes > recorded.piece_bytes {
+        if self.counted.chunk_bytes > recorded.chunk_bytes {
             return Err(Error::TotalsMismatch {
-                field: "piece bytes",
-                recorded: recorded.piece_bytes,
-                counted: self.counted.piece_bytes,
+                field: "chunk bytes",
+                recorded: recorded.chunk_bytes,
+                counted: self.counted.chunk_bytes,
             });
         }
         Ok(())
@@ -576,10 +576,10 @@ impl<'s> Intake<'s> {
         Ok(())
     }
 
-    /// Takes a file's list that is named, and notes the pieces it names.
+    /// Takes a file's list that is named, and notes the chunks it names.
     fn admit_file(&mut self, list: &FileList) -> Result<()> {
-        let cutting = self.cutting()?;
-        list.check_cutting(cutting)?;
+        let chunking = self.chunking()?;
+        list.check_chunking(chunking)?;
         let slot = self.files.get_mut(list.hash()).ok_or(Error::Invariant {
             detail: "a file is admitted before it is named",
         })?;
@@ -595,44 +595,44 @@ impl<'s> Intake<'s> {
         self.wanted_lists.remove(&order);
         self.count_list_bytes(list.encoded_len())?;
         for (number, item) in (0_u64..).zip(list.items()) {
-            if let Some(slot) = self.pieces.get(&item.hash) {
+            if let Some(slot) = self.chunks.get(&item.hash) {
                 if slot.length != item.length {
                     return Err(Error::SizeMismatch {
-                        what: "a piece that is listed with two lengths",
+                        what: "a chunk that is listed with two lengths",
                         expected: u64::from(slot.length),
                         actual: u64::from(item.length),
                     });
                 }
                 continue;
             }
-            self.count_piece(item.length)?;
+            self.count_chunk(item.length)?;
             let held = self.holds(item)?;
             let wanted_at = (!held).then_some((order, number));
             if let Some(at) = wanted_at {
-                self.wanted_pieces.insert(at, item.hash);
+                self.wanted_chunks.insert(at, item.hash);
             }
-            self.pieces.insert(
+            self.chunks.insert(
                 item.hash,
-                PieceSlot {
+                ChunkSlot {
                     length: item.length,
                     wanted_at,
                 },
             );
         }
-        if self.mode.recut && cutting == Cutting::FastCdcV1 {
-            self.to_recut.push(*list.hash());
+        if self.mode.rechunk && chunking == Chunking::FastCdcV1 {
+            self.to_rechunk.push(*list.hash());
         }
         Ok(())
     }
 
-    /// Hashes again every piece of this tree that the store holds, several
-    /// at once. A piece whose bytes are not what its hash says is damaged.
+    /// Hashes again every chunk of this tree that the store holds, several
+    /// at once. A chunk whose bytes are not what its hash says is damaged.
     fn rehash_held(&mut self, workers: usize) -> Result<()> {
-        let mut held: Vec<PieceRef> = self
-            .pieces
+        let mut held: Vec<ChunkRef> = self
+            .chunks
             .iter()
             .filter(|(_, slot)| slot.wanted_at.is_none())
-            .map(|(hash, slot)| PieceRef {
+            .map(|(hash, slot)| ChunkRef {
                 hash: *hash,
                 length: slot.length,
             })
@@ -640,7 +640,7 @@ impl<'s> Intake<'s> {
         held.sort_unstable_by_key(|item| item.hash);
         let store = self.store;
         let next = AtomicUsize::new(0);
-        // Gives the places, in `held`, of the pieces that are damaged.
+        // Gives the places, in `held`, of the chunks that are damaged.
         let work = || -> Result<Vec<usize>> {
             let mut spoiled = Vec::new();
             loop {
@@ -649,8 +649,8 @@ impl<'s> Intake<'s> {
                     return Ok(spoiled);
                 };
                 let bytes = store
-                    .get(Stored::Piece, &item.hash)
-                    .and_then(|bytes| bytes.ok_or_else(|| missing("the piece", &item.hash)));
+                    .get(Stored::Chunk, &item.hash)
+                    .and_then(|bytes| bytes.ok_or_else(|| missing("the chunk", &item.hash)));
                 match bytes {
                     Ok(bytes) if item.matches(&bytes) => {}
                     Ok(_) => spoiled.push(index),
@@ -686,45 +686,45 @@ impl<'s> Intake<'s> {
         }
         spoiled.sort_unstable();
         for &index in &spoiled {
-            self.damaged(Stored::Piece, &held[index].hash, "a stored piece")?;
+            self.damaged(Stored::Chunk, &held[index].hash, "a stored chunk")?;
         }
         match spoiled.first() {
-            Some(&index) => Err(missing("the piece", &held[index].hash)),
+            Some(&index) => Err(missing("the chunk", &held[index].hash)),
             None => Ok(()),
         }
     }
 
-    /// Cuts again every file that is held whole, and holds the result
-    /// against the file's list. The pieces were hashed before this.
-    fn recut_held(&mut self) -> Result<()> {
-        for file in std::mem::take(&mut self.to_recut) {
+    /// Chunks again every file that is held whole, and holds the result
+    /// against the file's list. The chunks were hashed before this.
+    fn rechunk_held(&mut self) -> Result<()> {
+        for file in std::mem::take(&mut self.to_rechunk) {
             let Some(bytes) = self.store.get(Stored::FileList, &file)? else {
                 continue;
             };
             let list = FileList::decode(&bytes)?;
             let whole = list.items().iter().all(|item| {
-                self.pieces
+                self.chunks
                     .get(&item.hash)
                     .is_some_and(|slot| slot.wanted_at.is_none())
             });
             if whole {
-                self.recut(&list)?;
+                self.rechunk(&list)?;
             }
         }
         Ok(())
     }
 
-    /// Cuts a file's bytes again, and holds the result against its list.
-    fn recut(&mut self, list: &FileList) -> Result<()> {
+    /// Chunks a file's bytes again, and holds the result against its list.
+    fn rechunk(&mut self, list: &FileList) -> Result<()> {
         let store = self.store;
-        let cutter = self.cutter.get_or_insert_with(StreamCutter::new);
+        let chunker = self.chunker.get_or_insert_with(StreamChunker::new);
         let mut unread = list.items().iter();
         let mut current: Option<(Arc<[u8]>, usize)> = None;
-        let mut uncut = list.items().iter();
-        let miscut = || invalid("a file is not cut where its bytes say it is cut");
-        cutter.cut(
-            Cutting::FastCdcV1,
-            2 * MAX_PIECE_BYTES,
+        let mut unchunked = list.items().iter();
+        let mischunked = || invalid("the chunks of a file do not end where its bytes say they end");
+        chunker.cut(
+            Chunking::FastCdcV1,
+            2 * MAX_CHUNK_BYTES,
             |buffer| loop {
                 if let Some((bytes, at)) = &mut current {
                     if *at < bytes.len() {
@@ -737,31 +737,31 @@ impl<'s> Intake<'s> {
                 match unread.next() {
                     Some(item) => {
                         let bytes = store
-                            .get(Stored::Piece, &item.hash)?
+                            .get(Stored::Chunk, &item.hash)?
                             .filter(|bytes| bytes.len() == item.length as usize)
-                            .ok_or_else(|| missing("the piece", &item.hash))?;
+                            .ok_or_else(|| missing("the chunk", &item.hash))?;
                         current = Some((bytes, 0));
                     }
                     None => return Ok(0),
                 }
             },
-            |pieces| {
-                for piece in pieces {
-                    match uncut.next() {
-                        Some(item) if item.length as usize == piece.len() => {}
-                        _ => return Err(miscut()),
+            |chunks| {
+                for chunk in chunks {
+                    match unchunked.next() {
+                        Some(item) if item.length as usize == chunk.len() => {}
+                        _ => return Err(mischunked()),
                     }
                 }
                 Ok(())
             },
         )?;
-        if uncut.next().is_some() {
-            return Err(miscut());
+        if unchunked.next().is_some() {
+            return Err(mischunked());
         }
         Ok(())
     }
 
-    /// Takes one frame: a record, a whole list, or a piece.
+    /// Takes one frame: a record, a whole list, or a chunk.
     ///
     /// A frame is accepted when it is what a checked parent names. A frame
     /// that is named and held already is accepted and not kept again. Any
@@ -862,31 +862,31 @@ impl<'s> Intake<'s> {
                     }
                 }
             }
-            FRAME_PIECE => {
+            FRAME_CHUNK => {
                 self.recorded()?;
-                if body.is_empty() || body.len() > MAX_PIECE_BYTES {
-                    return Err(invalid("a piece does not hold 1 byte to 8 MiB"));
+                if body.is_empty() || body.len() > MAX_CHUNK_BYTES {
+                    return Err(invalid("a chunk does not hold 1 byte to 8 MiB"));
                 }
                 let hash = Hash::of(body);
-                let what = Arrived::Piece(hash);
-                as_asked(what, "a piece")?;
+                let what = Arrived::Chunk(hash);
+                as_asked(what, "a chunk")?;
                 let slot = self
-                    .pieces
+                    .chunks
                     .get_mut(&hash)
-                    .ok_or(Error::NotWanted { what: "a piece" })?;
+                    .ok_or(Error::NotWanted { what: "a chunk" })?;
                 let Some(at) = slot.wanted_at else {
                     return Ok(Accepted { what, kept: false });
                 };
                 if slot.length as usize != body.len() {
                     return Err(Error::SizeMismatch {
-                        what: "a piece",
+                        what: "a chunk",
                         expected: u64::from(slot.length),
                         actual: body.len() as u64,
                     });
                 }
-                self.store.put(Stored::Piece, &hash, body)?;
+                self.store.put(Stored::Chunk, &hash, body)?;
                 slot.wanted_at = None;
-                self.wanted_pieces.remove(&at);
+                self.wanted_chunks.remove(&at);
                 Ok(Accepted { what, kept: true })
             }
             _ => Err(invalid("a frame that no tree is taken in by")),
@@ -894,7 +894,7 @@ impl<'s> Intake<'s> {
     }
 
     /// What to ask a peer for next: at most `limit` requests. The record
-    /// comes first, then lists, then pieces by their file and their numbers.
+    /// comes first, then lists, then chunks by their file and their numbers.
     /// Nothing is asked for twice while it is still wanted, so the caller
     /// asks again only after the answers have come, or have failed to.
     pub fn requests(&self, limit: usize) -> Vec<Request> {
@@ -913,36 +913,36 @@ impl<'s> Intake<'s> {
                 Kind::File => Request::File(target.hash),
             })
             .collect();
-        let mut run: Option<(u64, u64, u32)> = None;
-        for &(order, number) in self.wanted_pieces.keys() {
-            if let Some((run_order, start, count)) = &mut run {
-                if *run_order == order
+        let mut span: Option<(u64, u64, u32)> = None;
+        for &(order, number) in self.wanted_chunks.keys() {
+            if let Some((span_order, start, count)) = &mut span {
+                if *span_order == order
                     && *start + u64::from(*count) == number
-                    && *count < PIECES_PER_REQUEST
+                    && *count < CHUNKS_PER_REQUEST
                 {
                     *count += 1;
                     continue;
                 }
             }
-            if let Some(done) = run.take() {
-                self.push_pieces(&mut requests, done);
+            if let Some(done) = span.take() {
+                self.push_chunks(&mut requests, done);
             }
             if requests.len() >= limit {
                 break;
             }
-            run = Some((order, number, 1));
+            span = Some((order, number, 1));
         }
-        if let Some(done) = run {
+        if let Some(done) = span {
             if requests.len() < limit {
-                self.push_pieces(&mut requests, done);
+                self.push_chunks(&mut requests, done);
             }
         }
         requests
     }
 
-    fn push_pieces(&self, requests: &mut Vec<Request>, (order, start, count): (u64, u64, u32)) {
+    fn push_chunks(&self, requests: &mut Vec<Request>, (order, start, count): (u64, u64, u32)) {
         if let Some(file) = self.file_by_order.get(&order) {
-            requests.push(Request::Pieces {
+            requests.push(Request::Chunks {
                 file: *file,
                 start,
                 count,
@@ -951,20 +951,20 @@ impl<'s> Intake<'s> {
     }
 
     /// What the answer to one of this intake's requests has to be: the
-    /// frames, in order. A peer may send fewer pieces than were asked for,
+    /// frames, in order. A peer may send fewer chunks than were asked for,
     /// and never anything else.
     pub fn expected(&self, request: &Request) -> Vec<Arrived> {
         match request {
             Request::Record(_) => vec![Arrived::Record],
             Request::Folder(folder) => vec![Arrived::FolderList(*folder)],
             Request::File(file) => vec![Arrived::FileList(*file)],
-            Request::Pieces { file, start, count } => {
+            Request::Chunks { file, start, count } => {
                 let Some(order) = self.files.get(file).map(|slot| slot.order) else {
                     return Vec::new();
                 };
                 (*start..start.saturating_add(u64::from(*count)))
-                    .map_while(|number| self.wanted_pieces.get(&(order, number)))
-                    .map(|hash| Arrived::Piece(*hash))
+                    .map_while(|number| self.wanted_chunks.get(&(order, number)))
+                    .map(|hash| Arrived::Chunk(*hash))
                     .collect()
             }
             _ => Vec::new(),
@@ -1016,22 +1016,22 @@ impl<'s> Intake<'s> {
     }
 
     /// Ends the intake. The tree must be whole: the record in, every list
-    /// and every piece held, no folder too deep, and the record's totals
+    /// and every chunk held, no folder too deep, and the record's totals
     /// right.
     pub fn finish(self) -> Result<Summary> {
         if self.failed {
             return Err(Error::IntakeFailed);
         }
-        if let Some(hash) = self.wanted_pieces.values().next() {
+        if let Some(hash) = self.wanted_chunks.values().next() {
             if self.record.is_some() && self.wanted_lists.is_empty() {
-                return Err(missing("the piece", hash));
+                return Err(missing("the chunk", hash));
             }
         }
         self.finish_lists()
     }
 
     /// Ends the intake as [`Intake::finish`] does, without asking that the
-    /// pieces are held: every list must be there and right, and the totals
+    /// chunks are held: every list must be there and right, and the totals
     /// are counted from the lists.
     pub(crate) fn finish_lists(self) -> Result<Summary> {
         if self.failed {
@@ -1044,11 +1044,11 @@ impl<'s> Intake<'s> {
         self.check_depth(&record.top())?;
         let recorded = record.totals();
         for (field, recorded, counted) in [
-            ("pieces", recorded.pieces, self.counted.pieces),
+            ("chunks", recorded.chunks, self.counted.chunks),
             (
-                "piece bytes",
-                recorded.piece_bytes,
-                self.counted.piece_bytes,
+                "chunk bytes",
+                recorded.chunk_bytes,
+                self.counted.chunk_bytes,
             ),
             ("list bytes", recorded.list_bytes, self.counted.list_bytes),
         ] {
@@ -1068,7 +1068,7 @@ impl<'s> Intake<'s> {
     }
 }
 
-/// Checks a whole tree that a store holds: every list, every piece's bytes,
+/// Checks a whole tree that a store holds: every list, every chunk's bytes,
 /// the depth of its folders and the totals in its record. It is the same
 /// set of checks that a tree goes through when it is taken in.
 pub fn verify(store: &dyn Store, root: &Root) -> Result<Summary> {
@@ -1077,15 +1077,15 @@ pub fn verify(store: &dyn Store, root: &Root) -> Result<Summary> {
 
 /// Checks a whole tree that a store holds, with more checks switched on.
 ///
-/// The lists are checked first. Then every piece is hashed again, several at
-/// once, and last, when that is asked for, every file is cut again.
+/// The lists are checked first. Then every chunk is hashed again, several at
+/// once, and last, when that is asked for, every file is chunked again.
 pub fn verify_with(store: &dyn Store, root: &Root, options: VerifyOptions) -> Result<Summary> {
     let mode = Mode {
-        recut: options.recut,
+        rechunk: options.rechunk,
         discard: options.discard,
     };
     let mut intake = Intake::with_mode(store, *root, mode)?;
     intake.rehash_held(options.workers)?;
-    intake.recut_held()?;
+    intake.rechunk_held()?;
     intake.finish()
 }

@@ -4,7 +4,7 @@ version = "2.5.6"
 edition = "2021"
 rust-version = "1.85"
 publish = false
-description = "Scionic Merkle trees: a folder of files under one root, with identical pieces, files and folders stored once, and any part of it shown and checked without the rest"
+description = "Scionic Merkle trees: a folder of files under one root, with identical chunks, files and folders stored once, and any part of it shown and checked without the rest"
 license = "MIT"
 
 [dependencies]

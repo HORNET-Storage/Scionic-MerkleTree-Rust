@@ -228,13 +228,13 @@ Anything that answers requests is a peer: a connection to another machine, or a 
 
 ```rust
 use scionic_merkletree::{
-    fetch, Builder, Cutting, Entry, ExtraData, MemoryStore, Remote, Responder,
+    fetch, Builder, Chunking, Entry, ExtraData, MemoryStore, Remote, Responder,
 };
 
 fn main() -> scionic_merkletree::Result<()> {
     // A publisher builds a tree. Here it is built from bytes in memory.
     let publisher = MemoryStore::new();
-    let mut builder = Builder::new(&publisher, Cutting::FastCdcV1);
+    let mut builder = Builder::new(&publisher, Chunking::FastCdcV1);
     let readme = builder.file_from_bytes(b"# My model\n")?;
     let weights = builder.file_from_bytes(&vec![7_u8; 3 << 20])?;
     let top = builder.folder(vec![
@@ -317,7 +317,7 @@ The library verifies everything against the root, so a connection does not have 
 
 **Building.** Building uses every core unless `BuildOptions::workers` says otherwise. Several files are chunked at once, and the chunks of one long file are hashed several at once. A file is never held in memory whole: a builder holds up to 16 MiB of it, or up to 64 MiB while other threads help it. `BuildOptions::timestamp` writes the time into the tree's record, and `build_with` attaches extra data to each entry, such as a file mode or a media type. A link or a special file in the folder is refused, or left out with `Links::Skip`. It is never followed.
 
-**Verifying and mending.** `verify` checks every list and every chunk that a store holds for a root, on every core. When bytes were harmed where they are kept, the error says which thing it is: `Error::Corrupt` carries its hash. With `VerifyOptions::new().discard_damaged(true)` the damaged parts are removed, and the next `fetch` brings back exactly those. `VerifyOptions::recut` also chunks every file again, and refuses a file that was not chunked the standard way.
+**Verifying and mending.** `verify` checks every list and every chunk that a store holds for a root, on every core. When bytes were harmed where they are kept, the error says which thing it is: `Error::Corrupt` carries its hash. With `VerifyOptions::new().discard_damaged(true)` the damaged parts are removed, and the next `fetch` brings back exactly those. `VerifyOptions::rechunk` also chunks every file again, and refuses a file that was not chunked the standard way.
 
 **Bundles and changes.** A whole tree can travel as one stream, and two trees in one store can be compared:
 
@@ -376,15 +376,15 @@ pub trait Store: Send + Sync {
 
 ## Words Used in the API
 
-The API and the specification use short, plain words. This is how they line up with the words above:
+The API and the specification use the same words as this page. This is where each one is found:
 
 | Here | In the API and in `spec/FORMAT.md` |
 | --- | --- |
-| chunk | piece: `PieceRef`, `Stored::Piece` |
+| chunk | `ChunkRef`, `Stored::Chunk` |
 | a file's chunk list | file list: `FileList` |
 | a folder's listing | folder list: `FolderList`, made of entries: `Entry` |
-| Merkle branch, Merkle proof | run: `FileRun`, `FolderRun` |
-| chunking | cutting: `Cutting::FastCdcV1` |
+| Merkle branch, Merkle proof | branch: `FileBranch`, `FolderBranch` |
+| chunking | `Chunking::FastCdcV1` |
 | root | `Root`, the hash of the tree's record: `Record` |
 
 | Module | What it holds |

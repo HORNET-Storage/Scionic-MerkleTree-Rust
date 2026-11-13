@@ -2,17 +2,17 @@
 //! stretch of it, and writing the tree out to disk.
 //!
 //! Everything read from the store is checked again before it is used: a list
-//! against the hash it was asked for by, and a piece against the hash and the
+//! against the hash it was asked for by, and a chunk against the hash and the
 //! length its file gives it. A file's bytes are handed out only when every
-//! piece they need is there. Otherwise it is an error, never a shorter file.
+//! chunk they need is there. Otherwise it is an error, never a shorter file.
 
 use crate::disk::{Held, Refused};
 use crate::format::{
-    check_name, Entry, FileList, FolderList, Kind, OpenFile, PieceRef, Record, Target,
+    check_name, ChunkRef, Entry, FileList, FolderList, Kind, OpenFile, Record, Target,
     MAX_FOLDER_DEPTH,
 };
 use crate::hash::{Hash, Root};
-use crate::store::{load_file, load_folder, load_piece, load_record, missing, Store, Stored};
+use crate::store::{load_chunk, load_file, load_folder, load_record, missing, Store, Stored};
 use crate::{io_error, Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -36,7 +36,7 @@ pub fn folder_of(store: &dyn Store, folder: &Target) -> Result<FolderList> {
     load_folder(store, folder)?.ok_or_else(|| missing("the list of the folder", &folder.hash))
 }
 
-/// The list of a file's pieces.
+/// The list of a file's chunks.
 pub fn file_of(store: &dyn Store, file: &Target) -> Result<FileList> {
     load_file(store, file)?.ok_or_else(|| missing("the list of the file", &file.hash))
 }
@@ -91,8 +91,8 @@ pub fn read_file_to_vec(store: &dyn Store, file: &Target) -> Result<Vec<u8>> {
 
 /// Writes `length` bytes of a file, from byte `offset`, to `out`.
 ///
-/// Before the first byte goes out, every piece of the stretch is looked for.
-/// If one is missing, nothing is written. Each piece is then checked against
+/// Before the first byte goes out, every chunk of the stretch is looked for.
+/// If one is missing, nothing is written. Each chunk is then checked against
 /// its hash as it is written.
 ///
 /// The file's list is read and checked on every call. For many stretches of
@@ -112,7 +112,7 @@ pub fn read_range(
     if length == 0 {
         return Ok(());
     }
-    // The pieces that hold the stretch, each with the byte it starts at.
+    // The chunks that hold the stretch, each with the byte it starts at.
     let mut wanted = Vec::new();
     let mut start = 0_u64;
     for item in list.items() {
@@ -129,7 +129,7 @@ pub fn read_range(
 }
 
 /// Writes `length` bytes of a file whose list is open, from byte `offset`,
-/// to `out`. It does what [`read_range`] does, and finds the pieces without
+/// to `out`. It does what [`read_range`] does, and finds the chunks without
 /// a pass over the list.
 pub fn read_open(
     store: &dyn Store,
@@ -145,7 +145,7 @@ pub fn read_open(
             Err(invalid("a stretch of bytes is outside the file"))
         };
     }
-    let (first, after) = file.pieces_for(offset, length)?;
+    let (first, after) = file.chunks_for(offset, length)?;
     let mut wanted = Vec::new();
     for number in first..after {
         let item = usize::try_from(number)
@@ -153,7 +153,7 @@ pub fn read_open(
             .and_then(|place| file.list().items().get(place));
         let (Some(item), Some(start)) = (item, file.start_of(number)) else {
             return Err(Error::Invariant {
-                detail: "an open file names a piece it does not have",
+                detail: "an open file names a chunk it does not have",
             });
         };
         wanted.push((*item, start));
@@ -161,30 +161,30 @@ pub fn read_open(
     write_stretch(store, &wanted, offset, offset + length, out)
 }
 
-/// Writes the bytes from `offset` up to `end` out of the pieces that hold
-/// them. Each piece comes with the byte of the file it starts at.
+/// Writes the bytes from `offset` up to `end` out of the chunks that hold
+/// them. Each chunk comes with the byte of the file it starts at.
 fn write_stretch(
     store: &dyn Store,
-    wanted: &[(PieceRef, u64)],
+    wanted: &[(ChunkRef, u64)],
     offset: u64,
     end: u64,
     out: &mut dyn Write,
 ) -> Result<()> {
     for (item, _) in wanted {
-        match store.size(Stored::Piece, &item.hash)? {
+        match store.size(Stored::Chunk, &item.hash)? {
             Some(size) if size == u64::from(item.length) => {}
             Some(size) => {
                 return Err(Error::SizeMismatch {
-                    what: "a stored piece",
+                    what: "a stored chunk",
                     expected: u64::from(item.length),
                     actual: size,
                 })
             }
-            None => return Err(missing("the piece", &item.hash)),
+            None => return Err(missing("the chunk", &item.hash)),
         }
     }
     for (item, start) in wanted {
-        let bytes = load_piece(store, item)?.ok_or_else(|| missing("the piece", &item.hash))?;
+        let bytes = load_chunk(store, item)?.ok_or_else(|| missing("the chunk", &item.hash))?;
         let from = offset.saturating_sub(*start) as usize;
         let to = (end.min(start + u64::from(item.length)) - start) as usize;
         out.write_all(&bytes[from..to])
@@ -292,7 +292,7 @@ impl WriteOptions {
     }
 
     /// The most bytes that may be written. A tree's record says how many it
-    /// takes: the size of what is on top, with a file or a piece that the
+    /// takes: the size of what is on top, with a file or a chunk that the
     /// tree uses twice counted twice.
     pub fn max_bytes(mut self, most: u64) -> Self {
         self.max_bytes = most;
@@ -304,7 +304,7 @@ impl WriteOptions {
 /// its top file as the new file `dest`.
 ///
 /// Writing is stricter than holding. `dest` must not exist. Before anything
-/// is written, the whole tree is looked through: every list and every piece
+/// is written, the whole tree is looked through: every list and every chunk
 /// must be there, no folder may sit too deep, every name must be one that
 /// this system can hold as it is, and what would be made must fit within
 /// [`WriteOptions::new`]. Every file and folder is then created as new.
@@ -333,7 +333,7 @@ pub fn write_to_disk_with(
     // First: find everything, count what would be made, and write nothing.
     let entries = match top.kind {
         Kind::File => {
-            require_pieces(store, &file_of(store, &top)?)?;
+            require_chunks(store, &file_of(store, &top)?)?;
             1
         }
         Kind::Folder => survey(store, &top)?,
@@ -439,7 +439,7 @@ fn fill_folder(
 }
 
 /// Looks through a whole tree before it is written out, each folder once,
-/// however many places it has. Every list and every piece must be there,
+/// however many places it has. Every list and every chunk must be there,
 /// every name must be one this system can hold, and no folder may sit too
 /// deep. Gives how many files and folders writing the tree makes, the top
 /// one counted, and a folder with several places counted at each.
@@ -465,7 +465,7 @@ fn survey(store: &dyn Store, top: &Target) -> Result<u64> {
         match entry {
             Some((Kind::File, file)) => {
                 if checked_files.insert(file.hash) {
-                    require_pieces(store, &file_of(store, &file)?)?;
+                    require_chunks(store, &file_of(store, &file)?)?;
                 }
             }
             Some((Kind::Folder, folder)) => {
@@ -534,19 +534,19 @@ fn child_path(folder: &Path, name: &str) -> Result<PathBuf> {
     Ok(child)
 }
 
-/// Every piece of a file has to be held, with the length its list gives it.
-fn require_pieces(store: &dyn Store, list: &FileList) -> Result<()> {
+/// Every chunk of a file has to be held, with the length its list gives it.
+fn require_chunks(store: &dyn Store, list: &FileList) -> Result<()> {
     for item in list.items() {
-        match store.size(Stored::Piece, &item.hash)? {
+        match store.size(Stored::Chunk, &item.hash)? {
             Some(size) if size == u64::from(item.length) => {}
             Some(size) => {
                 return Err(Error::SizeMismatch {
-                    what: "a stored piece",
+                    what: "a stored chunk",
                     expected: u64::from(item.length),
                     actual: size,
                 })
             }
-            None => return Err(missing("the piece", &item.hash)),
+            None => return Err(missing("the chunk", &item.hash)),
         }
     }
     Ok(())

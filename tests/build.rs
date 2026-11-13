@@ -5,13 +5,13 @@ mod support;
 
 use scionic_merkletree::{
     build, build_with, file_of, folder_of, lookup, read_file_to_vec, record_of, verify,
-    BuildOptions, Builder, Cutting, Entry, Error, ExtraData, Kind, Links, MemoryStore, Store,
-    Stored, CUTTING_KEY, TIMESTAMP_KEY,
+    BuildOptions, Builder, Chunking, Entry, Error, ExtraData, Kind, Links, MemoryStore, Store,
+    Stored, CHUNKING_KEY, TIMESTAMP_KEY,
 };
 use std::fs;
 use support::oracle;
 use support::{
-    bytes, contents, sample_folder, sample_tree, small_options, small_pieces, write, TempDir,
+    bytes, contents, sample_folder, sample_tree, small_chunks, small_options, write, TempDir,
 };
 
 #[test]
@@ -74,7 +74,7 @@ fn the_root_is_what_the_format_says_it_is() {
         45,
         &top_hash,
         (4, 45, list_bytes),
-        &oracle::cut_tag("fixed-16"),
+        &oracle::chunking_tag("fixed-16"),
     );
 
     assert_eq!(*root.as_hash().as_bytes(), oracle::sha(&[&record]));
@@ -102,21 +102,21 @@ fn the_root_is_what_the_format_says_it_is() {
     );
     assert_eq!(kept(Stored::FileList, &empty_hash), Some(Vec::new()));
     assert_eq!(
-        kept(Stored::Piece, &b_items[2].hash),
+        kept(Stored::Chunk, &b_items[2].hash),
         Some(b[32..].to_vec())
     );
-    // A piece's hash is the plain SHA-256 of its bytes.
+    // A chunk's hash is the plain SHA-256 of its bytes.
     assert_eq!(
         scionic_merkletree::Hash::of(&a).to_hex(),
         "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
     );
-    assert_eq!(kept(Stored::Piece, &a_items[0].hash), Some(a));
+    assert_eq!(kept(Stored::Chunk, &a_items[0].hash), Some(a));
 }
 
 #[test]
 fn identical_things_are_stored_once() {
     let (_temp, store, root) = sample_tree("stored-once");
-    // Two names, one file: the same hash, one list, and its pieces once.
+    // Two names, one file: the same hash, one list, and its chunks once.
     let model = lookup(&store, &root, "weights/model.bin").unwrap().unwrap();
     let copy = lookup(&store, &root, "weights/copy-of-model.bin")
         .unwrap()
@@ -130,17 +130,17 @@ fn identical_things_are_stored_once() {
     assert_eq!(store.count(Stored::FileList), 6);
     assert_eq!(store.count(Stored::FolderList), 5);
     assert_eq!(store.count(Stored::Record), 1);
-    // 12, 1,000, 100, 33 and 32 bytes in pieces of 16.
-    assert_eq!(totals.pieces, 1 + 63 + 7 + 3 + 2);
-    assert_eq!(totals.piece_bytes, 12 + 1_000 + 100 + 33 + 32);
-    assert_eq!(store.count(Stored::Piece) as u64, totals.pieces);
-    assert_eq!(store.bytes(Stored::Piece), totals.piece_bytes);
+    // 12, 1,000, 100, 33 and 32 bytes in chunks of 16.
+    assert_eq!(totals.chunks, 1 + 63 + 7 + 3 + 2);
+    assert_eq!(totals.chunk_bytes, 12 + 1_000 + 100 + 33 + 32);
+    assert_eq!(store.count(Stored::Chunk) as u64, totals.chunks);
+    assert_eq!(store.bytes(Stored::Chunk), totals.chunk_bytes);
     assert_eq!(
         store.bytes(Stored::FileList) + store.bytes(Stored::FolderList),
         totals.list_bytes
     );
     // The tree's size counts the file under both of its names.
-    assert_eq!(summary.record.top().size, totals.piece_bytes + 1_000);
+    assert_eq!(summary.record.top().size, totals.chunk_bytes + 1_000);
     assert_eq!(summary.record.top().kind, Kind::Folder);
 }
 
@@ -151,12 +151,12 @@ fn a_second_tree_adds_only_what_is_new() {
     let store = MemoryStore::new();
     let first = build(&store, &folder, &small_options()).unwrap();
     let before = (
-        store.count(Stored::Piece),
+        store.count(Stored::Chunk),
         store.count(Stored::FileList),
         store.count(Stored::FolderList),
     );
 
-    // One piece of one file changes, and another file gets a new name.
+    // One chunk of one file changes, and another file gets a new name.
     let mut model = bytes("model", 1_000);
     model[320..336].copy_from_slice(&bytes("changed", 16));
     write(folder.join("weights/model.bin"), &model).unwrap();
@@ -165,11 +165,11 @@ fn a_second_tree_adds_only_what_is_new() {
     assert_ne!(first, second);
 
     let after = (
-        store.count(Stored::Piece),
+        store.count(Stored::Chunk),
         store.count(Stored::FileList),
         store.count(Stored::FolderList),
     );
-    // One new piece. One new list for the changed file: the renamed file is
+    // One new chunk. One new list for the changed file: the renamed file is
     // the same file. Two new folders: the one that holds the change, and the
     // top, which holds both.
     assert_eq!(after, (before.0 + 1, before.1 + 1, before.2 + 2));
@@ -195,13 +195,13 @@ fn a_second_tree_adds_only_what_is_new() {
 }
 
 #[test]
-fn a_file_that_repeats_a_piece_reads_back_whole() {
+fn a_file_that_repeats_a_chunk_reads_back_whole() {
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let (x, y) = (bytes("x", 16), bytes("y", 16));
     let content = [x.clone(), y, x].concat();
     let file = builder.file_from_bytes(&content).unwrap();
-    assert_eq!(store.count(Stored::Piece), 2);
+    assert_eq!(store.count(Stored::Chunk), 2);
 
     let list = file_of(&store, &file).unwrap();
     assert_eq!(list.count(), 3);
@@ -209,8 +209,11 @@ fn a_file_that_repeats_a_piece_reads_back_whole() {
     assert_eq!(read_file_to_vec(&store, &file).unwrap(), content);
     // Each of the three places is shown on its own, at its own byte.
     for place in 0..3 {
-        let run = list.open(place, place + 1).unwrap();
-        assert_eq!(run.check(&file, Some(small_pieces())).unwrap(), place * 16);
+        let branch = list.open(place, place + 1).unwrap();
+        assert_eq!(
+            branch.check(&file, Some(small_chunks())).unwrap(),
+            place * 16
+        );
     }
 
     let root = builder.finish(file, ExtraData::new()).unwrap();
@@ -218,15 +221,15 @@ fn a_file_that_repeats_a_piece_reads_back_whole() {
     let totals = summary.record.totals();
     assert_eq!(summary.record.top().size, 48);
     assert_eq!(
-        (totals.pieces, totals.piece_bytes, totals.list_bytes),
+        (totals.chunks, totals.chunk_bytes, totals.list_bytes),
         (2, 32, 108)
     );
 }
 
 #[test]
-fn the_same_piece_in_two_files_is_one_piece() {
+fn the_same_chunk_in_two_files_is_one_chunk() {
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let shared = bytes("shared", 16);
     let first = builder
         .file_from_bytes(&[shared.clone(), bytes("first", 10)].concat())
@@ -235,7 +238,7 @@ fn the_same_piece_in_two_files_is_one_piece() {
         .file_from_bytes(&[bytes("second", 16), shared].concat())
         .unwrap();
     assert_ne!(first.hash, second.hash);
-    assert_eq!(store.count(Stored::Piece), 3);
+    assert_eq!(store.count(Stored::Chunk), 3);
     let top = builder
         .folder(vec![
             Entry::new("second", second, ExtraData::new()).unwrap(),
@@ -244,7 +247,7 @@ fn the_same_piece_in_two_files_is_one_piece() {
         .unwrap();
     let root = builder.finish(top, ExtraData::new()).unwrap();
     let totals = verify(&store, &root).unwrap().record.totals();
-    assert_eq!((totals.pieces, totals.piece_bytes), (3, 42));
+    assert_eq!((totals.chunks, totals.chunk_bytes), (3, 42));
     // The builder sorted the entries by name.
     let names: Vec<String> = folder_of(&store, &top)
         .unwrap()
@@ -278,8 +281,8 @@ fn building_with_several_workers_gives_the_same_tree() {
 }
 
 #[test]
-fn files_are_cut_by_content_unless_a_test_says_otherwise() {
-    // A case of the committed cutting vectors: 3 MiB, cut after 2,118,489.
+fn files_are_chunked_by_content_unless_a_test_says_otherwise() {
+    // A case of the committed chunking vectors: 3 MiB, cut after 2,118,489.
     let data = bytes("scionic-fastcdc-v1:corpus:random_3mib", 3 << 20);
     let temp = TempDir::new("by-content").unwrap();
     let path = temp.path().join("random.bin");
@@ -287,8 +290,8 @@ fn files_are_cut_by_content_unless_a_test_says_otherwise() {
     let store = MemoryStore::new();
     let root = build(&store, &path, &BuildOptions::new()).unwrap();
     let record = record_of(&store, &root).unwrap();
-    assert_eq!(record.cutting(), Cutting::FastCdcV1);
-    assert_eq!(record.extra().text(CUTTING_KEY), Some("fastcdc-v1"));
+    assert_eq!(record.chunking(), Chunking::FastCdcV1);
+    assert_eq!(record.extra().text(CHUNKING_KEY), Some("fastcdc-v1"));
     assert_eq!(record.extra().len(), 1);
     assert_eq!(record.top().kind, Kind::File);
     let lengths: Vec<u32> = file_of(&store, &record.top())
@@ -302,7 +305,7 @@ fn files_are_cut_by_content_unless_a_test_says_otherwise() {
 
     // The same bytes, by the builder that is given bytes: the same file.
     let other = MemoryStore::new();
-    let file = Builder::new(&other, Cutting::FastCdcV1)
+    let file = Builder::new(&other, Chunking::FastCdcV1)
         .file_from_bytes(&data)
         .unwrap();
     assert_eq!(file, record.top());
@@ -316,14 +319,14 @@ fn the_record_carries_what_the_builder_was_told() {
     let extra = ExtraData::new()
         .with("name", "my model")
         .unwrap()
-        .with(CUTTING_KEY, "not for a caller to say")
+        .with(CHUNKING_KEY, "not for a caller to say")
         .unwrap();
     let options = small_options().extra(extra).timestamp(true);
     let root = build(&store, &folder, &options).unwrap();
     assert_ne!(root, plain);
     let record = record_of(&store, &root).unwrap();
     assert_eq!(record.extra().text("name"), Some("my model"));
-    assert_eq!(record.extra().text(CUTTING_KEY), Some("fixed-16"));
+    assert_eq!(record.extra().text(CHUNKING_KEY), Some("fixed-16"));
     let stamp = record.extra().text(TIMESTAMP_KEY).unwrap();
     assert_eq!(stamp.len(), 20, "{stamp}");
     assert!(stamp.starts_with("20") && stamp.ends_with('Z'), "{stamp}");
@@ -355,7 +358,7 @@ fn every_entry_can_be_given_extra_data() {
             "copy-of-model.bin",
             "data",
             "empty.bin",
-            "exactly-two-pieces.bin",
+            "exactly-two-chunks.bin",
             "model.bin",
             "nothing-here",
             "readme.txt",
@@ -400,7 +403,7 @@ fn a_file_on_its_own_is_a_tree() {
     let empty = build(&store, &empty_path, &small_options()).unwrap();
     let totals = verify(&store, &empty).unwrap().record.totals();
     assert_eq!(
-        (totals.pieces, totals.piece_bytes, totals.list_bytes),
+        (totals.chunks, totals.chunk_bytes, totals.list_bytes),
         (0, 0, 0)
     );
 }
@@ -435,7 +438,7 @@ fn a_link_is_never_followed() {
     assert!(lookup(&store, &root, "link.txt").unwrap().is_none());
     assert!(lookup(&store, &root, "inside.txt").unwrap().is_some());
     let secret = scionic_merkletree::Hash::of(b"not part of the folder");
-    assert!(!store.has(Stored::Piece, &secret).unwrap());
+    assert!(!store.has(Stored::Chunk, &secret).unwrap());
 }
 
 #[cfg(windows)]
@@ -491,7 +494,7 @@ fn on_windows_a_name_is_read_as_the_folder_lists_it() {
 fn a_folder_inside_128_others_is_too_deep() {
     // Made by hand: a path that long does not fit on every system.
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let file = builder.file_from_bytes(b"at the bottom").unwrap();
     let mut inner = builder
         .folder(vec![Entry::new("file", file, ExtraData::new()).unwrap()])
@@ -505,7 +508,7 @@ fn a_folder_inside_128_others_is_too_deep() {
     let root = builder.finish(inner, ExtraData::new()).unwrap();
     assert_eq!(verify(&store, &root).unwrap().folders, 128);
 
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let one_more = builder
         .folder(vec![Entry::new("d", inner, ExtraData::new()).unwrap()])
         .unwrap();
@@ -524,7 +527,7 @@ fn a_folder_inside_128_others_is_too_deep() {
     // 100 folders sit one inside the other. The top reaches them directly,
     // under `near`, and again under `far`, with more folders on the way.
     let hundred_deep = |wrapped: usize| {
-        let mut builder = Builder::new(&store, small_pieces());
+        let mut builder = Builder::new(&store, small_chunks());
         let mut hundred = builder
             .folder(vec![Entry::new("file", file, ExtraData::new()).unwrap()])
             .unwrap();

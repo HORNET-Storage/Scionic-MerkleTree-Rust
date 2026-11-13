@@ -3,21 +3,21 @@
 mod support;
 
 use scionic_merkletree::{
-    build, verify_with, Builder, Cutting, Error, ExtraData, Hash, MemoryStore, PieceRef, Result,
+    build, verify_with, Builder, ChunkRef, Chunking, Error, ExtraData, Hash, MemoryStore, Result,
     Store, Stored, VerifyOptions,
 };
 use std::sync::Arc;
-use support::{bytes, contents, sample_folder, small_options, small_pieces, write, TempDir};
+use support::{bytes, contents, sample_folder, small_chunks, small_options, write, TempDir};
 
 #[test]
-fn one_file_is_the_same_whatever_number_of_threads_keep_its_pieces() {
-    // 6,250 pieces of 16 bytes: more than a builder hands on at a time.
+fn one_file_is_the_same_whatever_number_of_threads_keep_its_chunks() {
+    // 6,250 chunks of 16 bytes: more than a builder hands on at a time.
     let data = bytes("threads-one-file", 100_000);
     let mut roots = Vec::new();
     let mut stores = Vec::new();
     for threads in [1, 2, 8, 0] {
         let store = MemoryStore::new();
-        let mut builder = Builder::new(&store, small_pieces()).threads(threads);
+        let mut builder = Builder::new(&store, small_chunks()).threads(threads);
         let streamed = builder.file(&mut data.as_slice()).unwrap();
         let in_place = builder.file_from_bytes(&data).unwrap();
         assert_eq!(streamed, in_place, "{threads} threads");
@@ -29,18 +29,18 @@ fn one_file_is_the_same_whatever_number_of_threads_keep_its_pieces() {
 }
 
 #[test]
-fn a_file_cut_by_content_is_the_same_with_help() {
+fn a_file_chunked_by_content_is_the_same_with_help() {
     let data = bytes("threads-by-content", 9 << 20);
     let mut roots = Vec::new();
     for threads in [1, 4] {
         let store = MemoryStore::new();
-        let mut builder = Builder::new(&store, Cutting::FastCdcV1).threads(threads);
+        let mut builder = Builder::new(&store, Chunking::FastCdcV1).threads(threads);
         let streamed = builder.file(&mut data.as_slice()).unwrap();
         assert_eq!(streamed, builder.file_from_bytes(&data).unwrap());
-        assert!(store.count(Stored::Piece) > 2, "several pieces");
+        assert!(store.count(Stored::Chunk) > 2, "several chunks");
         let root = builder.finish(streamed, ExtraData::new()).unwrap();
         for workers in [1, 4] {
-            let options = VerifyOptions::new().workers(workers).recut(true);
+            let options = VerifyOptions::new().workers(workers).rechunk(true);
             verify_with(&store, &root, options).unwrap();
         }
         roots.push(root);
@@ -65,7 +65,7 @@ fn a_folder_is_the_same_when_threads_outnumber_its_files() {
     assert!(stores.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
-/// A store that will not keep one piece.
+/// A store that will not keep one chunk.
 struct Refusing {
     inner: MemoryStore,
     refused: Hash,
@@ -73,9 +73,9 @@ struct Refusing {
 
 impl Store for Refusing {
     fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
-        if kind == Stored::Piece && *hash == self.refused {
+        if kind == Stored::Chunk && *hash == self.refused {
             return Err(Error::Invariant {
-                detail: "this store will not keep that piece",
+                detail: "this store will not keep that chunk",
             });
         }
         self.inner.put(kind, hash, bytes)
@@ -91,15 +91,15 @@ impl Store for Refusing {
 }
 
 #[test]
-fn a_piece_that_cannot_be_kept_stops_the_file_whoever_was_keeping_it() {
+fn a_chunk_that_cannot_be_kept_stops_the_file_whoever_was_keeping_it() {
     let data = bytes("threads-refused", 100_000);
-    let refused = PieceRef::of(&data[64_000..64_016]).unwrap().hash;
+    let refused = ChunkRef::of(&data[64_000..64_016]).unwrap().hash;
     for threads in [1, 8] {
         let store = Refusing {
             inner: MemoryStore::new(),
             refused,
         };
-        let mut builder = Builder::new(&store, small_pieces()).threads(threads);
+        let mut builder = Builder::new(&store, small_chunks()).threads(threads);
         for attempt in [
             builder.file(&mut data.as_slice()),
             builder.file_from_bytes(&data),
@@ -109,14 +109,14 @@ fn a_piece_that_cannot_be_kept_stops_the_file_whoever_was_keeping_it() {
                 "{threads} threads: {attempt:?}"
             );
         }
-        // A file whose pieces are not all kept has no list.
+        // A file whose chunks are not all kept has no list.
         assert_eq!(store.inner.count(Stored::FileList), 0);
     }
 }
 
 #[test]
 fn the_failure_that_is_told_is_the_one_that_happened() {
-    // A folder of many files, one of which holds a piece the store refuses.
+    // A folder of many files, one of which holds a chunk the store refuses.
     // The threads that stop because of it have nothing of their own to tell.
     let temp = TempDir::new("threads-failure").unwrap();
     let folder = temp.path().join("tree");
@@ -124,7 +124,7 @@ fn the_failure_that_is_told_is_the_one_that_happened() {
         let data = bytes(&format!("failure-{number}"), 64);
         write(folder.join(format!("file-{number:02}")), &data).unwrap();
     }
-    let refused = PieceRef::of(&bytes("failure-40", 64)[..16]).unwrap().hash;
+    let refused = ChunkRef::of(&bytes("failure-40", 64)[..16]).unwrap().hash;
     for workers in [1, 2, 8] {
         let store = Refusing {
             inner: MemoryStore::new(),
@@ -132,20 +132,20 @@ fn the_failure_that_is_told_is_the_one_that_happened() {
         };
         match build(&store, &folder, &small_options().workers(workers)) {
             Err(Error::Invariant { detail }) => {
-                assert_eq!(detail, "this store will not keep that piece");
+                assert_eq!(detail, "this store will not keep that chunk");
             }
             other => panic!("{workers} workers: {other:?}"),
         }
     }
 }
 
-/// A store that falls over whenever it is handed a piece, as one would whose
+/// A store that falls over whenever it is handed a chunk, as one would whose
 /// own code has a fault.
 struct Falling(MemoryStore);
 
 impl Store for Falling {
     fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
-        assert!(kind != Stored::Piece, "this store falls over");
+        assert!(kind != Stored::Chunk, "this store falls over");
         self.0.put(kind, hash, bytes)
     }
 
@@ -160,7 +160,7 @@ impl Store for Falling {
 
 #[test]
 fn a_store_that_falls_over_does_not_leave_a_build_waiting() {
-    // More files than the threads take at once: if every thread that cuts
+    // More files than the threads take at once: if every thread that chunks
     // is gone, the one that reads the folder must not wait for them.
     let temp = TempDir::new("threads-falling").unwrap();
     let folder = temp.path().join("tree");

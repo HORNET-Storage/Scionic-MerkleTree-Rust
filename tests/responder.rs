@@ -4,12 +4,12 @@
 mod support;
 
 use scionic_merkletree::{
-    Builder, Entry, Error, ExtraData, FileList, FolderList, Frame, Hash, MemoryStore, OpenFile,
-    OpenFolder, PieceRef, Refusal, Request, Responder, Result, Store, Stored,
+    Builder, ChunkRef, Entry, Error, ExtraData, FileList, FolderList, Frame, Hash, MemoryStore,
+    OpenFile, OpenFolder, Refusal, Request, Responder, Result, Store, Stored,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use support::{bytes, small_pieces};
+use support::{bytes, small_chunks};
 
 /// A store that counts how often a list is read from it.
 struct Counting {
@@ -49,12 +49,12 @@ fn lists_read_for(store: &Counting, responder: &Responder<'_>, files: [Hash; 2])
     for round in 0..20_u64 {
         for file in files {
             for request in [
-                Request::Pieces {
+                Request::Chunks {
                     file,
                     start: round,
                     count: 2,
                 },
-                Request::FileRun {
+                Request::FileBranch {
                     file,
                     start: round,
                     count: 3,
@@ -85,7 +85,7 @@ fn lists_that_were_asked_about_are_not_read_again() {
         inner: MemoryStore::new(),
         lists_read: AtomicUsize::new(0),
     };
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let first = builder
         .file_from_bytes(&bytes("responder-a", 1_600))
         .unwrap();
@@ -107,7 +107,7 @@ fn lists_that_were_asked_about_are_not_read_again() {
         .inner
         .put(Stored::FileList, &first.hash, &[7; 72])
         .unwrap();
-    let request = Request::FileRun {
+    let request = Request::FileBranch {
         file: first.hash,
         start: 0,
         count: 1,
@@ -120,9 +120,9 @@ fn lists_that_were_asked_about_are_not_read_again() {
 }
 
 #[test]
-fn a_responder_can_keep_to_itself_which_pieces_it_holds() {
+fn a_responder_can_keep_to_itself_which_chunks_it_holds() {
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let file = builder
         .file_from_bytes(&bytes("responder-have", 160))
         .unwrap();
@@ -153,12 +153,12 @@ fn a_responder_can_keep_to_itself_which_pieces_it_holds() {
 #[test]
 fn a_list_read_with_its_tree_is_the_list_read_alone() {
     for count in [0_usize, 1, 2, 3, 5, 8, 13, 100] {
-        let items: Vec<PieceRef> = (0..count)
-            .map(|number| PieceRef::of(&bytes(&format!("piece-{number}"), 16)).unwrap())
+        let items: Vec<ChunkRef> = (0..count)
+            .map(|number| ChunkRef::of(&bytes(&format!("chunk-{number}"), 16)).unwrap())
             .collect();
         let list = FileList::new(items).unwrap();
         let open = OpenFile::decode(&list.encode()).unwrap();
-        assert_eq!(open.list(), &list, "{count} pieces");
+        assert_eq!(open.list(), &list, "{count} chunks");
         if count > 0 {
             let end = count.min(3) as u64;
             assert_eq!(
@@ -167,7 +167,7 @@ fn a_list_read_with_its_tree_is_the_list_read_alone() {
             );
         }
     }
-    let file = FileList::new(vec![PieceRef::of(b"some bytes").unwrap()])
+    let file = FileList::new(vec![ChunkRef::of(b"some bytes").unwrap()])
         .unwrap()
         .target();
     let entry =

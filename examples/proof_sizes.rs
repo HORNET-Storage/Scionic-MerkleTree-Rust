@@ -11,7 +11,7 @@
 //! half a million chunks. A file of half a million chunks is about a terabyte.
 
 use scionic_merkletree::{
-    Builder, Cutting, Entry, ExtraData, MemoryStore, Request, Responder, Result, Store, Stored,
+    Builder, Chunking, Entry, ExtraData, MemoryStore, Request, Responder, Result, Store, Stored,
 };
 
 /// How many bytes a store's holder answers a request with.
@@ -37,7 +37,7 @@ fn main() -> Result<()> {
     );
     for count in [10_usize, 1_000, 10_000, 1_000_000] {
         let store = MemoryStore::new();
-        let mut builder = Builder::new(&store, Cutting::fixed(16)?);
+        let mut builder = Builder::new(&store, Chunking::fixed(16)?);
         let file = builder.file_from_bytes(b"the same small file")?;
         let entries = (0..count)
             .map(|number| Entry::new(format!("file-{number:07}.bin"), file, ExtraData::new()))
@@ -62,13 +62,13 @@ fn main() -> Result<()> {
     for count in [10_usize, 1_000, 10_000, 500_000] {
         // Chunks of one byte, so that a file of many chunks is small.
         let store = MemoryStore::new();
-        let mut builder = Builder::new(&store, Cutting::fixed(1)?);
+        let mut builder = Builder::new(&store, Chunking::fixed(1)?);
         let bytes: Vec<u8> = (0..count).map(|at| (at % 251) as u8).collect();
         let file = builder.file_from_bytes(&bytes)?;
         let list = store
             .get(Stored::FileList, &file.hash)?
             .map_or(0, |list| list.len());
-        let request = Request::FileRun {
+        let request = Request::FileBranch {
             file: file.hash,
             start: (count / 2) as u64,
             count: 1,

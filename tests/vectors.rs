@@ -12,9 +12,9 @@
 mod support;
 
 use scionic_merkletree::{
-    export, file_of, file_run_frame, folder_of, folder_run_frame, lookup, record_of, serve,
-    Builder, Cutting, Entry, ExtraData, FileList, FileRun, FolderList, FolderRun, Frame, Hash,
-    MemoryStore, PieceRef, Record, Request, Responder, Root, Target,
+    export, file_branch_frame, file_of, folder_branch_frame, folder_of, lookup, record_of, serve,
+    Builder, ChunkRef, Chunking, Entry, ExtraData, FileBranch, FileList, FolderBranch, FolderList,
+    Frame, Hash, MemoryStore, Record, Request, Responder, Root, Target,
 };
 use std::path::{Path, PathBuf};
 use support::bytes;
@@ -166,9 +166,9 @@ struct Tree {
 }
 
 /// Builds one tree, and writes down every byte of it.
-fn tree(name: &str, cutting: &str, record_extra: &[(&str, &str)], top: Json) -> (Json, Tree) {
+fn tree(name: &str, chunking: &str, record_extra: &[(&str, &str)], top: Json) -> (Json, Tree) {
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, Cutting::from_tag(cutting.as_bytes()).unwrap());
+    let mut builder = Builder::new(&store, Chunking::from_tag(chunking.as_bytes()).unwrap());
     let target = build_node(&mut builder, &top);
     let mut extra = ExtraData::new();
     for (name, value) in record_extra {
@@ -178,10 +178,10 @@ fn tree(name: &str, cutting: &str, record_extra: &[(&str, &str)], top: Json) -> 
     let record = record_of(&store, &root).unwrap();
     let totals = record.totals();
 
-    // The tree as one stream gives every list and piece once, parents first.
+    // The tree as one stream gives every list and chunk once, parents first.
     let mut bundle = Vec::new();
     export(&store, &root, &mut bundle).unwrap();
-    let (mut lists, mut pieces) = (Vec::new(), Vec::new());
+    let (mut lists, mut chunks) = (Vec::new(), Vec::new());
     let mut at = 8;
     while at < bundle.len() {
         let length = u32::from_be_bytes(bundle[at..at + 4].try_into().unwrap()) as usize;
@@ -197,7 +197,7 @@ fn tree(name: &str, cutting: &str, record_extra: &[(&str, &str)], top: Json) -> 
                 ("folder", *list.hash(), list.size())
             }
             0x25 => {
-                pieces.push(object(vec![
+                chunks.push(object(vec![
                     ("hash", text(Hash::of(&frame[1..]).to_hex())),
                     ("length", number(frame.len() as u64 - 1)),
                 ]));
@@ -214,7 +214,7 @@ fn tree(name: &str, cutting: &str, record_extra: &[(&str, &str)], top: Json) -> 
     }
     let described = object(vec![
         ("name", text(name)),
-        ("cutting", text(cutting)),
+        ("chunking", text(chunking)),
         (
             "extra",
             object(
@@ -229,11 +229,11 @@ fn tree(name: &str, cutting: &str, record_extra: &[(&str, &str)], top: Json) -> 
         ("root_hash", text(root.as_hash().to_hex())),
         ("record", hex(&record.encode())),
         ("size", number(record.top().size)),
-        ("pieces", number(totals.pieces)),
-        ("piece_bytes", number(totals.piece_bytes)),
+        ("chunks", number(totals.chunks)),
+        ("chunk_bytes", number(totals.chunk_bytes)),
         ("list_bytes", number(totals.list_bytes)),
         ("lists", Json::Array(lists)),
-        ("piece_list", Json::Array(pieces)),
+        ("chunk_list", Json::Array(chunks)),
         ("bundle_length", number(bundle.len() as u64)),
         ("bundle_sha256", text(Hash::of(&bundle).to_hex())),
     ]);
@@ -347,14 +347,14 @@ impl Refused {
         self.add("file-list", what, bytes, Vec::new(), refused);
     }
 
-    /// A file's list that is well formed, and does not fit a way of cutting.
-    fn file_list_cut(&mut self, what: &str, cutting: &str, bytes: &[u8]) {
+    /// A file's list that is well formed, and does not fit a way of chunking.
+    fn file_list_chunking(&mut self, what: &str, chunking: &str, bytes: &[u8]) {
         let list = FileList::decode(bytes).unwrap();
         let refused = list
-            .check_cutting(Cutting::from_tag(cutting.as_bytes()).unwrap())
+            .check_chunking(Chunking::from_tag(chunking.as_bytes()).unwrap())
             .is_err();
-        let more = vec![("cutting", text(cutting))];
-        self.add("file-list-cut", what, bytes, more, refused);
+        let more = vec![("chunking", text(chunking))];
+        self.add("file-list-chunking", what, bytes, more, refused);
     }
 
     fn folder_list(&mut self, what: &str, bytes: &[u8]) {
@@ -362,25 +362,25 @@ impl Refused {
         self.add("folder-list", what, bytes, Vec::new(), refused);
     }
 
-    fn file_run(&mut self, what: &str, against: &Target, bytes: &[u8]) {
-        let refused = FileRun::decode(bytes)
-            .and_then(|run| run.check(against, None))
+    fn file_branch(&mut self, what: &str, against: &Target, bytes: &[u8]) {
+        let refused = FileBranch::decode(bytes)
+            .and_then(|branch| branch.check(against, None))
             .is_err();
         let more = vec![("against", target_json(against))];
-        self.add("file-run", what, bytes, more, refused);
+        self.add("file-branch", what, bytes, more, refused);
     }
 
-    fn folder_run(&mut self, what: &str, against: &Target, bytes: &[u8]) {
-        let refused = FolderRun::decode(bytes)
-            .and_then(|run| run.check(against))
+    fn folder_branch(&mut self, what: &str, against: &Target, bytes: &[u8]) {
+        let refused = FolderBranch::decode(bytes)
+            .and_then(|branch| branch.check(against))
             .is_err();
         let more = vec![("against", target_json(against))];
-        self.add("folder-run", what, bytes, more, refused);
+        self.add("folder-branch", what, bytes, more, refused);
     }
 
     fn folder_name(&mut self, what: &str, against: &Target, name: &str, bytes: &[u8]) {
-        let refused = FolderRun::decode(bytes)
-            .and_then(|run| run.check_name(against, name).map(|_| ()))
+        let refused = FolderBranch::decode(bytes)
+            .and_then(|branch| branch.check_name(against, name).map(|_| ()))
             .is_err();
         let more = vec![("against", target_json(against)), ("name", text(name))];
         self.add("folder-name", what, bytes, more, refused);
@@ -420,7 +420,7 @@ fn sample_top() -> Json {
         Json::Array(vec![
             folder(
                 "data",
-                vec![file("exactly-two-pieces.bin", vec![part("two", 32)])],
+                vec![file("exactly-two-chunks.bin", vec![part("two", 32)])],
             ),
             file("empty.bin", Vec::new()),
             folder("nothing-here", Vec::new()),
@@ -454,22 +454,22 @@ fn sample_top() -> Json {
 fn manifest() -> Json {
     let top_file = |parts: Vec<Json>| object(vec![("file", Json::Array(parts))]);
     let (mut trees, mut built) = (Vec::new(), Vec::new());
-    for (name, cutting, extra, top) in [
+    for (name, chunking, extra, top) in [
         ("empty-file", "fixed-16", vec![], top_file(Vec::new())),
         (
-            "one-piece",
+            "one-chunk",
             "fixed-16",
             vec![],
             top_file(vec![part("one", 5)]),
         ),
         (
-            "three-pieces",
+            "three-chunks",
             "fixed-16",
             vec![],
             top_file(vec![part("three", 40)]),
         ),
         (
-            "a-piece-twice",
+            "a-chunk-twice",
             "fixed-16",
             vec![],
             top_file(vec![part("x", 16), part("y", 16), part("x", 16)]),
@@ -487,13 +487,13 @@ fn manifest() -> Json {
             sample_top(),
         ),
         (
-            "cut-by-content",
+            "chunked-by-content",
             "fastcdc-v1",
             vec![],
             top_file(vec![part("scionic-fastcdc-v1:corpus:random_3mib", 3 << 20)]),
         ),
     ] {
-        let (described, tree) = tree(name, cutting, &extra, top);
+        let (described, tree) = tree(name, chunking, &extra, top);
         trees.push(described);
         built.push(tree);
     }
@@ -506,33 +506,36 @@ fn manifest() -> Json {
     let top_list = folder_of(&sample.store, &top).unwrap();
 
     // Parts of the sample folder, as they are shown.
-    let mut runs = Vec::new();
+    let mut branches = Vec::new();
     for (start, end) in [(0, 1), (0, 63), (62, 63), (6, 28), (31, 33)] {
-        let run = model_list.open(start, end).unwrap();
-        runs.push(object(vec![
+        let branch = model_list.open(start, end).unwrap();
+        branches.push(object(vec![
             ("tree", text("folder")),
             ("path", text("weights/model.bin")),
             ("of", target_json(&model)),
             ("start", number(start)),
             ("end", number(end)),
-            ("starts_at_byte", number(run.check(&model, None).unwrap())),
-            ("frame", hex(&file_run_frame(&run))),
+            (
+                "starts_at_byte",
+                number(branch.check(&model, None).unwrap()),
+            ),
+            ("frame", hex(&file_branch_frame(&branch))),
         ]));
     }
     for (path, start, end) in [("", 0, 5), ("", 2, 3), ("", 4, 5), ("weights", 0, 2)] {
         let of = at(sample, path);
-        let run = folder_of(&sample.store, &of)
+        let branch = folder_of(&sample.store, &of)
             .unwrap()
             .open(start, end)
             .unwrap();
-        run.check(&of).unwrap();
-        runs.push(object(vec![
+        branch.check(&of).unwrap();
+        branches.push(object(vec![
             ("tree", text("folder")),
             ("path", text(path)),
             ("of", target_json(&of)),
             ("start", number(start)),
             ("end", number(end)),
-            ("frame", hex(&folder_run_frame(&run))),
+            ("frame", hex(&folder_branch_frame(&branch))),
         ]));
     }
 
@@ -549,24 +552,24 @@ fn manifest() -> Json {
         ("nothing-here", "anything"),
     ] {
         let of = at(sample, path);
-        let run = folder_of(&sample.store, &of)
+        let branch = folder_of(&sample.store, &of)
             .unwrap()
             .open_name(name)
             .unwrap();
-        let found = run.check_name(&of, name).unwrap().is_some();
+        let found = branch.check_name(&of, name).unwrap().is_some();
         names.push(object(vec![
             ("tree", text("folder")),
             ("path", text(path)),
             ("of", target_json(&of)),
             ("name", text(name)),
             ("found", Json::Bool(found)),
-            ("frame", hex(&folder_run_frame(&run))),
+            ("frame", hex(&folder_branch_frame(&branch))),
         ]));
     }
 
     // Every kind of request, and what the sample's holder answers.
     let unknown = Hash::of(b"nobody holds this");
-    let readme_piece = file_of(&sample.store, &at(sample, "readme.txt"))
+    let readme_chunk = file_of(&sample.store, &at(sample, "readme.txt"))
         .unwrap()
         .items()[0]
         .hash;
@@ -575,7 +578,7 @@ fn manifest() -> Json {
         ("the top folder's list", Request::Folder(top.hash)),
         (
             "two entries of weights, from the second",
-            Request::FolderRun {
+            Request::FolderBranch {
                 folder: weights.hash,
                 start: 1,
                 count: 2,
@@ -591,14 +594,14 @@ fn manifest() -> Json {
         ("a file's list", Request::File(shard_b.hash)),
         (
             "four items of a file's list, from the fourth",
-            Request::FileRun {
+            Request::FileBranch {
                 file: model.hash,
                 start: 3,
                 count: 4,
             },
         ),
         (
-            "the run that holds 40 bytes of a file, from byte 100",
+            "the branch that holds 40 bytes of a file, from byte 100",
             Request::FileBytes {
                 file: model.hash,
                 offset: 100,
@@ -606,19 +609,19 @@ fn manifest() -> Json {
             },
         ),
         (
-            "ten pieces of a file that has three",
-            Request::Pieces {
+            "ten chunks of a file that has three",
+            Request::Chunks {
                 file: shard_b.hash,
                 start: 0,
                 count: 10,
             },
         ),
-        ("one piece", Request::Piece(readme_piece)),
-        ("which pieces of a file are held", Request::Have(model.hash)),
+        ("one chunk", Request::Chunk(readme_chunk)),
+        ("which chunks of a file are held", Request::Have(model.hash)),
         ("a file that is not held", Request::File(unknown)),
         (
-            "pieces beyond a file's last",
-            Request::Pieces {
+            "chunks beyond a file's last",
+            Request::Chunks {
                 file: shard_b.hash,
                 start: 3,
                 count: 1,
@@ -658,15 +661,15 @@ fn manifest() -> Json {
     let record = record_of(&sample.store, &sample.root).unwrap();
     let honest = record.encode();
     let totals = record.totals();
-    let right = [totals.pieces, totals.piece_bytes, totals.list_bytes];
-    let cut = extra_raw(&[(b"chunking", b"fixed-16")]);
+    let right = [totals.chunks, totals.chunk_bytes, totals.list_bytes];
+    let chunking = extra_raw(&[(b"chunking", b"fixed-16")]);
     let mut changed = honest.clone();
     changed[0] = 0x21;
     refused.record("another first byte", &changed);
     refused.record("a byte after its end", &[honest.clone(), vec![0]].concat());
     refused.record("cut short by a byte", &honest[..honest.len() - 1]);
     refused.record(
-        "it does not say how the tree was cut",
+        "it does not say how the tree was chunked",
         &record_raw(2, &top, right, &extra_raw(&[])),
     );
     for tag in [
@@ -678,25 +681,25 @@ fn manifest() -> Json {
         "",
     ] {
         refused.record(
-            &format!("a way of cutting that is not known: {tag:?}"),
+            &format!("a way of chunking that is not known: {tag:?}"),
             &record_raw(2, &top, right, &extra_raw(&[(b"chunking", tag.as_bytes())])),
         );
     }
     refused.record(
         "a kind that is neither a file nor a folder",
-        &record_raw(3, &top, right, &cut),
+        &record_raw(3, &top, right, &chunking),
     );
     refused.record(
-        "more pieces than piece bytes",
-        &record_raw(2, &top, [right[1] + 1, right[1], right[2] * 40], &cut),
+        "more chunks than chunk bytes",
+        &record_raw(2, &top, [right[1] + 1, right[1], right[2] * 40], &chunking),
     );
     refused.record(
-        "more piece bytes than the tree's size",
-        &record_raw(2, &top, [right[0], top.size + 1, right[2]], &cut),
+        "more chunk bytes than the tree's size",
+        &record_raw(2, &top, [right[0], top.size + 1, right[2]], &chunking),
     );
     refused.record(
-        "fewer list bytes than 36 a piece",
-        &record_raw(2, &top, [right[0], right[1], right[0] * 36 - 1], &cut),
+        "fewer list bytes than 36 a chunk",
+        &record_raw(2, &top, [right[0], right[1], right[0] * 36 - 1], &chunking),
     );
     refused.record(
         "extra values out of order",
@@ -732,25 +735,25 @@ fn manifest() -> Json {
         bytes
     };
     refused.file_list("35 bytes", &item("a", 16)[..35]);
-    refused.file_list("a piece of no bytes", &item("a", 0));
-    refused.file_list("a piece of more than 8 MiB", &item("a", (8 << 20) + 1));
-    refused.file_list_cut(
-        "a piece in the middle that is shorter than the tree's pieces",
+    refused.file_list("a chunk of no bytes", &item("a", 0));
+    refused.file_list("a chunk of more than 8 MiB", &item("a", (8 << 20) + 1));
+    refused.file_list_chunking(
+        "a chunk in the middle that is shorter than the tree's chunks",
         "fixed-16",
         &[item("a", 16), item("b", 9), item("c", 16)].concat(),
     );
-    refused.file_list_cut(
-        "a last piece that is longer than the tree's pieces",
+    refused.file_list_chunking(
+        "a last chunk that is longer than the tree's chunks",
         "fixed-16",
         &[item("a", 16), item("b", 17)].concat(),
     );
-    refused.file_list_cut(
-        "a piece that is not the last and holds exactly 512 KiB",
+    refused.file_list_chunking(
+        "a chunk that is not the last and holds exactly 512 KiB",
         "fastcdc-v1",
         &[item("a", 512 << 10), item("b", 1)].concat(),
     );
-    refused.file_list_cut(
-        "small pieces in a tree that is cut by content",
+    refused.file_list_chunking(
+        "small chunks in a tree that is chunked by content",
         "fastcdc-v1",
         &[item("a", 16), item("b", 16)].concat(),
     );
@@ -779,59 +782,65 @@ fn manifest() -> Json {
     let whole = entries(&[b"a", b"b"]);
     refused.folder_list("cut short by a byte", &whole[..whole.len() - 1]);
 
-    let run = model_list.open(6, 9).unwrap().encode();
+    let branch = model_list.open(6, 9).unwrap().encode();
     assert_eq!(
-        FileRun::decode(&run).unwrap().check(&model, None).unwrap(),
+        FileBranch::decode(&branch)
+            .unwrap()
+            .check(&model, None)
+            .unwrap(),
         96
     );
     let with = |at: usize, by: u8| {
-        let mut forged = run.clone();
+        let mut forged = branch.clone();
         forged[at] = forged[at].wrapping_add(by);
         forged
     };
-    refused.file_run("under a count that is one more", &model, &with(7, 1));
-    refused.file_run("at a place that is one further", &model, &with(15, 1));
-    refused.file_run("an item with another length", &model, &with(20 + 35, 1));
-    refused.file_run("an item with another hash", &model, &with(20, 1));
-    refused.file_run(
+    refused.file_branch("under a count that is one more", &model, &with(7, 1));
+    refused.file_branch("at a place that is one further", &model, &with(15, 1));
+    refused.file_branch("an item with another length", &model, &with(20 + 35, 1));
+    refused.file_branch("an item with another hash", &model, &with(20, 1));
+    refused.file_branch(
         "a carried node with another size",
         &model,
-        &with(run.len() - 1, 1),
+        &with(branch.len() - 1, 1),
     );
     let carried_at = 20 + 3 * 36;
-    let carried = u16::from_be_bytes([run[carried_at], run[carried_at + 1]]);
+    let carried = u16::from_be_bytes([branch[carried_at], branch[carried_at + 1]]);
     let recount = |count: u16, bytes: &[u8]| {
         let mut forged = bytes.to_vec();
         forged[carried_at..carried_at + 2].copy_from_slice(&count.to_be_bytes());
         forged
     };
-    refused.file_run(
+    refused.file_branch(
         "a carried node left out",
         &model,
-        &recount(carried - 1, &run[..run.len() - 40]),
+        &recount(carried - 1, &branch[..branch.len() - 40]),
     );
-    refused.file_run(
+    refused.file_branch(
         "a carried node too many",
         &model,
-        &recount(carried + 1, &[&run[..], &run[run.len() - 40..]].concat()),
+        &recount(
+            carried + 1,
+            &[&branch[..], &branch[branch.len() - 40..]].concat(),
+        ),
     );
-    let mut nothing = run[..16].to_vec();
+    let mut nothing = branch[..16].to_vec();
     nothing.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-    refused.file_run("a run that shows nothing", &model, &nothing);
-    refused.file_run("a run of another file", &shard_b, &run);
-    refused.file_run("a file's run held against a folder", &weights, &run);
+    refused.file_branch("a branch that shows nothing", &model, &nothing);
+    refused.file_branch("a branch of another file", &shard_b, &branch);
+    refused.file_branch("a file's branch held against a folder", &weights, &branch);
 
     let shown = top_list.open(2, 3).unwrap().encode();
-    FolderRun::decode(&shown).unwrap().check(&top).unwrap();
+    FolderBranch::decode(&shown).unwrap().check(&top).unwrap();
     let mut other_kind = shown.clone();
     other_kind[20] = 1;
-    refused.folder_run("a folder shown as a file", &top, &other_kind);
+    refused.folder_branch("a folder shown as a file", &top, &other_kind);
     let mut other_name = shown.clone();
     other_name[20 + 43] ^= 1;
-    refused.folder_run("an entry with another name", &top, &other_name);
-    refused.folder_run("a run of another folder", &weights, &shown);
-    refused.folder_run(
-        "an empty folder's run for a folder that has entries",
+    refused.folder_branch("an entry with another name", &top, &other_name);
+    refused.folder_branch("a branch of another folder", &weights, &shown);
+    refused.folder_branch(
+        "an empty folder's branch for a folder that has entries",
         &top,
         &[0; 22],
     );
@@ -842,13 +851,13 @@ fn manifest() -> Json {
     assert_eq!(shown[first_name_at..first_name_at + 2], [0, 0]);
     let mut named = shown.clone();
     named.splice(first_name_at..first_name_at + 2, [0, 1, b'a']);
-    refused.folder_run(
+    refused.folder_branch(
         "a name for the carried node that begins the list",
         &top,
         &named,
     );
     let from_the_start = top_list.open(0, 1).unwrap().encode();
-    FolderRun::decode(&from_the_start)
+    FolderBranch::decode(&from_the_start)
         .unwrap()
         .check(&top)
         .unwrap();
@@ -860,7 +869,7 @@ fn manifest() -> Json {
     assert!(name_len > 0);
     let mut nameless = from_the_start.clone();
     nameless.splice(name_at..name_at + 2 + name_len, [0, 0]);
-    refused.folder_run(
+    refused.folder_branch(
         "no name for a carried node that is not the one that begins the list",
         &top,
         &nameless,
@@ -918,7 +927,7 @@ fn manifest() -> Json {
     refused.frame("a refusal that says nothing", &[0x27]);
     refused.frame("a refusal for no reason that there is", &[0x27, 0]);
     refused.frame("a refusal for a reason that there is not", &[0x27, 3]);
-    refused.frame("a piece of no bytes", &[0x25]);
+    refused.frame("a chunk of no bytes", &[0x25]);
 
     let spelled = sample.root.to_text();
     refused.root("in capital letters", &spelled.to_uppercase());
@@ -943,7 +952,7 @@ fn manifest() -> Json {
             ),
         ),
         ("trees", Json::Array(trees)),
-        ("runs", Json::Array(runs)),
+        ("branches", Json::Array(branches)),
         ("names", Json::Array(names)),
         ("answers", Json::Array(answers)),
         ("connection", connection),
@@ -956,11 +965,11 @@ fn the_shared_vectors_are_what_the_library_makes() {
     check_or_write(&spec("vectors/manifest.json"), &manifest());
 }
 
-/// The cutting vectors also say what each file hashes to. That follows from
-/// its pieces' hashes and lengths alone, so it is worked out from them here.
-/// `tests/fastcdc_vectors.rs` cuts the real bytes and holds them to it.
+/// The chunking vectors also say what each file hashes to. That follows from
+/// its chunks' hashes and lengths alone, so it is worked out from them here.
+/// `tests/fastcdc_vectors.rs` chunks the real bytes and holds them to it.
 #[test]
-fn the_cutting_vectors_say_what_each_file_hashes_to() {
+fn the_chunking_vectors_say_what_each_file_hashes_to() {
     let path = spec("fastcdc-vectors/manifest.json");
     let mut manifest = Json::parse(&std::fs::read(&path).unwrap());
     let mut cases = Vec::new();
@@ -974,14 +983,14 @@ fn the_cutting_vectors_say_what_each_file_hashes_to() {
             .zip(case.get("chunk_sha256").items())
         {
             let end = as_number(end);
-            items.push(PieceRef {
+            items.push(ChunkRef {
                 hash: Hash::from_hex(hash.text()).unwrap(),
                 length: (end - start) as u32,
             });
             start = end;
         }
         let list = FileList::new(items).unwrap();
-        list.check_cutting(Cutting::FastCdcV1).unwrap();
+        list.check_chunking(Chunking::FastCdcV1).unwrap();
         let mut kept = Vec::new();
         for (name, value) in case.members() {
             // What the layout before this one said of a case is left out.

@@ -1,17 +1,17 @@
-//! fastcdc-v1: cutting a file into pieces by its content (FastCDC, Xia et al.
-//! 2016). It is the way a tree's files are cut. This code and the vectors
+//! fastcdc-v1: chunking a file by its content (FastCDC, Xia et al.
+//! 2016). It is the way a tree's files are chunked. This code and the vectors
 //! under `spec/fastcdc-vectors` define its exact bytes.
 //!
-//! Cutting at a fixed size ([`Cutting::Fixed`]) is there for tests. A tree
+//! Chunking at a fixed size ([`Chunking::Fixed`]) is there for tests. A tree
 //! says in its record which of the two it used, and every file in it is held
 //! to that when the tree is checked.
 //!
 //! Every constant in this file is frozen as fastcdc-v1. A change to a size, a
-//! mask, a gear entry or the boundary loop would be another way of cutting
+//! mask, a gear entry or the boundary loop would be another way of chunking
 //! under another name, never a change to this one: two builders give the same
 //! file the same hash only when both cut at the same bytes.
 
-use crate::format::Cutting;
+use crate::format::Chunking;
 use crate::{Error, Result};
 
 /// Cut-point skipping floor: no boundary test runs inside the first
@@ -256,44 +256,44 @@ fn fastcdc_boundary_plain(data: &[u8]) -> usize {
     limit
 }
 
-impl Cutting {
-    /// Cuts `data` into pieces. The pieces are parts of `data`, in order, and
-    /// nothing is copied. No bytes give no pieces.
+impl Chunking {
+    /// Cuts `data` into chunks. The chunks are parts of `data`, in order, and
+    /// nothing is copied. No bytes give no chunks.
     ///
     /// A caller that holds a file in memory cuts it with this, so that every
     /// builder cuts the same bytes at the same places.
     pub fn cut(self, data: &[u8]) -> Vec<&[u8]> {
         match self {
-            Cutting::Fixed(size) => data.chunks(size.get() as usize).collect(),
-            Cutting::FastCdcV1 => {
-                let mut pieces = Vec::with_capacity(data.len() / FASTCDC_TARGET_SIZE + 1);
+            Chunking::Fixed(size) => data.chunks(size.get() as usize).collect(),
+            Chunking::FastCdcV1 => {
+                let mut chunks = Vec::with_capacity(data.len() / FASTCDC_TARGET_SIZE + 1);
                 let mut offset = 0;
                 while offset < data.len() {
                     let cut = fastcdc_boundary(&data[offset..]);
-                    pieces.push(&data[offset..offset + cut]);
+                    chunks.push(&data[offset..offset + cut]);
                     offset += cut;
                 }
-                pieces
+                chunks
             }
         }
     }
 }
 
-/// What a cutter's window holds when it starts on its first stream. The
+/// What a chunker's window holds when it starts on its first stream. The
 /// window grows only as a stream turns out to be longer, so a small file
 /// never costs a large window.
 const WINDOW_START: usize = 64 * 1024;
 
-/// The most pieces of a fixed size that are handed on at a time.
-const FIXED_PIECES_AT_A_TIME: usize = 1024;
+/// The most chunks of a fixed size that are handed on at a time.
+const FIXED_CHUNKS_AT_A_TIME: usize = 1024;
 
-/// Cuts a stream into pieces, holding a window of it and no more. One cutter
+/// Cuts a stream into chunks, holding a window of it and no more. One chunker
 /// serves many files, one after another, with the same window.
-pub(crate) struct StreamCutter {
+pub(crate) struct StreamChunker {
     window: Vec<u8>,
 }
 
-impl StreamCutter {
+impl StreamChunker {
     pub(crate) fn new() -> Self {
         Self { window: Vec::new() }
     }
@@ -305,37 +305,37 @@ impl StreamCutter {
         self.window
             .try_reserve_exact(more)
             .map_err(|_| Error::AllocationFailed {
-                resource: "the cutting window",
+                resource: "the chunking window",
                 requested: length as u64,
             })?;
         self.window.resize(length, 0);
         Ok(())
     }
 
-    /// Reads with `read` until it gives no more bytes, and hands the pieces
-    /// to `on_pieces` in order: each time, all the pieces that the window
-    /// holds whole. The pieces are lent only for the call.
+    /// Reads with `read` until it gives no more bytes, and hands the chunks
+    /// to `on_chunks` in order: each time, all the chunks that the window
+    /// holds whole. The chunks are lent only for the call.
     ///
     /// `room` is the most bytes the window may hold. It always holds one
-    /// piece of the longest kind; with more room, more pieces are handed on
+    /// chunk of the longest kind; with more room, more chunks are handed on
     /// at a time, and fewer bytes are moved to make room for the next ones.
     ///
-    /// The windowing rule: where a piece ends is settled only once the window
-    /// holds [`FASTCDC_MAX_SIZE`] bytes from the piece's start, or the input
-    /// has ended. That is what makes cutting a stream the same as cutting
+    /// The windowing rule: where a chunk ends is settled only once the window
+    /// holds [`FASTCDC_MAX_SIZE`] bytes from the chunk's start, or the input
+    /// has ended. That is what makes chunking a stream the same as chunking
     /// the whole of it at once.
     pub(crate) fn cut(
         &mut self,
-        cutting: Cutting,
+        chunking: Chunking,
         room: usize,
         mut read: impl FnMut(&mut [u8]) -> Result<usize>,
-        mut on_pieces: impl FnMut(&[&[u8]]) -> Result<()>,
+        mut on_chunks: impl FnMut(&[&[u8]]) -> Result<()>,
     ) -> Result<()> {
-        let (longest, room) = match cutting {
-            Cutting::FastCdcV1 => (FASTCDC_MAX_SIZE, room.max(FASTCDC_MAX_SIZE)),
-            Cutting::Fixed(size) => {
+        let (longest, room) = match chunking {
+            Chunking::FastCdcV1 => (FASTCDC_MAX_SIZE, room.max(FASTCDC_MAX_SIZE)),
+            Chunking::Fixed(size) => {
                 let size = size.get() as usize;
-                let most = size.saturating_mul(FIXED_PIECES_AT_A_TIME);
+                let most = size.saturating_mul(FIXED_CHUNKS_AT_A_TIME);
                 (size, room.min(most).max(size))
             }
         };
@@ -360,22 +360,22 @@ impl StreamCutter {
                 }
             }
             let window = &self.window[..filled];
-            let mut pieces: Vec<&[u8]> = Vec::new();
+            let mut chunks: Vec<&[u8]> = Vec::new();
             let mut start = 0_usize;
             while start < filled {
                 let rest = &window[start..];
                 if !ended && rest.len() < longest {
                     break; // not settled: fill the window again first
                 }
-                let cut = match cutting {
-                    Cutting::FastCdcV1 => fastcdc_boundary(rest),
-                    Cutting::Fixed(_) => rest.len().min(longest),
+                let cut = match chunking {
+                    Chunking::FastCdcV1 => fastcdc_boundary(rest),
+                    Chunking::Fixed(_) => rest.len().min(longest),
                 };
-                pieces.push(&rest[..cut]);
+                chunks.push(&rest[..cut]);
                 start += cut;
             }
-            if !pieces.is_empty() {
-                on_pieces(&pieces)?;
+            if !chunks.is_empty() {
+                on_chunks(&chunks)?;
             }
             self.window.copy_within(start..filled, 0);
             filled -= start;
@@ -458,8 +458,8 @@ mod tests {
     #[test]
     fn cut_bounds_and_determinism() {
         let data = corpus_bytes("scionic-fastcdc-v1:test:bounds", 40 << 20);
-        let first = Cutting::FastCdcV1.cut(&data);
-        let second = Cutting::FastCdcV1.cut(&data);
+        let first = Chunking::FastCdcV1.cut(&data);
+        let second = Chunking::FastCdcV1.cut(&data);
         assert_eq!(first, second, "two cuts of identical data must agree");
         assert!(!first.is_empty());
         let mut total = 0_usize;
@@ -486,7 +486,7 @@ mod tests {
     }
 
     /// Returns data in awkward partial reads to exercise every refill path
-    /// of the streaming cutter.
+    /// of the streaming chunker.
     struct StutterReader {
         data: Vec<u8>,
         offset: usize,
@@ -522,12 +522,12 @@ mod tests {
             20 << 20,
         ];
         let corpus = corpus_bytes("scionic-fastcdc-v1:test:stream", 20 << 20);
-        let mut cutter = StreamCutter::new();
-        for cutting in [Cutting::FastCdcV1, Cutting::fixed(1 << 20).unwrap()] {
+        let mut chunker = StreamChunker::new();
+        for chunking in [Chunking::FastCdcV1, Chunking::fixed(1 << 20).unwrap()] {
             for length in lengths {
                 let data = &corpus[..length];
                 let expected: Vec<Vec<u8>> =
-                    cutting.cut(data).into_iter().map(<[u8]>::to_vec).collect();
+                    chunking.cut(data).into_iter().map(<[u8]>::to_vec).collect();
                 // The smallest window, one that is filled several times, and
                 // one that the whole stream fits into.
                 for room in [0, 2 * FASTCDC_MAX_SIZE, 5 * FASTCDC_MAX_SIZE + 3] {
@@ -537,20 +537,20 @@ mod tests {
                         offset: 0,
                         step: 64 * 1024 + 17,
                     };
-                    cutter
+                    chunker
                         .cut(
-                            cutting,
+                            chunking,
                             room,
                             |buffer| Ok(reader.read(buffer).unwrap()),
-                            |pieces| {
-                                streamed.extend(pieces.iter().map(|piece| piece.to_vec()));
+                            |chunks| {
+                                streamed.extend(chunks.iter().map(|chunk| chunk.to_vec()));
                                 Ok(())
                             },
                         )
                         .unwrap();
                     assert_eq!(
                         streamed, expected,
-                        "{cutting:?}, length {length}, room {room}: streaming vs slice cutting"
+                        "{chunking:?}, length {length}, room {room}: streaming vs slice chunking"
                     );
                 }
             }
@@ -598,11 +598,11 @@ mod tests {
     fn small_inputs_are_single_chunks() {
         for length in [1, 100, FASTCDC_MIN_SIZE - 1, FASTCDC_MIN_SIZE] {
             let data = corpus_bytes("scionic-fastcdc-v1:test:small", length);
-            let chunks = Cutting::FastCdcV1.cut(&data);
+            let chunks = Chunking::FastCdcV1.cut(&data);
             assert_eq!(chunks.len(), 1, "length {length} must be a single chunk");
             assert_eq!(chunks[0], &data[..]);
         }
-        assert!(Cutting::FastCdcV1.cut(&[]).is_empty());
+        assert!(Chunking::FastCdcV1.cut(&[]).is_empty());
     }
 
     #[test]
@@ -611,7 +611,7 @@ mod tests {
         // cut at the max, with the remainder as the tail. The committed
         // conformance corpus pins zeros_20mib as 8 MiB + 8 MiB + 4 MiB.
         let zeros = vec![0_u8; 20 << 20];
-        let cuts: Vec<usize> = Cutting::FastCdcV1
+        let cuts: Vec<usize> = Chunking::FastCdcV1
             .cut(&zeros)
             .iter()
             .map(|c| c.len())
@@ -619,7 +619,7 @@ mod tests {
         assert_eq!(cuts, [8 << 20, 8 << 20, 4 << 20]);
         let letters = vec![b'a'; 20 << 20];
         let mut total = 0_usize;
-        let letter_chunks = Cutting::FastCdcV1.cut(&letters);
+        let letter_chunks = Chunking::FastCdcV1.cut(&letters);
         for (index, chunk) in letter_chunks.iter().enumerate() {
             assert!(chunk.len() <= FASTCDC_MAX_SIZE);
             if index < letter_chunks.len() - 1 {
@@ -638,12 +638,12 @@ mod tests {
         edited.extend_from_slice(&base[..16 << 20]);
         edited.extend_from_slice(&payload);
         edited.extend_from_slice(&base[16 << 20..]);
-        let base_hashes: BTreeSet<[u8; 32]> = Cutting::FastCdcV1
+        let base_hashes: BTreeSet<[u8; 32]> = Chunking::FastCdcV1
             .cut(&base)
             .iter()
             .map(|chunk| sha256(chunk))
             .collect();
-        let edited_chunks = Cutting::FastCdcV1.cut(&edited);
+        let edited_chunks = Chunking::FastCdcV1.cut(&edited);
         let fresh = edited_chunks
             .iter()
             .filter(|chunk| !base_hashes.contains(&sha256(chunk)))
@@ -660,19 +660,19 @@ mod tests {
     #[test]
     fn mode_cut_semantics_are_canonical() {
         let data: Vec<u8> = (0_u8..10).collect();
-        assert!(Cutting::fixed(4).unwrap().cut(&[]).is_empty());
+        assert!(Chunking::fixed(4).unwrap().cut(&[]).is_empty());
         assert_eq!(
-            Cutting::fixed(4).unwrap().cut(&data),
+            Chunking::fixed(4).unwrap().cut(&data),
             vec![&data[0..4], &data[4..8], &data[8..10]]
         );
         assert_eq!(
-            Cutting::fixed(5).unwrap().cut(&data),
+            Chunking::fixed(5).unwrap().cut(&data),
             vec![&data[0..5], &data[5..10]]
         );
-        assert_eq!(Cutting::fixed(16).unwrap().cut(&data), vec![&data[..]]);
-        assert_eq!(Cutting::FastCdcV1.cut(&data), vec![&data[..]]);
-        assert!(Cutting::fixed(0).is_err());
-        assert!(Cutting::fixed(FASTCDC_MAX_SIZE as u32).is_ok());
-        assert!(Cutting::fixed(FASTCDC_MAX_SIZE as u32 + 1).is_err());
+        assert_eq!(Chunking::fixed(16).unwrap().cut(&data), vec![&data[..]]);
+        assert_eq!(Chunking::FastCdcV1.cut(&data), vec![&data[..]]);
+        assert!(Chunking::fixed(0).is_err());
+        assert!(Chunking::fixed(FASTCDC_MAX_SIZE as u32).is_ok());
+        assert!(Chunking::fixed(FASTCDC_MAX_SIZE as u32 + 1).is_err());
     }
 }

@@ -5,16 +5,16 @@
 //! cargo run --release --example speed -- <MiB> [folder]
 //! ```
 //!
-//! It prints, for a file of that many MiB of bytes that look random: cutting
+//! It prints, for a file of that many MiB of bytes that look random: chunking
 //! alone, hashing alone, building the file into a store in memory, and
-//! checking every piece of it again.
+//! checking every chunk of it again.
 //!
 //! With a folder, it also builds that folder from disk into a store in
 //! memory, and prints the best of five runs: by then the system holds the
 //! files in memory, so it is the library that is measured and not the disk.
 
 use scionic_merkletree::{
-    build, record_of, verify, BuildOptions, Builder, Cutting, ExtraData, Hash, MemoryStore, Stored,
+    build, record_of, verify, BuildOptions, Builder, Chunking, ExtraData, Hash, MemoryStore, Stored,
 };
 use std::time::Instant;
 
@@ -46,20 +46,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data = filler(megabytes << 20);
 
     let started = Instant::now();
-    let pieces = Cutting::FastCdcV1.cut(&data);
-    report("cut", started, data.len());
-    println!("{:<22} {} pieces", "", pieces.len());
+    let chunks = Chunking::FastCdcV1.cut(&data);
+    report("chunked", started, data.len());
+    println!("{:<22} {} chunks", "", chunks.len());
 
     let started = Instant::now();
     let mut mixed = 0_u8;
-    for piece in &pieces {
-        mixed ^= Hash::of(piece).as_bytes()[0];
+    for chunk in &chunks {
+        mixed ^= Hash::of(chunk).as_bytes()[0];
     }
     report("hashed", started, data.len());
 
     let store = MemoryStore::new();
     let started = Instant::now();
-    let mut builder = Builder::new(&store, Cutting::FastCdcV1);
+    let mut builder = Builder::new(&store, Chunking::FastCdcV1);
     let file = builder.file_from_bytes(&data)?;
     report("built", started, data.len());
 

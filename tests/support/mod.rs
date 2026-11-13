@@ -4,7 +4,7 @@ pub mod json;
 pub mod oracle;
 
 use scionic_merkletree::{
-    BuildOptions, Cutting, Error, Hash, MemoryStore, Peer, Responder, Result, Root, Store, Stored,
+    BuildOptions, Chunking, Error, Hash, MemoryStore, Peer, Responder, Result, Root, Store, Stored,
 };
 use std::collections::VecDeque;
 use std::fs;
@@ -69,13 +69,13 @@ pub fn bytes(seed: &str, length: usize) -> Vec<u8> {
     out
 }
 
-/// Cutting into pieces of 16 bytes, so that small files have many pieces.
-pub fn small_pieces() -> Cutting {
-    Cutting::fixed(16).unwrap()
+/// Chunking into chunks of 16 bytes, so that small files have many chunks.
+pub fn small_chunks() -> Chunking {
+    Chunking::fixed(16).unwrap()
 }
 
 pub fn small_options() -> BuildOptions {
-    BuildOptions::new().cutting(small_pieces())
+    BuildOptions::new().chunking(small_chunks())
 }
 
 /// A folder with files of several sizes, a folder inside a folder, an empty
@@ -91,7 +91,7 @@ pub fn sample_folder(parent: &Path, name: &str) -> io::Result<PathBuf> {
     )?;
     write(top.join("weights/shards/a.bin"), &bytes("shard-a", 100))?;
     write(top.join("weights/shards/b.bin"), &bytes("shard-b", 33))?;
-    write(top.join("data/exactly-two-pieces.bin"), &bytes("two", 32))?;
+    write(top.join("data/exactly-two-chunks.bin"), &bytes("two", 32))?;
     fs::create_dir_all(top.join("nothing-here"))?;
     Ok(top)
 }
@@ -100,7 +100,7 @@ pub fn sample_folder(parent: &Path, name: &str) -> io::Result<PathBuf> {
 pub fn contents(store: &MemoryStore) -> Vec<(Stored, Hash, Vec<u8>)> {
     let mut all = Vec::new();
     for kind in [
-        Stored::Piece,
+        Stored::Chunk,
         Stored::FileList,
         Stored::FolderList,
         Stored::Record,
@@ -230,7 +230,7 @@ impl<F: FnMut(&[u8]) -> Vec<Vec<u8>>> Peer for ScriptedPeer<F> {
     }
 }
 
-/// Builds the sample folder into a new store with small pieces.
+/// Builds the sample folder into a new store with small chunks.
 pub fn sample_tree(name: &str) -> (TempDir, MemoryStore, Root) {
     let temp = TempDir::new(name).unwrap();
     let folder = sample_folder(temp.path(), "sample").unwrap();

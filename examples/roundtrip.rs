@@ -51,7 +51,7 @@ impl DirStore {
 
     fn path(&self, kind: Stored, hash: &Hash) -> PathBuf {
         let kind = match kind {
-            Stored::Piece => "pieces",
+            Stored::Chunk => "chunks",
             Stored::FileList => "files",
             Stored::FolderList => "folders",
             Stored::Record => "records",
@@ -102,7 +102,7 @@ impl Store for DirStore {
             failed("read", &path, too_long)
         })?;
         // The bytes are read straight into the memory that is handed out. A
-        // `Vec` that is turned into an `Arc` is copied once more, and a piece
+        // `Vec` that is turned into an `Arc` is copied once more, and a chunk
         // is megabytes long.
         let mut bytes: Arc<[u8]> = std::iter::repeat_n(0, length).collect();
         let room = Arc::get_mut(&mut bytes).expect("nothing else holds what was just made");
@@ -175,13 +175,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     report("built", started, size);
     println!("root         {root}");
     println!(
-        "the tree     {size} bytes; kept once: {} pieces of {} bytes, and {} bytes of lists",
-        totals.pieces, totals.piece_bytes, totals.list_bytes
+        "the tree     {size} bytes; kept once: {} chunks of {} bytes, and {} bytes of lists",
+        totals.chunks, totals.chunk_bytes, totals.list_bytes
     );
 
     let started = Instant::now();
     let summary = verify(&source, &root)?;
-    report("checked", started, totals.piece_bytes);
+    report("checked", started, totals.chunk_bytes);
     println!(
         "             {} different files in {} different folders",
         summary.files, summary.folders
@@ -190,7 +190,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let fetched = DirStore::new(work.join("fetched-store"));
     let started = Instant::now();
     fetch(&fetched, &root, &mut Responder::new(&source))?;
-    report("fetched", started, totals.piece_bytes);
+    report("fetched", started, totals.chunk_bytes);
 
     if let Some(file) = largest_file(&source, record.top())? {
         let length = file.size.min(4096);

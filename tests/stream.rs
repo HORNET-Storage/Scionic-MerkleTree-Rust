@@ -9,7 +9,7 @@ use scionic_merkletree::{
 };
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
-use support::{bytes, contents, pipe, sample_tree, small_pieces, PipeReader, PipeWriter};
+use support::{bytes, contents, pipe, sample_tree, small_chunks, PipeReader, PipeWriter};
 
 /// Counts what a client sends between one flush and the next.
 struct Flights<W> {
@@ -117,7 +117,7 @@ fn requests_are_sent_ahead_of_their_answers_and_never_too_far() {
     // A folder of 150 small files: more lists than one round asks for, and
     // more requests in a round than are sent ahead at once.
     let source = MemoryStore::new();
-    let mut builder = Builder::new(&source, small_pieces());
+    let mut builder = Builder::new(&source, small_chunks());
     let entries: Vec<Entry> = (0..150)
         .map(|index| {
             let file = builder
@@ -140,7 +140,7 @@ fn requests_are_sent_ahead_of_their_answers_and_never_too_far() {
     summary.unwrap();
     assert_eq!(contents(&dest), contents(&source));
 
-    // 1 record, 1 folder, 150 lists and 150 requests for pieces.
+    // 1 record, 1 folder, 150 lists and 150 requests for chunks.
     let sent: usize = flights.iter().sum();
     assert_eq!(sent, (33 + 4) * 152 + (45 + 4) * 150);
     assert!(flights.iter().all(|flight| *flight <= REQUESTS_AHEAD_BYTES));

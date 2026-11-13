@@ -10,7 +10,7 @@ use scionic_merkletree::{
 };
 use std::fs;
 use std::path::Path;
-use support::{bytes, sample_tree, small_options, small_pieces, write, TempDir};
+use support::{bytes, sample_tree, small_chunks, small_options, write, TempDir};
 
 fn entry(name: &str, target: Target) -> Entry {
     Entry::new(name, target, ExtraData::new()).unwrap()
@@ -20,7 +20,7 @@ fn entry(name: &str, target: Target) -> Entry {
 fn a_stretch_is_read_from_an_open_file_without_a_pass_over_its_list() {
     let store = MemoryStore::new();
     let data = bytes("open", 100);
-    let file = Builder::new(&store, small_pieces())
+    let file = Builder::new(&store, small_chunks())
         .file_from_bytes(&data)
         .unwrap();
     let open = OpenFile::new(file_of(&store, &file).unwrap()).unwrap();
@@ -35,16 +35,16 @@ fn a_stretch_is_read_from_an_open_file_without_a_pass_over_its_list() {
     assert!(read_open(&store, &open, 0, 101, &mut out).is_err());
     assert!(read_open(&store, &open, 101, 0, &mut out).is_err());
     assert!(read_open(&store, &open, u64::MAX, 2, &mut out).is_err());
-    // A piece that is missing: an error, and no byte.
-    let piece = open.list().items()[3];
-    store.remove(Stored::Piece, &piece.hash).unwrap();
+    // A chunk that is missing: an error, and no byte.
+    let chunk = open.list().items()[3];
+    store.remove(Stored::Chunk, &chunk.hash).unwrap();
     assert!(matches!(
         read_open(&store, &open, 40, 30, &mut out),
         Err(Error::Missing { .. })
     ));
     assert!(out.is_empty());
     // An empty file has one stretch: none of its bytes, from its start.
-    let empty = Builder::new(&store, small_pieces())
+    let empty = Builder::new(&store, small_chunks())
         .file_from_bytes(b"")
         .unwrap();
     let open = OpenFile::new(file_of(&store, &empty).unwrap()).unwrap();
@@ -57,7 +57,7 @@ fn a_stretch_is_read_from_an_open_file_without_a_pass_over_its_list() {
 fn a_small_tree_that_stands_for_more_folders_than_a_disk_holds_is_not_written() {
     let temp = TempDir::new("read-unfold").unwrap();
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     // An empty folder, and above it 100 folders that each hold the one below
     // under two names.
     let mut folder = builder.folder(Vec::new()).unwrap();
@@ -86,7 +86,7 @@ fn a_small_tree_that_stands_for_more_folders_than_a_disk_holds_is_not_written() 
     assert!(!dest.exists());
 
     // Twenty levels of it are counted exactly: 2^21 - 1 folders.
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let mut folder = builder.folder(Vec::new()).unwrap();
     for _ in 0..20 {
         folder = builder
@@ -131,7 +131,7 @@ fn writing_out_stays_within_what_it_is_given() {
         .unwrap()
         .unwrap()
         .target();
-    let alone = Builder::new(&store, small_pieces())
+    let alone = Builder::new(&store, small_chunks())
         .finish(file, ExtraData::new())
         .unwrap();
     let dest = temp.path().join("alone.bin");
@@ -147,7 +147,7 @@ fn writing_out_stays_within_what_it_is_given() {
 fn every_stretch_of_a_file_reads_back() {
     let store = MemoryStore::new();
     let data = bytes("stretch", 100);
-    let file = Builder::new(&store, small_pieces())
+    let file = Builder::new(&store, small_chunks())
         .file_from_bytes(&data)
         .unwrap();
     for offset in 0..=100_usize {
@@ -166,16 +166,16 @@ fn every_stretch_of_a_file_reads_back() {
 }
 
 #[test]
-fn a_file_with_a_piece_missing_gives_an_error_and_no_bytes() {
+fn a_file_with_a_chunk_missing_gives_an_error_and_no_bytes() {
     let store = MemoryStore::new();
     let data = bytes("holed", 100);
-    let file = Builder::new(&store, small_pieces())
+    let file = Builder::new(&store, small_chunks())
         .file_from_bytes(&data)
         .unwrap();
-    // Piece 3 holds bytes 48 to 63.
-    let piece = file_of(&store, &file).unwrap().items()[3];
-    let honest = store.get(Stored::Piece, &piece.hash).unwrap().unwrap();
-    store.remove(Stored::Piece, &piece.hash).unwrap();
+    // Chunk 3 holds bytes 48 to 63.
+    let chunk = file_of(&store, &file).unwrap().items()[3];
+    let honest = store.get(Stored::Chunk, &chunk.hash).unwrap().unwrap();
+    store.remove(Stored::Chunk, &chunk.hash).unwrap();
 
     let mut out = Vec::new();
     assert!(matches!(
@@ -188,22 +188,22 @@ fn a_file_with_a_piece_missing_gives_an_error_and_no_bytes() {
         assert!(read_range(&store, &file, offset, length, &mut out).is_err());
         assert!(out.is_empty(), "{offset}+{length}");
     }
-    // What does not need the piece is still read.
+    // What does not need the chunk is still read.
     read_range(&store, &file, 0, 48, &mut out).unwrap();
     read_range(&store, &file, 64, 36, &mut out).unwrap();
     assert_eq!(out, [&data[..48], &data[64..]].concat());
 
-    // Other bytes under the piece's hash are no piece of the file.
+    // Other bytes under the chunk's hash are no chunk of the file.
     store
-        .put(Stored::Piece, &piece.hash, &bytes("other", 16))
+        .put(Stored::Chunk, &chunk.hash, &bytes("other", 16))
         .unwrap();
     assert!(matches!(
         read_file_to_vec(&store, &file),
         Err(Error::Corrupt { .. })
     ));
-    store.remove(Stored::Piece, &piece.hash).unwrap();
+    store.remove(Stored::Chunk, &chunk.hash).unwrap();
     store
-        .put(Stored::Piece, &piece.hash, &bytes("other", 5))
+        .put(Stored::Chunk, &chunk.hash, &bytes("other", 5))
         .unwrap();
     let mut out = Vec::new();
     assert!(matches!(
@@ -211,8 +211,8 @@ fn a_file_with_a_piece_missing_gives_an_error_and_no_bytes() {
         Err(Error::SizeMismatch { .. })
     ));
     assert!(out.is_empty());
-    store.remove(Stored::Piece, &piece.hash).unwrap();
-    store.put(Stored::Piece, &piece.hash, &honest).unwrap();
+    store.remove(Stored::Chunk, &chunk.hash).unwrap();
+    store.put(Stored::Chunk, &chunk.hash, &honest).unwrap();
     assert_eq!(read_file_to_vec(&store, &file).unwrap(), data);
 }
 
@@ -289,7 +289,7 @@ fn a_tree_written_to_disk_builds_to_the_same_root() {
         .unwrap()
         .unwrap()
         .target();
-    let alone = Builder::new(&store, small_pieces())
+    let alone = Builder::new(&store, small_chunks())
         .finish(file, ExtraData::new())
         .unwrap();
     let dest_file = temp.path().join("written.bin");
@@ -305,8 +305,8 @@ fn nothing_is_written_when_a_part_is_missing() {
         .unwrap()
         .unwrap()
         .target();
-    let piece = file_of(&store, &shard).unwrap().items()[2];
-    store.remove(Stored::Piece, &piece.hash).unwrap();
+    let chunk = file_of(&store, &shard).unwrap().items()[2];
+    store.remove(Stored::Chunk, &chunk.hash).unwrap();
     let dest = temp.path().join("written");
     assert!(matches!(
         write_to_disk(&store, &root, &dest),
@@ -329,7 +329,7 @@ fn two_names_that_one_system_takes_for_one_are_refused_there() {
     let temp = TempDir::new("read-fold").unwrap();
     let folds = folds_case(temp.path());
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let upper = builder.file_from_bytes(b"under the capital").unwrap();
     let lower = builder.file_from_bytes(b"under the small letter").unwrap();
     let inner = builder.folder(vec![entry("x", upper)]).unwrap();
@@ -348,7 +348,7 @@ fn two_names_that_one_system_takes_for_one_are_refused_there() {
         ),
     ];
     for (case, entries) in cases {
-        let mut builder = Builder::new(&store, small_pieces());
+        let mut builder = Builder::new(&store, small_chunks());
         let top = builder.folder(entries.clone()).unwrap();
         // Held in a tree, the two names are two names.
         let root = builder.finish(top, ExtraData::new()).unwrap();
@@ -431,7 +431,7 @@ fn names_that_windows_cannot_hold_are_found() {
 fn a_name_this_system_cannot_hold_is_refused_before_anything_is_written() {
     let temp = TempDir::new("read-names").unwrap();
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let file = builder.file_from_bytes(b"content").unwrap();
     let inner = builder
         .folder(vec![entry("fine", file), entry("nul.txt", file)])

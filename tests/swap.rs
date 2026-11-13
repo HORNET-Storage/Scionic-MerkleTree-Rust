@@ -8,7 +8,7 @@
 mod support;
 
 use scionic_merkletree::{
-    build, lookup, write_to_disk, Error, Hash, MemoryStore, PieceRef, Result, Store, Stored,
+    build, lookup, write_to_disk, ChunkRef, Error, Hash, MemoryStore, Result, Store, Stored,
 };
 use std::fs;
 use std::path::Path;
@@ -20,7 +20,7 @@ use support::{bytes, small_options, write, TempDir};
 type Trick = Box<dyn FnMut(&[u8]) -> bool + Send>;
 
 /// A store that plays a trick in the middle of the library's work: when the
-/// first piece is put, or when the thing it watches for is asked for.
+/// first chunk is put, or when the thing it watches for is asked for.
 struct Tricky {
     inner: MemoryStore,
     watched: Option<(Stored, Hash)>,
@@ -49,7 +49,7 @@ impl Tricky {
 
 impl Store for Tricky {
     fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
-        if self.watched.is_none() && kind == Stored::Piece {
+        if self.watched.is_none() && kind == Stored::Chunk {
             self.play(bytes);
         }
         self.inner.put(kind, hash, bytes)
@@ -98,9 +98,9 @@ fn link_to_file(link: &Path, to: &Path) -> bool {
     }
 }
 
-fn holds_piece(store: &MemoryStore, bytes: &[u8]) -> bool {
+fn holds_chunk(store: &MemoryStore, bytes: &[u8]) -> bool {
     store
-        .has(Stored::Piece, &PieceRef::of(bytes).unwrap().hash)
+        .has(Stored::Chunk, &ChunkRef::of(bytes).unwrap().hash)
         .unwrap()
 }
 
@@ -123,7 +123,7 @@ fn a_folder_that_becomes_a_link_while_its_folder_is_read_is_not_entered() {
         write(top.join("z-dir/inside"), &bytes("swap-mine", 16)).unwrap();
         let (dir, moved) = (top.join("z-dir"), top.join("moved"));
         let to = temp.path().join("secret");
-        // When the first piece is kept, the folder is given another name,
+        // When the first chunk is kept, the folder is given another name,
         // and its own name is given to a link that leads to the secret.
         let store = Tricky::new(None, move |_| {
             if fs::rename(&dir, &moved).is_ok() {
@@ -133,7 +133,7 @@ fn a_folder_that_becomes_a_link_while_its_folder_is_read_is_not_entered() {
         });
         let result = build(&store, &top, &small_options().workers(threads));
         // Whatever the timing, the secret is not in the tree.
-        assert!(!holds_piece(&store.inner, &secret), "{threads} threads");
+        assert!(!holds_chunk(&store.inner, &secret), "{threads} threads");
         // One thread reads the folder's files before it goes down into the
         // folders, so the link is always there when it does.
         if threads == 1 {
@@ -162,10 +162,10 @@ fn a_file_that_becomes_a_link_while_its_folder_is_read_is_not_read() {
     write(top.join("x"), &x).unwrap();
     write(top.join("y"), &y).unwrap();
     let (x_path, y_path) = (top.join("x"), top.join("y"));
-    // Whichever file is cut first, the other one is swapped for a link to
+    // Whichever file is chunked first, the other one is swapped for a link to
     // the secret before its turn comes.
-    let store = Tricky::new(None, move |piece| {
-        let other = if piece == x.as_slice() {
+    let store = Tricky::new(None, move |chunk| {
+        let other = if chunk == x.as_slice() {
             &y_path
         } else {
             &x_path
@@ -179,7 +179,7 @@ fn a_file_that_becomes_a_link_while_its_folder_is_read_is_not_read() {
         matches!(result, Err(Error::UnsupportedEntry { .. })),
         "{result:?}"
     );
-    assert!(!holds_piece(&store.inner, &secret));
+    assert!(!holds_chunk(&store.inner, &secret));
 }
 
 #[test]
@@ -210,7 +210,7 @@ fn nothing_is_written_through_a_link_that_takes_a_new_folders_place() {
         ("held", (Stored::FolderList, folder.hash)),
         (
             "waiting",
-            (Stored::Piece, PieceRef::of(&last).unwrap().hash),
+            (Stored::Chunk, ChunkRef::of(&last).unwrap().hash),
         ),
     ] {
         let dest = temp.path().join(format!("dest-{moment}"));

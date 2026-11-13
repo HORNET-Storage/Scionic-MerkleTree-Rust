@@ -7,7 +7,7 @@ use scionic_merkletree::{
     Stored,
 };
 use std::fs;
-use support::{bytes, sample_folder, small_options, small_pieces, write, TempDir};
+use support::{bytes, sample_folder, small_chunks, small_options, write, TempDir};
 
 #[test]
 fn each_change_is_listed_once_by_its_path() {
@@ -17,7 +17,7 @@ fn each_change_is_listed_once_by_its_path() {
     let old = build(&store, &folder, &small_options()).unwrap();
     assert_eq!(diff(&store, &old, &old).unwrap(), Vec::new());
 
-    // One piece of a file changes.
+    // One chunk of a file changes.
     let mut model = bytes("model", 1_000);
     model[320..336].copy_from_slice(&bytes("changed", 16));
     write(folder.join("weights/model.bin"), &model).unwrap();
@@ -99,8 +99,8 @@ fn each_change_is_listed_once_by_its_path() {
     for hash in store.hashes(Stored::FileList) {
         store.remove(Stored::FileList, &hash).unwrap();
     }
-    for hash in store.hashes(Stored::Piece) {
-        store.remove(Stored::Piece, &hash).unwrap();
+    for hash in store.hashes(Stored::Chunk) {
+        store.remove(Stored::Chunk, &hash).unwrap();
     }
     assert_eq!(diff(&store, &old, &new).unwrap(), changes);
     // A folder that did change is needed.
@@ -149,12 +149,12 @@ fn extra_data_that_changed_is_a_change() {
 #[test]
 fn trees_with_a_file_on_top_have_no_entries_to_compare() {
     let store = MemoryStore::new();
-    let mut builder = Builder::new(&store, small_pieces());
+    let mut builder = Builder::new(&store, small_chunks());
     let one = builder.file_from_bytes(b"one").unwrap();
     let two = builder.file_from_bytes(b"two").unwrap();
     let folder = builder.folder(Vec::new()).unwrap();
     let finish = |top, extra| {
-        Builder::new(&store, small_pieces())
+        Builder::new(&store, small_chunks())
             .finish(top, extra)
             .unwrap()
     };

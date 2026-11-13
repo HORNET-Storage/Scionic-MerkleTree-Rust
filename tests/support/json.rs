@@ -278,7 +278,7 @@ impl Parser<'_> {
         let mut out = String::new();
         loop {
             // A quote and a backslash are ASCII, and no byte of a longer UTF-8
-            // sequence is, so a run ends on a character boundary.
+            // sequence is, so a branch ends on a character boundary.
             let start = self.at;
             while !matches!(self.peek(), b'"' | b'\\') {
                 self.at += 1;

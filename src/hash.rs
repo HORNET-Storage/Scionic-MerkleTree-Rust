@@ -5,7 +5,7 @@ use crate::{Error, Result};
 use std::fmt;
 use std::str::FromStr;
 
-/// A SHA-256 hash: of a piece's bytes, or of the bytes that describe a file,
+/// A SHA-256 hash: of a chunk's bytes, or of the bytes that describe a file,
 /// a folder or a tree.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Hash([u8; 32]);

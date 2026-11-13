@@ -1,10 +1,10 @@
-//! Syncing by file hash and piece number.
+//! Syncing by file hash and chunk number.
 //!
 //! * A [`Responder`] answers a receiver's requests from a store.
 //! * [`fetch`] takes a whole tree from a peer into a store, from the top
 //!   down, and skips whatever the store holds already.
 //! * A [`Remote`] reads parts of a tree straight from a peer: one name in a
-//!   folder, a run of entries, or a stretch of a file's bytes. It needs no
+//!   folder, a branch of entries, or a stretch of a file's bytes. It needs no
 //!   store, and takes nothing but the parts it is asked for.
 //! * [`export`] and [`import`] carry a whole tree as one stream of frames.
 //! * [`serve`] answers requests on a connection, and a [`StreamPeer`] asks
@@ -19,18 +19,18 @@
 
 use crate::fastcdc::FASTCDC_MIN_SIZE;
 use crate::format::{
-    check_name, Cutting, Entry, FileList, FolderRun, Kind, OpenFile, OpenFolder, Record, Target,
-    LIST_ITEM_BYTES, MAX_CARRIED_NODES, MAX_ENTRY_BYTES, MAX_FOLDER_DEPTH, MAX_NAME_BYTES,
+    check_name, Chunking, Entry, FileList, FolderBranch, Kind, OpenFile, OpenFolder, Record,
+    Target, LIST_ITEM_BYTES, MAX_CARRIED_NODES, MAX_ENTRY_BYTES, MAX_FOLDER_DEPTH, MAX_NAME_BYTES,
     MAX_RECORD_BYTES,
 };
 use crate::hash::{Hash, Root};
 use crate::intake::{Arrived, Intake, Summary};
 use crate::read::{file_of, folder_of, record_of};
-use crate::store::{check_piece, damaged, load_piece, missing, Store, Stored};
+use crate::store::{check_chunk, damaged, load_chunk, missing, Store, Stored};
 use crate::wire::{
-    file_list_frame, file_run_frame, folder_list_frame, folder_run_frame, have_frame, piece_frame,
-    read_frame, read_next, refused_frame, write_end, write_frame, Frame, HaveMap, Next, Refusal,
-    Request, BUNDLE_MAGIC, FRAME_REFUSED, MAX_REQUEST_BYTES,
+    chunk_frame, file_branch_frame, file_list_frame, folder_branch_frame, folder_list_frame,
+    have_frame, read_frame, read_next, refused_frame, write_end, write_frame, Frame, HaveMap, Next,
+    Refusal, Request, BUNDLE_MAGIC, FRAME_REFUSED, MAX_REQUEST_BYTES,
 };
 use crate::{Error, Result};
 use std::collections::HashSet;
@@ -40,9 +40,9 @@ use std::sync::{Arc, Mutex};
 /// The most requests [`fetch`] sends before it looks at what is still wanted.
 const REQUESTS_PER_ROUND: usize = 64;
 /// The most items of a list that one answer shows.
-const MAX_RUN_ITEMS: u64 = 16_384;
-/// The most pieces that one answer sends.
-const MAX_PIECES_PER_ANSWER: u64 = 256;
+const MAX_BRANCH_ITEMS: u64 = 16_384;
+/// The most chunks that one answer sends.
+const MAX_CHUNKS_PER_ANSWER: u64 = 256;
 
 fn invalid(detail: &str) -> Error {
     Error::InvalidData {
@@ -63,10 +63,10 @@ const TOO_MUCH: Error = Error::NotWanted {
     what: "more than was asked for",
 };
 
-/// The bytes of a run's frame that are there whatever it shows: its first
-/// byte, the list's count, the run's start, how many items it shows, and how
+/// The bytes of a branch's frame that are there whatever it shows: its first
+/// byte, the list's count, the branch's start, how many items it shows, and how
 /// many nodes it carries.
-const RUN_FIXED_BYTES: usize = 23;
+const BRANCH_FIXED_BYTES: usize = 23;
 
 /// How many bytes of requests a [`StreamPeer`] sends ahead of their answers.
 /// It is small on purpose. The other end answers one request before it reads
@@ -88,29 +88,29 @@ fn within(limit: usize, frame: &[u8]) -> Result<()> {
 }
 
 /// The longest frame that shows `entries` entries of a folder.
-fn folder_run_limit(entries: u64) -> usize {
+fn folder_branch_limit(entries: u64) -> usize {
     let carried = MAX_CARRIED_NODES * (42 + MAX_NAME_BYTES);
     usize::try_from(entries)
         .unwrap_or(usize::MAX)
         .saturating_mul(MAX_ENTRY_BYTES)
-        .saturating_add(RUN_FIXED_BYTES + carried)
+        .saturating_add(BRANCH_FIXED_BYTES + carried)
 }
 
 /// The longest frame that shows `items` items of a file's list.
-fn file_run_limit(items: u64) -> usize {
+fn file_branch_limit(items: u64) -> usize {
     usize::try_from(items)
         .unwrap_or(usize::MAX)
         .saturating_mul(LIST_ITEM_BYTES)
-        .saturating_add(RUN_FIXED_BYTES + MAX_CARRIED_NODES * 40)
+        .saturating_add(BRANCH_FIXED_BYTES + MAX_CARRIED_NODES * 40)
 }
 
-/// The most pieces that `length` bytes of a file can lie in. All of them but
-/// the first and the last lie in the stretch whole, and no piece but a
-/// file's last is shorter than the tree's way of cutting allows.
-fn most_pieces_in(cutting: Cutting, length: u64) -> u64 {
-    let shortest = match cutting {
-        Cutting::FastCdcV1 => FASTCDC_MIN_SIZE as u64 + 1,
-        Cutting::Fixed(piece) => u64::from(piece.get()),
+/// The most chunks that `length` bytes of a file can lie in. All of them but
+/// the first and the last lie in the stretch whole, and no chunk but a
+/// file's last is shorter than the tree's way of chunking allows.
+fn most_chunks_in(chunking: Chunking, length: u64) -> u64 {
+    let shortest = match chunking {
+        Chunking::FastCdcV1 => FASTCDC_MIN_SIZE as u64 + 1,
+        Chunking::Fixed(chunk) => u64::from(chunk.get()),
     };
     length / shortest + 2
 }
@@ -239,8 +239,8 @@ impl<'s> Responder<'s> {
         self
     }
 
-    /// Whether a peer is told which pieces of a file are held here. Telling
-    /// takes a look into the store for every piece of the file, so a
+    /// Whether a peer is told which chunks of a file are held here. Telling
+    /// takes a look into the store for every chunk of the file, so a
     /// responder that serves strangers may leave it off. It then answers
     /// such a request as it does for a file it does not hold.
     pub fn have(mut self, on: bool) -> Self {
@@ -333,11 +333,11 @@ impl<'s> Responder<'s> {
                 Some(bytes) => on_frame(&file_list_frame(&bytes)),
                 None => on_frame(&not_held),
             },
-            Request::Piece(piece) => match self.store.get(Stored::Piece, &piece)? {
-                Some(bytes) => on_frame(&piece_frame(&bytes)),
+            Request::Chunk(chunk) => match self.store.get(Stored::Chunk, &chunk)? {
+                Some(bytes) => on_frame(&chunk_frame(&bytes)),
                 None => on_frame(&not_held),
             },
-            Request::FolderRun {
+            Request::FolderBranch {
                 folder,
                 start,
                 count,
@@ -347,19 +347,19 @@ impl<'s> Responder<'s> {
                 };
                 let total = open.list().count();
                 if total == 0 {
-                    return on_frame(&folder_run_frame(&FolderRun::empty()));
+                    return on_frame(&folder_branch_frame(&FolderBranch::empty()));
                 }
                 if start >= total {
                     return on_frame(&out_of_range);
                 }
-                let end = total.min(start + u64::from(count).min(MAX_RUN_ITEMS));
-                on_frame(&folder_run_frame(&open.open(start, end)?))
+                let end = total.min(start + u64::from(count).min(MAX_BRANCH_ITEMS));
+                on_frame(&folder_branch_frame(&open.open(start, end)?))
             }
             Request::FolderName { folder, name } => match self.open_folder(&folder)? {
-                Some(open) => on_frame(&folder_run_frame(&open.open_name(&name)?)),
+                Some(open) => on_frame(&folder_branch_frame(&open.open_name(&name)?)),
                 None => on_frame(&not_held),
             },
-            Request::FileRun { file, start, count } => {
+            Request::FileBranch { file, start, count } => {
                 let Some(open) = self.open_file(&file)? else {
                     return on_frame(&not_held);
                 };
@@ -367,8 +367,8 @@ impl<'s> Responder<'s> {
                 if start >= total {
                     return on_frame(&out_of_range);
                 }
-                let end = total.min(start + u64::from(count).min(MAX_RUN_ITEMS));
-                on_frame(&file_run_frame(&open.open(start, end)?))
+                let end = total.min(start + u64::from(count).min(MAX_BRANCH_ITEMS));
+                on_frame(&file_branch_frame(&open.open(start, end)?))
             }
             Request::FileBytes {
                 file,
@@ -382,21 +382,21 @@ impl<'s> Responder<'s> {
                 if offset >= size {
                     return on_frame(&out_of_range);
                 }
-                let (first, after) = open.pieces_for(offset, length.min(size - offset))?;
-                let after = after.min(first + MAX_RUN_ITEMS);
-                on_frame(&file_run_frame(&open.open(first, after)?))
+                let (first, after) = open.chunks_for(offset, length.min(size - offset))?;
+                let after = after.min(first + MAX_BRANCH_ITEMS);
+                on_frame(&file_branch_frame(&open.open(first, after)?))
             }
-            Request::Pieces { file, start, count } => {
+            Request::Chunks { file, start, count } => {
                 let Some(list) = self.file_list(&file)? else {
                     return on_frame(&not_held);
                 };
                 if start >= list.count() {
                     return on_frame(&out_of_range);
                 }
-                let count = u64::from(count).min(MAX_PIECES_PER_ANSWER) as usize;
+                let count = u64::from(count).min(MAX_CHUNKS_PER_ANSWER) as usize;
                 for item in list.items()[start as usize..].iter().take(count) {
-                    match self.store.get(Stored::Piece, &item.hash)? {
-                        Some(bytes) => on_frame(&piece_frame(&bytes))?,
+                    match self.store.get(Stored::Chunk, &item.hash)? {
+                        Some(bytes) => on_frame(&chunk_frame(&bytes))?,
                         None => return on_frame(&not_held),
                     }
                 }
@@ -411,7 +411,7 @@ impl<'s> Responder<'s> {
                 };
                 let mut map = HaveMap::new(list.count())?;
                 for (number, item) in (0_u64..).zip(list.items()) {
-                    if self.store.has(Stored::Piece, &item.hash)? {
+                    if self.store.has(Stored::Chunk, &item.hash)? {
                         map.set(number)?;
                     }
                 }
@@ -461,8 +461,8 @@ fn ask_one(peer: &mut dyn Peer, request: &Request, limit: usize) -> Result<Vec<u
 /// Takes the whole tree with this root from a peer into a store.
 ///
 /// It goes from the top down: the record, then each folder's entries and
-/// each file's list, then the pieces, by their file and their numbers in it.
-/// Whatever the store holds already is skipped by its hash, be it a piece,
+/// each file's list, then the chunks, by their file and their numbers in it.
+/// Whatever the store holds already is skipped by its hash, be it a chunk,
 /// a file or a whole folder, and wherever it came from. Every answer has to
 /// be exactly what was asked for, and is checked before it is kept.
 ///
@@ -518,7 +518,7 @@ pub fn fetch(store: &dyn Store, root: &Root, peer: &mut dyn Peer) -> Result<Summ
     intake.finish()
 }
 
-/// A run of a folder's entries, as a peer showed it and as it was checked.
+/// A branch of a folder's entries, as a peer showed it and as it was checked.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Entries {
     /// How many entries the folder has in all.
@@ -573,12 +573,12 @@ impl<'p> Remote<'p> {
                 folder: folder.hash,
                 name: name.to_owned(),
             },
-            folder_run_limit(1),
+            folder_branch_limit(1),
         )?;
-        let Frame::FolderRun(run) = Frame::decode(&frame)? else {
+        let Frame::FolderBranch(branch) = Frame::decode(&frame)? else {
             return Err(OTHER_KIND);
         };
-        Ok(run.check_name(folder, name)?.cloned())
+        Ok(branch.check_name(folder, name)?.cloned())
     }
 
     /// What is at `path` in the tree: names with `/` between them. One
@@ -610,33 +610,35 @@ impl<'p> Remote<'p> {
     /// time. An empty folder gives none.
     pub fn entries(&mut self, folder: &Target, start: u64, count: u32) -> Result<Entries> {
         folder.require(Kind::Folder)?;
-        let request = Request::FolderRun {
+        let request = Request::FolderBranch {
             folder: folder.hash,
             start,
             count,
         };
-        let frame = ask_one(self.peer, &request, folder_run_limit(u64::from(count)))?;
-        let Frame::FolderRun(run) = Frame::decode(&frame)? else {
+        let frame = ask_one(self.peer, &request, folder_branch_limit(u64::from(count)))?;
+        let Frame::FolderBranch(branch) = Frame::decode(&frame)? else {
             return Err(OTHER_KIND);
         };
-        run.check(folder)?;
-        if run.count() != 0 && (run.start() != start || run.entries().len() > count as usize) {
+        branch.check(folder)?;
+        if branch.count() != 0
+            && (branch.start() != start || branch.entries().len() > count as usize)
+        {
             return Err(Error::NotWanted {
-                what: "a run that was not asked for",
+                what: "a branch that was not asked for",
             });
         }
         Ok(Entries {
-            total: run.count(),
-            start: run.start(),
-            entries: run.entries().to_vec(),
+            total: branch.count(),
+            start: branch.start(),
+            entries: branch.entries().to_vec(),
         })
     }
 
     /// Writes `length` bytes of a file, from byte `offset`, to `out`.
     ///
-    /// The peer shows the run of the file's list that holds the stretch, and
-    /// that proves each piece's number and the byte it starts at. Then the
-    /// pieces are asked for by their numbers, and each is checked against
+    /// The peer shows the branch of the file's list that holds the stretch, and
+    /// that proves each chunk's number and the byte it starts at. Then the
+    /// chunks are asked for by their numbers, and each is checked against
     /// the list before any of its bytes is written. Nothing else of the file
     /// is taken.
     pub fn read(
@@ -651,7 +653,7 @@ impl<'p> Remote<'p> {
             .checked_add(length)
             .filter(|end| *end <= file.size)
             .ok_or_else(|| invalid("a stretch of bytes is outside the file"))?;
-        let cutting = self.record.cutting();
+        let chunking = self.record.chunking();
         let mut at = offset;
         while at < end {
             let request = Request::FileBytes {
@@ -659,58 +661,58 @@ impl<'p> Remote<'p> {
                 offset: at,
                 length: end - at,
             };
-            let run_limit = file_run_limit(most_pieces_in(cutting, end - at));
-            let frame = ask_one(self.peer, &request, run_limit)?;
-            let Frame::FileRun(run) = Frame::decode(&frame)? else {
+            let branch_limit = file_branch_limit(most_chunks_in(chunking, end - at));
+            let frame = ask_one(self.peer, &request, branch_limit)?;
+            let Frame::FileBranch(branch) = Frame::decode(&frame)? else {
                 return Err(OTHER_KIND);
             };
-            let run_start = run.check(file, Some(cutting))?;
-            let items = run.items();
-            // The run has to begin with the piece that holds the first byte
-            // still due, and may not reach past the piece that holds the last.
+            let branch_start = branch.check(file, Some(chunking))?;
+            let items = branch.items();
+            // The branch has to begin with the chunk that holds the first byte
+            // still due, and may not reach past the chunk that holds the last.
             let before_last: u64 = items[..items.len() - 1]
                 .iter()
                 .map(|item| u64::from(item.length))
                 .sum();
-            let holds_first = run_start <= at && at < run_start + u64::from(items[0].length);
-            if !holds_first || run_start + before_last >= end {
+            let holds_first = branch_start <= at && at < branch_start + u64::from(items[0].length);
+            if !holds_first || branch_start + before_last >= end {
                 return Err(Error::NotWanted {
-                    what: "a run that does not hold the bytes asked for",
+                    what: "a branch that does not hold the bytes asked for",
                 });
             }
-            let pieces = Request::Pieces {
+            let chunks = Request::Chunks {
                 file: file.hash,
-                start: run.start(),
+                start: branch.start(),
                 count: items.len() as u32,
             };
-            // No piece that is due is longer than the longest in the run.
+            // No chunk that is due is longer than the longest in the branch.
             let longest = items
                 .iter()
                 .map(|item| item.length as usize)
                 .max()
                 .unwrap_or(0);
             let mut taken = 0_usize;
-            let mut piece_start = run_start;
+            let mut chunk_start = branch_start;
             let mut refused = false;
-            self.peer.ask(&pieces.encode(), longest + 1, &mut |frame| {
+            self.peer.ask(&chunks.encode(), longest + 1, &mut |frame| {
                 if refused {
                     return Err(peer_error("sent more after it refused"));
                 }
                 match Frame::decode(frame)? {
                     Frame::Refused(_) => refused = true,
-                    Frame::Piece(bytes) => {
+                    Frame::Chunk(bytes) => {
                         let item = items.get(taken).ok_or(TOO_MUCH)?;
-                        check_piece(item, bytes, "a piece")?;
-                        let piece_end = piece_start + u64::from(item.length);
-                        let from = (at - piece_start) as usize;
-                        let to = (end.min(piece_end) - piece_start) as usize;
+                        check_chunk(item, bytes, "a chunk")?;
+                        let chunk_end = chunk_start + u64::from(item.length);
+                        let from = (at - chunk_start) as usize;
+                        let to = (end.min(chunk_end) - chunk_start) as usize;
                         out.write_all(&bytes[from..to])
                             .map_err(|source| Error::Stream {
                                 operation: "write a file's bytes",
                                 source,
                             })?;
-                        at = end.min(piece_end);
-                        piece_start = piece_end;
+                        at = end.min(chunk_end);
+                        chunk_start = chunk_end;
                         taken += 1;
                     }
                     _ => return Err(OTHER_KIND),
@@ -718,20 +720,20 @@ impl<'p> Remote<'p> {
                 Ok(())
             })?;
             if taken == 0 {
-                return Err(peer_error("does not hold the pieces asked for"));
+                return Err(peer_error("does not hold the chunks asked for"));
             }
         }
         Ok(())
     }
 
-    /// Which pieces of a file the peer says it holds, one bit a piece. This
-    /// is what the peer says about itself: nothing proves it, and a piece it
-    /// claims is still checked when it comes. Only the number of pieces is
+    /// Which chunks of a file the peer says it holds, one bit a chunk. This
+    /// is what the peer says about itself: nothing proves it, and a chunk it
+    /// claims is still checked when it comes. Only the number of chunks is
     /// held to what the file's size allows.
     pub fn have(&mut self, file: &Target) -> Result<HaveMap> {
         file.require(Kind::File)?;
-        let cutting = self.record.cutting();
-        let most = cutting.count_bounds(file.size).1;
+        let chunking = self.record.chunking();
+        let most = chunking.count_bounds(file.size).1;
         let limit = usize::try_from(most.div_ceil(8))
             .unwrap_or(usize::MAX)
             .saturating_add(9);
@@ -739,13 +741,13 @@ impl<'p> Remote<'p> {
         let Frame::Have(map) = Frame::decode(&frame)? else {
             return Err(OTHER_KIND);
         };
-        cutting.check_count(file.size, map.count())?;
+        chunking.check_count(file.size, map.count())?;
         Ok(map)
     }
 }
 
 /// Writes a whole tree to `out` as one stream: the bundle's first bytes,
-/// the record, and then every list and every piece once, each after what
+/// the record, and then every list and every chunk once, each after what
 /// names it. [`import`] reads it back.
 pub fn export(store: &dyn Store, root: &Root, out: &mut dyn Write) -> Result<()> {
     let record = record_of(store, root)?;
@@ -756,7 +758,7 @@ pub fn export(store: &dyn Store, root: &Root, out: &mut dyn Write) -> Result<()>
         })?;
     write_frame(out, &record.encode())?;
     let mut lists: HashSet<(Kind, Hash)> = HashSet::new();
-    let mut pieces: HashSet<Hash> = HashSet::new();
+    let mut chunks: HashSet<Hash> = HashSet::new();
     let mut pending = vec![record.top()];
     while let Some(target) = pending.pop() {
         if !lists.insert((target.kind, target.hash)) {
@@ -772,10 +774,10 @@ pub fn export(store: &dyn Store, root: &Root, out: &mut dyn Write) -> Result<()>
                 let list = file_of(store, &target)?;
                 write_frame(out, &file_list_frame(&list.encode()))?;
                 for item in list.items() {
-                    if pieces.insert(item.hash) {
-                        let bytes = load_piece(store, item)?
-                            .ok_or_else(|| missing("the piece", &item.hash))?;
-                        write_frame(out, &piece_frame(&bytes))?;
+                    if chunks.insert(item.hash) {
+                        let bytes = load_chunk(store, item)?
+                            .ok_or_else(|| missing("the chunk", &item.hash))?;
+                        write_frame(out, &chunk_frame(&bytes))?;
                     }
                 }
             }
