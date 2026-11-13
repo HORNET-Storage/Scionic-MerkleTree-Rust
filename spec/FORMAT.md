@@ -219,4 +219,5 @@ A tree can hold a name that one system cannot. Writing out is stricter than hold
 - The record's totals are counted by the checks that a receiver runs, so a tree that is built has passed them.
 - A link is never followed. It is refused, or left out when the builder is told to. Anything that is neither a file nor a folder is refused.
 - That holds too for a link that takes a file's or a folder's place while the folder is read. A builder holds each folder open while it reads it, and opens what is in it from the folder itself, so that no path is looked up twice. Where a system has no way to do that, the builder says so.
+- An entry holds the bytes of the file that the folder lists under the entry's name, and of no other. Where a system changes a name when it looks a path up, as Windows drops a dot or a space from the end of one, a builder opens the file in a way that takes the name as it is.
 - A name that is not UTF-8 is refused.

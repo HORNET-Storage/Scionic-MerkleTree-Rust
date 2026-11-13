@@ -12,7 +12,12 @@
 //! * On Windows a held folder is a handle that does not share deletion. The
 //!   folder can be neither renamed nor replaced while it is held, and a held
 //!   folder keeps the folders above it held. What is in it is opened by its
-//!   path, as itself, and refused when it turns out to be a link.
+//!   path, as itself, and refused when it turns out to be a link. The path
+//!   is in the form that Windows takes letter for letter, so a name is the
+//!   name that was listed and no other.
+//!
+//! On every system a name is one name: an empty one, a dot name, or one with
+//! a separator in it is refused before the system sees it.
 //! * Elsewhere a held folder is its path, and no more is promised than the
 //!   standard library gives.
 
@@ -87,21 +92,20 @@ impl Held {
     /// Holds the folder `name` in this one. A link is refused.
     pub(crate) fn open_folder(self: &Arc<Self>, name: &str) -> Result<Arc<Self>, Refused> {
         let path = self.path.join(name);
-        let inner = imp::Inner::open_folder(self, OsStr::new(name), &path)?;
+        let inner = imp::Inner::open_folder(self, one_name(name)?, &path)?;
         Ok(Arc::new(Self { path, inner }))
     }
 
     /// Opens the file `name` in this folder, to read. A link is refused, and
     /// so is anything that is not a plain file.
     pub(crate) fn open_file(&self, name: &str) -> Result<File, Refused> {
-        self.inner
-            .open_file(OsStr::new(name), &self.path.join(name))
+        self.inner.open_file(one_name(name)?, &self.path.join(name))
     }
 
     /// Makes the new folder `name` in this one, and holds it.
     pub(crate) fn create_folder(self: &Arc<Self>, name: &str) -> io::Result<Arc<Self>> {
         let path = self.path.join(name);
-        let inner = imp::Inner::create_folder(self, OsStr::new(name), &path)?;
+        let inner = imp::Inner::create_folder(self, one_name(name)?, &path)?;
         Ok(Arc::new(Self { path, inner }))
     }
 
@@ -109,8 +113,27 @@ impl Held {
     /// there already is an error, a link too.
     pub(crate) fn create_file(&self, name: &str) -> io::Result<File> {
         self.inner
-            .create_file(OsStr::new(name), &self.path.join(name))
+            .create_file(one_name(name)?, &self.path.join(name))
     }
+}
+
+/// A name in a folder is one name. One that could lead out of the folder, or
+/// to a part of a file, is refused before the system sees it: an empty name,
+/// a dot name, and a name with a separator or a zero byte in it. On Windows
+/// a colon too, which names a second stream of a file's bytes.
+fn one_name(name: &str) -> io::Result<&OsStr> {
+    let more_than_a_name = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\0'])
+        || (cfg!(windows) && name.contains(['\\', ':']));
+    if more_than_a_name {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "what is opened or made in a folder is named by one name",
+        ));
+    }
+    Ok(OsStr::new(name))
 }
 
 /// The names in the folder at `path`, by the standard library.
@@ -283,7 +306,7 @@ mod imp {
     use std::fs::{self, File, OpenOptions};
     use std::io;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::path::Path;
+    use std::path::{Component, Path, PathBuf, Prefix};
     use std::sync::Arc;
 
     const FILE_SHARE_READ: u32 = 0x1;
@@ -297,12 +320,53 @@ mod imp {
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
     pub(super) struct Inner {
+        /// The folder's path in the form that Windows takes letter for
+        /// letter. Everything in the folder is reached through it.
+        exact: PathBuf,
         /// Open for as long as the folder is held. It shares reading and
         /// writing and not deleting, so the folder can be neither renamed nor
         /// replaced meanwhile.
         _pin: File,
         /// The folder this one is in, held as long as this one is.
         _above: Option<Arc<Held>>,
+    }
+
+    /// `path` in the form that Windows takes letter for letter.
+    ///
+    /// Windows changes an ordinary path when it looks it up: a dot or a space
+    /// at the end of a name is dropped, and some names are devices wherever
+    /// they stand. So a file `a.` would be read as the file `a` beside it. A
+    /// path that begins with `\\?\` is looked up as it is written.
+    ///
+    /// What the caller wrote is first read the way Windows reads it, which is
+    /// what the caller means by it. The names that are added to it afterwards
+    /// are the ones that a folder listed, and are taken as they are.
+    fn exact(path: &Path) -> io::Result<PathBuf> {
+        let whole = std::path::absolute(path)?;
+        let mut parts = whole.components();
+        let mut exact = OsString::from(r"\\?\");
+        match parts.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                // `C:\folder` is `\\?\C:\folder`.
+                Prefix::Disk(_) => exact.push(prefix.as_os_str()),
+                // `\\server\share\folder` is `\\?\UNC\server\share\folder`.
+                Prefix::UNC(server, share) => {
+                    exact.push("UNC\\");
+                    exact.push(server);
+                    exact.push("\\");
+                    exact.push(share);
+                }
+                // `\\.\C:\folder` is `\\?\C:\folder`.
+                Prefix::DeviceNS(device) => exact.push(device),
+                // It is in that form already.
+                Prefix::Verbatim(_) | Prefix::VerbatimUNC(..) | Prefix::VerbatimDisk(_) => {
+                    return Ok(whole);
+                }
+            },
+            _ => return Ok(whole),
+        }
+        exact.push(parts.as_path());
+        Ok(PathBuf::from(exact))
     }
 
     /// Opens the folder at `path` so that it stays what and where it is.
@@ -367,38 +431,56 @@ mod imp {
     }
 
     impl Inner {
+        /// The exact path of `name` in this folder. The name is added as it
+        /// is: nothing reads it as a path.
+        fn within(&self, name: &OsStr) -> PathBuf {
+            let mut path = self.exact.clone().into_os_string();
+            if !path.as_encoded_bytes().ends_with(b"\\") {
+                path.push("\\");
+            }
+            path.push(name);
+            PathBuf::from(path)
+        }
+
         pub(super) fn open(path: &Path) -> io::Result<Self> {
+            let exact = exact(path)?;
             Ok(Self {
-                _pin: pin(path, true).map_err(as_io)?,
+                _pin: pin(&exact, true).map_err(as_io)?,
+                exact,
                 _above: None,
             })
         }
 
         pub(super) fn create(path: &Path) -> io::Result<Self> {
-            fs::create_dir(path)?;
+            let exact = exact(path)?;
+            fs::create_dir(&exact)?;
             Ok(Self {
-                _pin: pin(path, false).map_err(as_io)?,
+                _pin: pin(&exact, false).map_err(as_io)?,
+                exact,
                 _above: None,
             })
         }
 
-        pub(super) fn list(&self, path: &Path) -> io::Result<Vec<(OsString, Found)>> {
-            list_by_path(path)
+        pub(super) fn list(&self, _path: &Path) -> io::Result<Vec<(OsString, Found)>> {
+            list_by_path(&self.exact)
         }
 
         pub(super) fn open_folder(
             above: &Arc<Held>,
-            _name: &OsStr,
-            path: &Path,
+            name: &OsStr,
+            _path: &Path,
         ) -> Result<Self, Refused> {
+            let exact = above.inner.within(name);
             Ok(Self {
-                _pin: pin(path, false)?,
+                _pin: pin(&exact, false)?,
+                exact,
                 _above: Some(Arc::clone(above)),
             })
         }
 
-        pub(super) fn open_file(&self, _name: &OsStr, path: &Path) -> Result<File, Refused> {
-            let (file, plain) = open_as_itself(path, false)?;
+        pub(super) fn open_file(&self, name: &OsStr, _path: &Path) -> Result<File, Refused> {
+            let exact = self.within(name);
+            let (file, plain) = open_as_itself(&exact, false)?;
             if plain {
                 // For a plain file, opening it as itself is opening it.
                 return Ok(file);
@@ -408,26 +490,34 @@ mod imp {
             // file does. So it is held where it is, looked at again, and
             // opened in the usual way while it cannot be swapped.
             drop(file);
-            let (held, _) = open_as_itself(path, true)?;
-            let file = File::open(path)?;
+            let (held, _) = open_as_itself(&exact, true)?;
+            let file = File::open(&exact)?;
             drop(held);
             Ok(file)
         }
 
         pub(super) fn create_folder(
             above: &Arc<Held>,
-            _name: &OsStr,
-            path: &Path,
+            name: &OsStr,
+            _path: &Path,
         ) -> io::Result<Self> {
-            fs::create_dir(path)?;
+            let exact = above.inner.within(name);
+            fs::create_dir(&exact)?;
             Ok(Self {
-                _pin: pin(path, false).map_err(as_io)?,
+                _pin: pin(&exact, false).map_err(as_io)?,
+                exact,
                 _above: Some(Arc::clone(above)),
             })
         }
 
-        pub(super) fn create_file(&self, _name: &OsStr, path: &Path) -> io::Result<File> {
-            OpenOptions::new().write(true).create_new(true).open(path)
+        pub(super) fn create_file(&self, name: &OsStr, _path: &Path) -> io::Result<File> {
+            // A link that is there under the name is not gone through: the
+            // name is taken, and that is an error.
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(self.within(name))
         }
     }
 }

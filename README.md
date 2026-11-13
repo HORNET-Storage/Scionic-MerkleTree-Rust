@@ -102,6 +102,7 @@ The tests under `tests/` hold the library to these, with forged bytes made by a 
 - Nothing a peer sends makes a store remove bytes that are sound. A list that names a held piece with a wrong length is refused, and the piece stays.
 - A link is never followed when a tree is built. That holds for a link that is in the folder, and for one that takes a file's or a folder's place while the folder is being read: each folder is held open while it is read, and what is in it is opened from the folder itself, never by a path that is looked up again.
 - A tree is written only to a new place, and only with names the system can hold as they are. The new folders are held open while they are filled, so a link that takes the place of one is not written through.
+- On Windows a file is read under the name its folder lists it by, and under no other. Windows drops a dot or a space from the end of a name when it looks a path up, and takes `NUL` for a device wherever it stands, so a file `model.` beside a file `model` would be read as `model`. Everything below the place a caller names is opened by a path that Windows takes letter for letter.
 - Malformed input is an error, and never a crash or a loop.
 
 ## What it does not do well yet

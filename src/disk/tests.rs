@@ -209,3 +209,129 @@ fn a_link_between_folders_is_refused() {
     fs::remove_dir(root.join("top/to-folder")).unwrap();
     assert!(root.join("secret/key").exists());
 }
+
+#[test]
+fn a_name_is_one_name() {
+    let scratch = Scratch::new("one-name");
+    let top = Held::create(&scratch.0.join("top")).unwrap();
+    let inner = top.create_folder("inner").unwrap();
+    fs::write(scratch.0.join("beside"), b"beside").unwrap();
+    let mut more_than_a_name = vec!["", ".", "..", "../beside", "inner/new", "a\0b"];
+    if cfg!(windows) {
+        more_than_a_name.extend(["..\\beside", "inner\\new", "file:stream", "C:new"]);
+    }
+    for name in more_than_a_name {
+        assert!(
+            matches!(top.open_file(name), Err(Refused::Io(_))),
+            "{name:?}"
+        );
+        assert!(
+            matches!(inner.open_folder(name), Err(Refused::Io(_))),
+            "{name:?}"
+        );
+        assert!(top.create_file(name).is_err(), "{name:?}");
+        assert!(inner.create_folder(name).is_err(), "{name:?}");
+    }
+    // Nothing was made, in the folders or beside them.
+    assert_eq!(kinds(&top), [("inner".to_owned(), Found::Folder)]);
+    assert_eq!(kinds(&inner), []);
+    assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_name_is_opened_as_it_is_listed() {
+    let scratch = Scratch::new("names");
+    // A path that begins with `\\?\` is taken letter for letter, so it can
+    // make the names that Windows changes when it looks an ordinary path up:
+    // a dot or a space at the end goes, and some names are devices.
+    let exact = fs::canonicalize(&scratch.0).unwrap().join("top");
+    assert!(exact.to_str().unwrap().starts_with(r"\\?\"));
+    fs::create_dir(&exact).unwrap();
+    let files = [
+        "a", "a.", "a ", "only.", "aux", "nul", "con", "com1", "nul.txt",
+    ];
+    let folders = ["d", "d.", "d ", "...", ".. "];
+    for name in files {
+        fs::write(exact.join(name), format!("the file [{name}]")).unwrap();
+    }
+    for name in folders {
+        fs::create_dir(exact.join(name)).unwrap();
+        fs::write(exact.join(name).join("inside"), format!("in [{name}]")).unwrap();
+    }
+
+    let top = Held::open(&scratch.0.join("top")).unwrap();
+    assert_eq!(kinds(&top).len(), files.len() + folders.len());
+    for name in files {
+        assert_eq!(read(top.open_file(name)), format!("the file [{name}]"));
+        assert!(top.create_file(name).is_err(), "{name:?} is taken");
+    }
+    for name in folders {
+        let folder = top.open_folder(name).map_err(|_| name).unwrap();
+        assert_eq!(kinds(&folder), [("inside".to_owned(), Found::File)]);
+        assert_eq!(read(folder.open_file("inside")), format!("in [{name}]"));
+        // It is this folder that is held, and not the one that Windows
+        // would have made of its name.
+        assert!(
+            fs::rename(exact.join(name), exact.join("moved")).is_err(),
+            "{name:?}"
+        );
+        drop(folder);
+        fs::rename(exact.join(name), exact.join("moved")).unwrap();
+        fs::rename(exact.join("moved"), exact.join(name)).unwrap();
+    }
+    // What is made is made under the name it is given, and under no other.
+    let made = top.create_folder("made.").unwrap();
+    made.create_file("file ")
+        .unwrap()
+        .write_all(b"new")
+        .unwrap();
+    assert_eq!(kinds(&made), [("file ".to_owned(), Found::File)]);
+    assert_eq!(fs::read(exact.join("made.").join("file ")).unwrap(), b"new");
+    assert!(!exact.join("made").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn nothing_is_made_through_a_link_that_leads_nowhere() {
+    let scratch = Scratch::new("nowhere");
+    let root = &scratch.0;
+    fs::create_dir_all(root.join("top")).unwrap();
+    fs::create_dir_all(root.join("elsewhere")).unwrap();
+    // Links between folders, of the kind that anyone may make, to places
+    // where nothing is: each is made to a folder, which is then taken away.
+    let mut links = Vec::new();
+    for name in ["one", "two"] {
+        let to = root.join("elsewhere").join(name);
+        fs::create_dir(&to).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("top").join(name))
+            .arg(&to)
+            .output();
+        fs::remove_dir(&to).unwrap();
+        if made.is_ok_and(|output| output.status.success()) {
+            links.push(name);
+        }
+    }
+    // Links of the other kind, which take a right that not every user has.
+    let to = root.join("elsewhere");
+    if std::os::windows::fs::symlink_file(to.join("three"), root.join("top/three")).is_ok() {
+        links.push("three");
+    }
+    if std::os::windows::fs::symlink_dir(to.join("four"), root.join("top/four")).is_ok() {
+        links.push("four");
+    }
+    let top = Held::open(&root.join("top")).unwrap();
+    assert_eq!(kinds(&top).len(), links.len());
+    for name in links {
+        assert!(top.create_file(name).is_err(), "{name}");
+        assert!(top.create_folder(name).is_err(), "{name}");
+        assert!(matches!(top.open_file(name), Err(Refused::Link)), "{name}");
+        assert!(
+            matches!(top.open_folder(name), Err(Refused::Link)),
+            "{name}"
+        );
+    }
+    assert_eq!(fs::read_dir(root.join("elsewhere")).unwrap().count(), 0);
+}

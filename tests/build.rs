@@ -438,6 +438,55 @@ fn a_link_is_never_followed() {
     assert!(!store.has(Stored::Piece, &secret).unwrap());
 }
 
+#[cfg(windows)]
+#[test]
+fn on_windows_a_name_is_read_as_the_folder_lists_it() {
+    // Windows drops a dot or a space from the end of a name when it looks a
+    // path up, and takes `nul` for a device wherever it stands. So a file
+    // `model.` beside a file `model` would be read as `model`. Such names
+    // are made by a path that begins with `\\?\`, which is taken as it is.
+    let temp = TempDir::new("windows-names").unwrap();
+    let exact = fs::canonicalize(temp.path()).unwrap().join("tree");
+    let files = [
+        "model",
+        "model.",
+        "model ",
+        "nul",
+        "dir/inside",
+        "dir./inside",
+        ".../inside",
+    ];
+    for name in files {
+        let path = name
+            .split('/')
+            .fold(exact.clone(), |path, part| path.join(part));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes(&format!("names-{name}"), 16)).unwrap();
+    }
+
+    for workers in [1, 4] {
+        let store = MemoryStore::new();
+        let options = small_options().workers(workers);
+        let root = build(&store, temp.path().join("tree"), &options).unwrap();
+        for name in files {
+            let entry = lookup(&store, &root, name).unwrap().unwrap();
+            assert_eq!(
+                read_file_to_vec(&store, &entry.target()).unwrap(),
+                bytes(&format!("names-{name}"), 16),
+                "{name:?} with {workers} workers"
+            );
+        }
+        // Windows cannot hold these names as they are, so here the tree is
+        // not written out: nothing is made, and the error names the name.
+        let out = temp.path().join(format!("out-{workers}"));
+        assert!(matches!(
+            scionic_merkletree::write_to_disk(&store, &root, &out),
+            Err(Error::UnwritableName { .. })
+        ));
+        assert!(!out.exists());
+    }
+}
+
 #[test]
 fn a_folder_inside_128_others_is_too_deep() {
     // Made by hand: a path that long does not fit on every system.
