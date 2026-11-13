@@ -335,3 +335,30 @@ fn nothing_is_made_through_a_link_that_leads_nowhere() {
     }
     assert_eq!(fs::read_dir(root.join("elsewhere")).unwrap().count(), 0);
 }
+
+#[cfg(windows)]
+#[test]
+fn two_open_files_are_known_to_be_one_file_or_not() {
+    use super::imp::one_file;
+    let scratch = Scratch::new("identity");
+    let root = &scratch.0;
+    fs::create_dir_all(root.join("folder")).unwrap();
+    for name in ["one", "two", "folder/one"] {
+        fs::write(root.join(name), b"one").unwrap();
+    }
+    let open = |name: &str| fs::File::open(root.join(name)).unwrap();
+    assert!(one_file(&open("one"), &open("one")).unwrap());
+    // Two files with the same bytes are two files, and so are two files with
+    // the same name in two folders.
+    assert!(!one_file(&open("one"), &open("two")).unwrap());
+    assert!(!one_file(&open("one"), &open("folder/one")).unwrap());
+    // A second name of a file is the file.
+    fs::hard_link(root.join("one"), root.join("again")).unwrap();
+    assert!(one_file(&open("one"), &open("again")).unwrap());
+    // What a link leads to is the file it leads to, and no other: a link that
+    // took a file's place is found by this.
+    if std::os::windows::fs::symlink_file(root.join("one"), root.join("link")).is_ok() {
+        assert!(one_file(&open("one"), &open("link")).unwrap());
+        assert!(!one_file(&open("two"), &open("link")).unwrap());
+    }
+}

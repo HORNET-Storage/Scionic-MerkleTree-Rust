@@ -406,6 +406,15 @@ mod imp {
         }
     }
 
+    /// Whether two open files are one file: on the same volume, with the
+    /// same number there. Where that is not to be had, nothing says that the
+    /// two are one.
+    pub(super) fn one_file(left: &File, right: &File) -> io::Result<bool> {
+        let left = same_file::Handle::from_file(left.try_clone()?)?;
+        let right = same_file::Handle::from_file(right.try_clone()?)?;
+        Ok(left == right)
+    }
+
     /// Opens `path` as itself, and says whether it is a plain file with
     /// nothing standing in for it. A link is refused, and so is a folder.
     fn open_as_itself(path: &Path, held: bool) -> Result<(File, bool), Refused> {
@@ -488,10 +497,17 @@ mod imp {
             // Something stands in for this file, as for one that is fetched
             // when it is read, and opened as itself it may not read as the
             // file does. So it is held where it is, looked at again, and
-            // opened in the usual way while it cannot be swapped.
+            // opened in the usual way while it cannot be renamed or replaced.
             drop(file);
             let (held, _) = open_as_itself(&exact, true)?;
             let file = File::open(&exact)?;
+            // Holding the file keeps its name on it. It does not keep what
+            // stands in for it from being changed into a link, which the
+            // usual way of opening then follows. So what was opened has to be
+            // the file that is held, and not another one.
+            if !one_file(&held, &file)? {
+                return Err(Refused::Link);
+            }
             drop(held);
             Ok(file)
         }

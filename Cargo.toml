@@ -15,3 +15,10 @@ sha2 = { version = "0.11", default-features = false }
 # On Windows the same is done with what the standard library has.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
+
+# Telling whether two open files are one file, by the volume it is on and its
+# number there: the standard library has no way to do that without `unsafe`
+# either. Used on Windows only, where a file that something stands in for has
+# to be opened a second time.
+[target.'cfg(windows)'.dependencies]
+same-file = "1.0.6"
