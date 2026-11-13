@@ -136,6 +136,13 @@ fn every_case_is_cut_where_the_manifest_says() {
             "{name}: the lengths in the file's list"
         );
         list.check_cutting(Cutting::FastCdcV1).unwrap();
+        // And so the file has the hash that the manifest gives it.
+        assert_eq!(file.size, data.len() as u64, "{name}: the file's size");
+        assert_eq!(
+            file.hash.to_hex(),
+            case.get("file_hash").text(),
+            "{name}: the file's hash"
+        );
     }
 }
 
