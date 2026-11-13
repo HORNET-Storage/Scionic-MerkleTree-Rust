@@ -24,7 +24,7 @@ pub mod tree;
 mod wire;
 
 pub use build::{build, build_with, BuildOptions, Builder, EntryExtra, Links};
-pub use diff::{diff, Change};
+pub use diff::{diff, diff_within, Change, DEFAULT_MAX_CHANGES};
 pub use fastcdc::{
     FASTCDC_GEAR_SEED_PREFIX, FASTCDC_LOOSE_MASK, FASTCDC_MAX_SIZE, FASTCDC_MIN_SIZE,
     FASTCDC_STRICT_MASK, FASTCDC_TARGET_SIZE,
@@ -39,8 +39,9 @@ pub use format::{
 pub use hash::{Hash, Root};
 pub use intake::{verify, verify_with, Accepted, Arrived, Intake, Summary, VerifyOptions};
 pub use read::{
-    file_of, folder_of, lookup, read_file, read_file_to_vec, read_range, record_of, unwritable,
-    unwritable_on_windows, write_to_disk,
+    file_of, folder_of, lookup, read_file, read_file_to_vec, read_open, read_range, record_of,
+    unwritable, unwritable_on_windows, write_to_disk, write_to_disk_with, WriteOptions,
+    DEFAULT_MAX_WRITTEN_ENTRIES,
 };
 pub use store::{MemoryStore, Store, Stored};
 pub use sync::{

@@ -40,9 +40,42 @@ impl Change {
     }
 }
 
+/// The most changes that [`diff`] lists.
+pub const DEFAULT_MAX_CHANGES: usize = 1_000_000;
+
+fn too_many(most: usize, found: usize) -> Error {
+    Error::LimitExceeded {
+        what: "the changes between two trees",
+        limit: most as u64,
+        requested: found as u64,
+    }
+}
+
 /// The differences between two trees that a store holds, sorted by path.
 /// Both trees must have a folder on top, or be the same tree.
+///
+/// A change is listed at every place it has. A tree keeps a folder once,
+/// however many places the folder has in it, so two small trees can differ
+/// at more places than any list holds. More than [`DEFAULT_MAX_CHANGES`]
+/// changes are an error, found as soon as there are that many.
 pub fn diff(store: &dyn Store, old: &Root, new: &Root) -> Result<Vec<Change>> {
+    diff_within(store, old, new, DEFAULT_MAX_CHANGES)
+}
+
+/// The differences between two trees, as [`diff`] gives them, where more
+/// than `most` changes are an error.
+pub fn diff_within(store: &dyn Store, old: &Root, new: &Root, most: usize) -> Result<Vec<Change>> {
+    let changes = find_changes(store, old, new, most)?;
+    if changes.len() > most {
+        return Err(too_many(most, changes.len()));
+    }
+    Ok(changes)
+}
+
+/// The differences, sorted by path. It stops soon after it has found more
+/// than `most`: every pair of folders it looks into holds a change, so the
+/// work is held by the same number.
+fn find_changes(store: &dyn Store, old: &Root, new: &Root, most: usize) -> Result<Vec<Change>> {
     let old_top = record_of(store, old)?.top();
     let new_top = record_of(store, new)?.top();
     if old_top == new_top {
@@ -57,6 +90,9 @@ pub fn diff(store: &dyn Store, old: &Root, new: &Root) -> Result<Vec<Change>> {
     let mut pending: Vec<(Target, Target, String, usize)> =
         vec![(old_top, new_top, String::new(), 1)];
     while let Some((old_folder, new_folder, prefix, depth)) = pending.pop() {
+        if changes.len() > most {
+            return Err(too_many(most, changes.len()));
+        }
         if depth > MAX_FOLDER_DEPTH {
             return Err(Error::TooDeep {
                 limit: MAX_FOLDER_DEPTH,

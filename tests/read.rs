@@ -3,9 +3,10 @@
 mod support;
 
 use scionic_merkletree::{
-    build, file_of, lookup, read_file, read_file_to_vec, read_range, unwritable_on_windows,
-    write_to_disk, Builder, Entry, Error, ExtraData, Kind, MemoryStore, Root, Store, Stored,
-    Target,
+    build, file_of, lookup, read_file, read_file_to_vec, read_open, read_range, record_of,
+    unwritable_on_windows, verify, write_to_disk, write_to_disk_with, Builder, Entry, Error,
+    ExtraData, Kind, MemoryStore, OpenFile, Root, Store, Stored, Target, WriteOptions,
+    DEFAULT_MAX_WRITTEN_ENTRIES,
 };
 use std::fs;
 use std::path::Path;
@@ -13,6 +14,133 @@ use support::{bytes, sample_tree, small_options, small_pieces, write, TempDir};
 
 fn entry(name: &str, target: Target) -> Entry {
     Entry::new(name, target, ExtraData::new()).unwrap()
+}
+
+#[test]
+fn a_stretch_is_read_from_an_open_file_without_a_pass_over_its_list() {
+    let store = MemoryStore::new();
+    let data = bytes("open", 100);
+    let file = Builder::new(&store, small_pieces())
+        .file_from_bytes(&data)
+        .unwrap();
+    let open = OpenFile::new(file_of(&store, &file).unwrap()).unwrap();
+    for offset in 0..=100_usize {
+        for length in 0..=100 - offset {
+            let mut out = Vec::new();
+            read_open(&store, &open, offset as u64, length as u64, &mut out).unwrap();
+            assert_eq!(out, &data[offset..offset + length], "{offset}+{length}");
+        }
+    }
+    let mut out = Vec::new();
+    assert!(read_open(&store, &open, 0, 101, &mut out).is_err());
+    assert!(read_open(&store, &open, 101, 0, &mut out).is_err());
+    assert!(read_open(&store, &open, u64::MAX, 2, &mut out).is_err());
+    // A piece that is missing: an error, and no byte.
+    let piece = open.list().items()[3];
+    store.remove(Stored::Piece, &piece.hash).unwrap();
+    assert!(matches!(
+        read_open(&store, &open, 40, 30, &mut out),
+        Err(Error::Missing { .. })
+    ));
+    assert!(out.is_empty());
+    // An empty file has one stretch: none of its bytes, from its start.
+    let empty = Builder::new(&store, small_pieces())
+        .file_from_bytes(b"")
+        .unwrap();
+    let open = OpenFile::new(file_of(&store, &empty).unwrap()).unwrap();
+    read_open(&store, &open, 0, 0, &mut out).unwrap();
+    assert!(read_open(&store, &open, 0, 1, &mut out).is_err());
+    assert!(out.is_empty());
+}
+
+#[test]
+fn a_small_tree_that_stands_for_more_folders_than_a_disk_holds_is_not_written() {
+    let temp = TempDir::new("read-unfold").unwrap();
+    let store = MemoryStore::new();
+    let mut builder = Builder::new(&store, small_pieces());
+    // An empty folder, and above it 100 folders that each hold the one below
+    // under two names.
+    let mut folder = builder.folder(Vec::new()).unwrap();
+    for _ in 0..100 {
+        folder = builder
+            .folder(vec![entry("a", folder), entry("b", folder)])
+            .unwrap();
+    }
+    let root = builder.finish(folder, ExtraData::new()).unwrap();
+    // To hold and to check, it is a tree like any other: 101 small lists.
+    assert_eq!(store.count(Stored::FolderList), 101);
+    assert_eq!(verify(&store, &root).unwrap().folders, 101);
+
+    // Written out, it would be more folders than there are numbers for.
+    // They are counted, each folder once, before anything is made.
+    let dest = temp.path().join("written");
+    match write_to_disk(&store, &root, &dest) {
+        Err(Error::LimitExceeded {
+            requested, limit, ..
+        }) => {
+            assert_eq!(requested, u64::MAX);
+            assert_eq!(limit, DEFAULT_MAX_WRITTEN_ENTRIES);
+        }
+        other => panic!("it was written: {other:?}"),
+    }
+    assert!(!dest.exists());
+
+    // Twenty levels of it are counted exactly: 2^21 - 1 folders.
+    let mut builder = Builder::new(&store, small_pieces());
+    let mut folder = builder.folder(Vec::new()).unwrap();
+    for _ in 0..20 {
+        folder = builder
+            .folder(vec![entry("a", folder), entry("b", folder)])
+            .unwrap();
+    }
+    let root = builder.finish(folder, ExtraData::new()).unwrap();
+    assert!(matches!(
+        write_to_disk(&store, &root, &dest),
+        Err(Error::LimitExceeded {
+            requested: 2_097_151,
+            ..
+        })
+    ));
+    assert!(!dest.exists());
+}
+
+#[test]
+fn writing_out_stays_within_what_it_is_given() {
+    let (temp, store, root) = sample_tree("read-limits");
+    let size = record_of(&store, &root).unwrap().top().size;
+    // The tree is seven files and five folders, the top one counted.
+    let cases = [
+        (WriteOptions::new().max_entries(11), false),
+        (WriteOptions::new().max_bytes(size - 1), false),
+        (WriteOptions::new().max_entries(12).max_bytes(size), true),
+    ];
+    for (number, (options, fits)) in cases.into_iter().enumerate() {
+        let dest = temp.path().join(format!("written-{number}"));
+        let written = write_to_disk_with(&store, &root, &dest, &options);
+        if fits {
+            written.unwrap();
+            assert!(dest.join("weights/shards/a.bin").is_file());
+        } else {
+            assert!(matches!(written, Err(Error::LimitExceeded { .. })));
+            assert!(!dest.exists(), "nothing is made before the limits are held");
+        }
+    }
+
+    // A file on top is one thing to make, and takes its own size.
+    let file = lookup(&store, &root, "weights/model.bin")
+        .unwrap()
+        .unwrap()
+        .target();
+    let alone = Builder::new(&store, small_pieces())
+        .finish(file, ExtraData::new())
+        .unwrap();
+    let dest = temp.path().join("alone.bin");
+    let too_few = WriteOptions::new().max_bytes(999);
+    assert!(write_to_disk_with(&store, &alone, &dest, &too_few).is_err());
+    assert!(!dest.exists());
+    let enough = WriteOptions::new().max_entries(1).max_bytes(1_000);
+    write_to_disk_with(&store, &alone, &dest, &enough).unwrap();
+    assert_eq!(fs::read(&dest).unwrap(), bytes("model", 1_000));
 }
 
 #[test]
