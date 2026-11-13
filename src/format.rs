@@ -25,6 +25,7 @@ use crate::tree::{
 use crate::{Error, Result};
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 /// The most bytes a piece may hold: 8 MiB.
 pub const MAX_PIECE_BYTES: usize = FASTCDC_MAX_SIZE;
@@ -638,8 +639,8 @@ impl FileList {
         })
     }
 
-    /// Reads a whole list: 36 bytes for each piece.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    /// Reads the items of a whole list: 36 bytes for each piece.
+    fn items_of(bytes: &[u8]) -> Result<Vec<PieceRef>> {
         if bytes.len() % LIST_ITEM_BYTES != 0 {
             return Err(invalid("a file's list is not a whole number of items"));
         }
@@ -648,7 +649,12 @@ impl FileList {
         while !reader.is_empty() {
             items.push(PieceRef::decode(&mut reader)?);
         }
-        Self::new(items)
+        Ok(items)
+    }
+
+    /// Reads a whole list: 36 bytes for each piece.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::new(Self::items_of(bytes)?)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -734,7 +740,7 @@ impl FileList {
 /// finding the pieces that hold a stretch of bytes.
 #[derive(Clone, Debug)]
 pub struct OpenFile {
-    list: FileList,
+    list: Arc<FileList>,
     tree: ListTree,
     /// Where each piece starts, and after the last one the file's size.
     starts: Vec<u64>,
@@ -742,7 +748,37 @@ pub struct OpenFile {
 
 impl OpenFile {
     pub fn new(list: FileList) -> Result<Self> {
+        Self::shared(Arc::new(list))
+    }
+
+    /// As [`OpenFile::new`], for a list that others hold too.
+    pub fn shared(list: Arc<FileList>) -> Result<Self> {
         let tree = ListTree::build(ListKind::File, &list.leaves())?;
+        Ok(Self::with_tree(list, tree))
+    }
+
+    /// Reads a whole list as [`FileList::decode`] does, and keeps its tree.
+    /// The list is hashed once for both.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let items = FileList::items_of(bytes)?;
+        let leaves: Vec<Leaf<'static>> = items
+            .iter()
+            .map(|item| Leaf {
+                node: item.leaf(),
+                name: &[],
+            })
+            .collect();
+        let tree = ListTree::build(ListKind::File, &leaves)?;
+        let top = tree.top()?;
+        let list = FileList {
+            hash: file_hash(items.len() as u64, top.size, &top.hash),
+            size: top.size,
+            items,
+        };
+        Ok(Self::with_tree(Arc::new(list), tree))
+    }
+
+    fn with_tree(list: Arc<FileList>, tree: ListTree) -> Self {
         let mut starts = Vec::with_capacity(list.items.len() + 1);
         let mut at = 0_u64;
         for item in &list.items {
@@ -750,11 +786,16 @@ impl OpenFile {
             at += u64::from(item.length);
         }
         starts.push(at);
-        Ok(Self { list, tree, starts })
+        Self { list, tree, starts }
     }
 
     pub fn list(&self) -> &FileList {
         &self.list
+    }
+
+    /// The list, to hold beside this.
+    pub fn shared_list(&self) -> Arc<FileList> {
+        Arc::clone(&self.list)
     }
 
     /// The byte at which piece `index` starts. The count gives the size.
@@ -944,14 +985,19 @@ impl FolderList {
         })
     }
 
-    /// Reads a whole list: its entries, one after another.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    /// Reads the entries of a whole list, one after another.
+    fn entries_of(bytes: &[u8]) -> Result<Vec<Entry>> {
         let mut reader = Reader::new(bytes, "a folder's list");
         let mut entries = Vec::new();
         while !reader.is_empty() {
             entries.push(Entry::decode(&mut reader)?);
         }
-        Self::new(entries)
+        Ok(entries)
+    }
+
+    /// Reads a whole list: its entries, one after another.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::new(Self::entries_of(bytes)?)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -1074,6 +1120,30 @@ pub struct OpenFolder {
 impl OpenFolder {
     pub fn new(list: FolderList) -> Result<Self> {
         let tree = ListTree::build(ListKind::Folder, &list.leaves())?;
+        Ok(Self { list, tree })
+    }
+
+    /// Reads a whole list as [`FolderList::decode`] does, and keeps its tree.
+    /// The list is hashed once for both.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let entries = FolderList::entries_of(bytes)?;
+        let leaves: Vec<Leaf<'_>> = entries
+            .iter()
+            .map(|entry| Leaf {
+                node: entry.leaf(),
+                name: entry.name.as_bytes(),
+            })
+            .collect();
+        let tree = ListTree::build(ListKind::Folder, &leaves)?;
+        let top = tree.top()?;
+        drop(leaves);
+        let encoded_len = entries.iter().map(|entry| entry.encoded_len() as u64).sum();
+        let list = FolderList {
+            hash: folder_hash(entries.len() as u64, top.size, &top.hash),
+            size: top.size,
+            encoded_len,
+            entries,
+        };
         Ok(Self { list, tree })
     }
 

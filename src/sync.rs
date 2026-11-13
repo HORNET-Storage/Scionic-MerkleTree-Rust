@@ -19,14 +19,14 @@
 
 use crate::fastcdc::FASTCDC_MIN_SIZE;
 use crate::format::{
-    check_name, Cutting, Entry, FileList, FolderList, FolderRun, Kind, OpenFile, OpenFolder,
-    Record, Target, LIST_ITEM_BYTES, MAX_CARRIED_NODES, MAX_ENTRY_BYTES, MAX_FOLDER_DEPTH,
-    MAX_NAME_BYTES, MAX_RECORD_BYTES,
+    check_name, Cutting, Entry, FileList, FolderRun, Kind, OpenFile, OpenFolder, Record, Target,
+    LIST_ITEM_BYTES, MAX_CARRIED_NODES, MAX_ENTRY_BYTES, MAX_FOLDER_DEPTH, MAX_NAME_BYTES,
+    MAX_RECORD_BYTES,
 };
 use crate::hash::{Hash, Root};
 use crate::intake::{Arrived, Intake, Summary};
 use crate::read::{file_of, folder_of, record_of};
-use crate::store::{check_piece, load_piece, missing, Store, Stored};
+use crate::store::{check_piece, damaged, load_piece, missing, Store, Stored};
 use crate::wire::{
     file_list_frame, file_run_frame, folder_list_frame, folder_run_frame, have_frame, piece_frame,
     read_frame, read_next, refused_frame, write_end, write_frame, Frame, HaveMap, Next, Refusal,
@@ -150,20 +150,64 @@ pub trait Peer {
     }
 }
 
+/// How many items of lists a responder keeps between requests, for each of
+/// the three kinds it keeps, unless it is told otherwise. This many items of
+/// files' lists stand for about half a terabyte of files.
+const RECENT_ITEMS: u64 = 1 << 18;
+
+/// The most lists of one kind that a responder keeps, however short.
+const RECENT_LISTS: usize = 64;
+
+/// The lists that were used last. Reading a list from the store and hashing
+/// it takes a pass over the whole of it, so a list that was asked about is
+/// kept for the next request. Lists are weighed by their items, and the ones
+/// used longest ago go first.
+struct Recent<T> {
+    kept: Vec<(Hash, Arc<T>, u64)>,
+}
+
+impl<T> Recent<T> {
+    fn new() -> Self {
+        Self { kept: Vec::new() }
+    }
+
+    fn get(&mut self, hash: &Hash) -> Option<Arc<T>> {
+        let at = self.kept.iter().position(|(kept, _, _)| kept == hash)?;
+        let found = self.kept.remove(at);
+        let value = Arc::clone(&found.1);
+        self.kept.push(found);
+        Some(value)
+    }
+
+    /// Keeps `value`, and lets go of older ones while there are more than
+    /// `most` items or too many lists. The newest one always stays.
+    fn keep(&mut self, hash: Hash, value: Arc<T>, items: u64, most: u64) {
+        self.kept.retain(|(kept, _, _)| *kept != hash);
+        self.kept.push((hash, value, items.max(1)));
+        let mut total: u64 = self.kept.iter().map(|(_, _, items)| *items).sum();
+        while self.kept.len() > 1 && (total > most || self.kept.len() > RECENT_LISTS) {
+            total -= self.kept.remove(0).2;
+        }
+    }
+}
+
 /// Answers requests from a store.
 ///
 /// It answers for whatever the store holds, by hash. It gives what it has and
 /// says so when it has nothing: a receiver never has to trust it, because a
 /// receiver checks every answer.
+///
+/// One responder serves many threads at once.
 pub struct Responder<'s> {
     store: &'s dyn Store,
-    /// The file whose list was read last.
-    list: Mutex<Option<Arc<FileList>>>,
-    /// The file and the folder whose trees were built last. Showing a part
-    /// of a long list needs its tree, and building it takes a pass over the
-    /// list, so the last one is kept for the next request.
-    file: Mutex<Option<Arc<OpenFile>>>,
-    folder: Mutex<Option<Arc<OpenFolder>>>,
+    /// The files whose lists were read last.
+    lists: Mutex<Recent<FileList>>,
+    /// The files and the folders whose trees were built last. Showing a
+    /// part of a long list needs its tree.
+    files: Mutex<Recent<OpenFile>>,
+    folders: Mutex<Recent<OpenFolder>>,
+    recent: u64,
+    have: bool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -176,63 +220,93 @@ impl<'s> Responder<'s> {
     pub fn new(store: &'s dyn Store) -> Self {
         Self {
             store,
-            list: Mutex::new(None),
-            file: Mutex::new(None),
-            folder: Mutex::new(None),
+            lists: Mutex::new(Recent::new()),
+            files: Mutex::new(Recent::new()),
+            folders: Mutex::new(Recent::new()),
+            recent: RECENT_ITEMS,
+            have: true,
         }
     }
 
+    /// How many items of lists are kept between requests, for each of the
+    /// three kinds: files' lists, files' trees and folders' trees. A list
+    /// that is not kept is read from the store and hashed again when it is
+    /// next asked about, which takes a pass over the whole of it. An item
+    /// kept costs some tens of bytes for a file and some hundreds for a
+    /// folder. The list that was used last is kept whatever its length.
+    pub fn recent(mut self, items: u64) -> Self {
+        self.recent = items;
+        self
+    }
+
+    /// Whether a peer is told which pieces of a file are held here. Telling
+    /// takes a look into the store for every piece of the file, so a
+    /// responder that serves strangers may leave it off. It then answers
+    /// such a request as it does for a file it does not hold.
+    pub fn have(mut self, on: bool) -> Self {
+        self.have = on;
+        self
+    }
+
     fn file_list(&self, file: &Hash) -> Result<Option<Arc<FileList>>> {
-        if let Some(list) = lock(&self.list).as_ref().filter(|list| list.hash() == file) {
-            return Ok(Some(Arc::clone(list)));
+        if let Some(list) = lock(&self.lists).get(file) {
+            return Ok(Some(list));
+        }
+        if let Some(open) = lock(&self.files).get(file) {
+            return Ok(Some(open.shared_list()));
         }
         let Some(bytes) = self.store.get(Stored::FileList, file)? else {
             return Ok(None);
         };
-        let list = FileList::decode(&bytes)?;
-        if list.hash() != file {
-            return Err(Error::HashMismatch {
-                what: "a stored file's list",
-            });
-        }
+        let list = FileList::decode(&bytes)
+            .ok()
+            .filter(|list| list.hash() == file)
+            .ok_or_else(|| damaged("a stored file's list", file))?;
         let list = Arc::new(list);
-        *lock(&self.list) = Some(Arc::clone(&list));
+        lock(&self.lists).keep(*file, Arc::clone(&list), list.count(), self.recent);
         Ok(Some(list))
     }
 
     fn open_file(&self, file: &Hash) -> Result<Option<Arc<OpenFile>>> {
-        if let Some(open) = lock(&self.file)
-            .as_ref()
-            .filter(|open| open.list().hash() == file)
-        {
-            return Ok(Some(Arc::clone(open)));
+        if let Some(open) = lock(&self.files).get(file) {
+            return Ok(Some(open));
         }
-        let Some(list) = self.file_list(file)? else {
-            return Ok(None);
+        // Looked up on a line of its own: the lock is let go before the
+        // list is hashed, so that other threads are not kept waiting.
+        let listed = lock(&self.lists).get(file);
+        let open = match listed {
+            Some(list) => OpenFile::shared(list)?,
+            None => {
+                let Some(bytes) = self.store.get(Stored::FileList, file)? else {
+                    return Ok(None);
+                };
+                // Read and hashed once, for the list and for its tree.
+                OpenFile::decode(&bytes)
+                    .ok()
+                    .filter(|open| open.list().hash() == file)
+                    .ok_or_else(|| damaged("a stored file's list", file))?
+            }
         };
-        let open = Arc::new(OpenFile::new(FileList::clone(&list))?);
-        *lock(&self.file) = Some(Arc::clone(&open));
+        let open = Arc::new(open);
+        let items = open.list().count();
+        lock(&self.files).keep(*file, Arc::clone(&open), items, self.recent);
         Ok(Some(open))
     }
 
     fn open_folder(&self, folder: &Hash) -> Result<Option<Arc<OpenFolder>>> {
-        if let Some(open) = lock(&self.folder)
-            .as_ref()
-            .filter(|open| open.list().hash() == folder)
-        {
-            return Ok(Some(Arc::clone(open)));
+        if let Some(open) = lock(&self.folders).get(folder) {
+            return Ok(Some(open));
         }
         let Some(bytes) = self.store.get(Stored::FolderList, folder)? else {
             return Ok(None);
         };
-        let list = FolderList::decode(&bytes)?;
-        if list.hash() != folder {
-            return Err(Error::HashMismatch {
-                what: "a stored folder's list",
-            });
-        }
-        let open = Arc::new(OpenFolder::new(list)?);
-        *lock(&self.folder) = Some(Arc::clone(&open));
+        let open = OpenFolder::decode(&bytes)
+            .ok()
+            .filter(|open| open.list().hash() == folder)
+            .ok_or_else(|| damaged("a stored folder's list", folder))?;
+        let open = Arc::new(open);
+        let items = open.list().count();
+        lock(&self.folders).keep(*folder, Arc::clone(&open), items, self.recent);
         Ok(Some(open))
     }
 
@@ -329,6 +403,9 @@ impl<'s> Responder<'s> {
                 Ok(())
             }
             Request::Have(file) => {
+                if !self.have {
+                    return on_frame(&not_held);
+                }
                 let Some(list) = self.file_list(&file)? else {
                     return on_frame(&not_held);
                 };
