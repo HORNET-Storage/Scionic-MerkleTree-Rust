@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod json;
+
 use scionic_merkletree::{DagBuildOptions, Result};
 use std::fs;
 use std::io;
