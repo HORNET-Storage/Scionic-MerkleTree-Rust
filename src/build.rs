@@ -1,19 +1,19 @@
 //! Building a tree: from a folder or a file on disk, or part by part.
 
-use crate::fastcdc::StreamCutter;
+use crate::fastcdc::{StreamCutter, FASTCDC_MAX_SIZE};
 use crate::format::{
     check_name, Cutting, Entry, ExtraData, FileList, FolderList, Kind, PieceRef, Record, Target,
-    Totals, MAX_FOLDER_DEPTH, TIMESTAMP_KEY,
+    MAX_FOLDER_DEPTH, TIMESTAMP_KEY,
 };
-use crate::hash::{Hash, Root};
+use crate::hash::Root;
 use crate::intake::Intake;
-use crate::store::{load_file, load_folder, missing, Store, Stored};
+use crate::store::{Store, Stored};
 use crate::{io_error, Error, Result};
-use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Reads once, and again when the read was only interrupted.
@@ -26,6 +26,77 @@ pub(crate) fn read_some(reader: &mut dyn Read, buffer: &mut [u8]) -> io::Result<
     }
 }
 
+/// How much of a file a builder holds at a time when it works alone: two
+/// pieces of the longest kind.
+const ROOM_ALONE: usize = 2 * FASTCDC_MAX_SIZE;
+
+/// How much of a file a builder holds at a time when other threads help it:
+/// enough pieces to give each of them some.
+const ROOM_WITH_HELP: usize = 8 * FASTCDC_MAX_SIZE;
+
+/// How many pieces of a file that lies in memory are handed on at a time.
+const PIECES_AT_A_TIME: usize = 64;
+
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+/// The threads that are free to help with a long file.
+///
+/// A file is cut on the thread that asks for it, because where one piece
+/// ends decides where the next begins. Hashing and keeping the pieces is the
+/// greater part of the work and needs no order, so it is shared out among
+/// that thread and the helpers that are free.
+pub(crate) struct Helpers {
+    free: AtomicUsize,
+}
+
+impl Helpers {
+    fn new(free: usize) -> Arc<Self> {
+        Arc::new(Self {
+            free: AtomicUsize::new(free),
+        })
+    }
+
+    /// The helpers of a builder that may use `threads` threads, its own
+    /// counted. Zero is one thread for each core.
+    fn for_threads(threads: usize) -> Arc<Self> {
+        let threads = match threads {
+            0 => cores(),
+            threads => threads,
+        };
+        Self::new(threads - 1)
+    }
+
+    fn any(&self) -> bool {
+        self.free.load(Ordering::Relaxed) > 0
+    }
+
+    /// Takes up to `most` helpers, and says how many it got.
+    fn take(&self, most: usize) -> usize {
+        let mut free = self.free.load(Ordering::Relaxed);
+        loop {
+            let taken = free.min(most);
+            if taken == 0 {
+                return 0;
+            }
+            match self.free.compare_exchange_weak(
+                free,
+                free - taken,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return taken,
+                Err(now) => free = now,
+            }
+        }
+    }
+
+    fn give(&self, count: usize) {
+        self.free.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
 /// Builds a tree part by part: files from their bytes, folders from their
 /// entries, and at the end the record.
 ///
@@ -35,15 +106,31 @@ pub struct Builder<'s> {
     store: &'s dyn Store,
     cutting: Cutting,
     cutter: StreamCutter,
+    helpers: Arc<Helpers>,
 }
 
 impl<'s> Builder<'s> {
+    /// A builder that uses one thread for each core on a long file.
     pub fn new(store: &'s dyn Store, cutting: Cutting) -> Self {
+        Self::sharing(store, cutting, Helpers::for_threads(0))
+    }
+
+    fn sharing(store: &'s dyn Store, cutting: Cutting, helpers: Arc<Helpers>) -> Self {
         Self {
             store,
             cutting,
             cutter: StreamCutter::new(),
+            helpers,
         }
+    }
+
+    /// How many threads hash and keep the pieces of one file: 1 is the
+    /// calling thread alone, and zero is one thread for each core. A file is
+    /// always cut on the calling thread. With help, a builder holds up to
+    /// 64 MiB of a long file at a time; alone it holds up to 16 MiB.
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.helpers = Helpers::for_threads(threads);
+        self
     }
 
     /// How this builder cuts files.
@@ -52,8 +139,8 @@ impl<'s> Builder<'s> {
     }
 
     /// Cuts everything `reader` gives into pieces, keeps the pieces and the
-    /// file's list, and says what the file is. No more than one piece of the
-    /// file is held in memory at a time.
+    /// file's list, and says what the file is. The file is never held in
+    /// memory whole: only a window of it, as [`Builder::threads`] says.
     pub fn file(&mut self, reader: &mut dyn Read) -> Result<Target> {
         self.file_from(|buffer| {
             read_some(reader, buffer).map_err(|source| Error::Stream {
@@ -63,9 +150,14 @@ impl<'s> Builder<'s> {
         })
     }
 
-    /// The file with these bytes.
-    pub fn file_from_bytes(&mut self, mut bytes: &[u8]) -> Result<Target> {
-        self.file(&mut bytes)
+    /// The file with these bytes. They are cut where they lie, and nothing
+    /// is copied on the way to the store.
+    pub fn file_from_bytes(&mut self, bytes: &[u8]) -> Result<Target> {
+        let mut items = Vec::new();
+        for pieces in self.cutting.cut(bytes).chunks(PIECES_AT_A_TIME) {
+            keep_pieces(self.store, &self.helpers, pieces, &mut items)?;
+        }
+        self.keep_list(items)
     }
 
     /// The file at `path` on disk.
@@ -78,18 +170,26 @@ impl<'s> Builder<'s> {
 
     fn file_from(&mut self, read: impl FnMut(&mut [u8]) -> Result<usize>) -> Result<Target> {
         let store = self.store;
+        let helpers = &self.helpers;
+        let room = if helpers.any() {
+            ROOM_WITH_HELP
+        } else {
+            ROOM_ALONE
+        };
         let mut items = Vec::new();
-        self.cutter.cut(self.cutting, read, |piece| {
-            let item = PieceRef::of(piece)?;
-            if !store.has(Stored::Piece, &item.hash)? {
-                store.put(Stored::Piece, &item.hash, piece)?;
-            }
-            items.push(item);
-            Ok(())
+        self.cutter.cut(self.cutting, room, read, |pieces| {
+            keep_pieces(store, helpers, pieces, &mut items)
         })?;
+        self.keep_list(items)
+    }
+
+    /// Keeps the list of a file whose pieces are kept, and says what the
+    /// file is.
+    fn keep_list(&self, items: Vec<PieceRef>) -> Result<Target> {
         let list = FileList::new(items)?;
-        if !store.has(Stored::FileList, list.hash())? {
-            store.put(Stored::FileList, list.hash(), &list.encode())?;
+        if !self.store.has(Stored::FileList, list.hash())? {
+            self.store
+                .put(Stored::FileList, list.hash(), &list.encode())?;
         }
         Ok(list.target())
     }
@@ -107,71 +207,85 @@ impl<'s> Builder<'s> {
     }
 
     /// Writes the record of the tree that has `top` on top, and gives the
-    /// tree's root. The store must hold every list under `top`. The whole
-    /// tree is checked before its record is kept: its sizes, how its files
-    /// are cut, and how deep its folders sit.
+    /// tree's root. The store must hold every list under `top`.
+    ///
+    /// The whole tree is checked before its record is kept: its sizes, how
+    /// its files are cut, and how deep its folders sit. The checks are the
+    /// ones a tree goes through when it is taken in, and the totals in the
+    /// record are what those checks counted.
     pub fn finish(self, top: Target, extra: ExtraData) -> Result<Root> {
-        let totals = totals_of(self.store, &top)?;
+        let totals = Intake::measure(self.store, top, self.cutting)?;
         let record = Record::new(top, totals, self.cutting, extra)?;
         let bytes = record.encode();
         let root = Root::of_record(&bytes);
-        let held_before = self.store.has(Stored::Record, root.as_hash())?;
         self.store.put(Stored::Record, root.as_hash(), &bytes)?;
-        let checked = Intake::new(self.store, root).and_then(|intake| intake.finish_lists());
-        if let Err(error) = checked {
-            if !held_before {
-                self.store.remove(Stored::Record, root.as_hash())?;
-            }
-            return Err(error);
-        }
         Ok(root)
     }
 }
 
-/// Counts what a record says about its tree: each different piece and each
-/// different list, once.
-fn totals_of(store: &dyn Store, top: &Target) -> Result<Totals> {
-    let mut totals = Totals::default();
-    let mut lists: HashSet<(Kind, Hash)> = HashSet::new();
-    let mut pieces: HashMap<Hash, u32> = HashMap::new();
-    let mut pending = vec![*top];
-    let overflow = || Error::SizeOverflow {
-        field: "a tree's totals",
-    };
-    while let Some(target) = pending.pop() {
-        if !lists.insert((target.kind, target.hash)) {
-            continue;
-        }
-        match target.kind {
-            Kind::Folder => {
-                let list = load_folder(store, &target)?
-                    .ok_or_else(|| missing("the list of the folder", &target.hash))?;
-                totals.list_bytes = totals
-                    .list_bytes
-                    .checked_add(list.encoded_len())
-                    .ok_or_else(overflow)?;
-                pending.extend(list.entries().iter().map(Entry::target));
-            }
-            Kind::File => {
-                let list = load_file(store, &target)?
-                    .ok_or_else(|| missing("the list of the file", &target.hash))?;
-                totals.list_bytes = totals
-                    .list_bytes
-                    .checked_add(list.encoded_len())
-                    .ok_or_else(overflow)?;
-                for item in list.items() {
-                    if pieces.insert(item.hash, item.length).is_none() {
-                        totals.pieces += 1;
-                        totals.piece_bytes = totals
-                            .piece_bytes
-                            .checked_add(u64::from(item.length))
-                            .ok_or_else(overflow)?;
-                    }
-                }
-            }
-        }
+/// Hashes and keeps one piece, and says what it is. A piece that the store
+/// holds already is not written again.
+fn keep_piece(store: &dyn Store, piece: &[u8]) -> Result<PieceRef> {
+    let item = PieceRef::of(piece)?;
+    if !store.has(Stored::Piece, &item.hash)? {
+        store.put(Stored::Piece, &item.hash, piece)?;
     }
-    Ok(totals)
+    Ok(item)
+}
+
+/// Hashes and keeps pieces that follow one another in a file, and adds what
+/// they are to `items`, in their order. Helpers that are free take a share.
+fn keep_pieces(
+    store: &dyn Store,
+    helpers: &Helpers,
+    pieces: &[&[u8]],
+    items: &mut Vec<PieceRef>,
+) -> Result<()> {
+    // A helper is worth starting only for a few pieces of its own.
+    let helping = helpers.take(pieces.len() / 2);
+    if helping == 0 {
+        for piece in pieces {
+            items.push(keep_piece(store, piece)?);
+        }
+        return Ok(());
+    }
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut kept = Vec::new();
+        loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(piece) = pieces.get(index) else {
+                return kept;
+            };
+            let item = keep_piece(store, piece);
+            if item.is_err() {
+                next.store(pieces.len(), Ordering::Relaxed);
+            }
+            kept.push((index, item));
+        }
+    };
+    let kept: Vec<(usize, Result<PieceRef>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..helping).map(|_| scope.spawn(work)).collect();
+        let mut kept = work();
+        for handle in handles {
+            match handle.join() {
+                Ok(more) => kept.extend(more),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        kept
+    });
+    helpers.give(helping);
+    let mut found: Vec<Option<PieceRef>> = vec![None; pieces.len()];
+    for (index, item) in kept {
+        found[index] = Some(item?);
+    }
+    for item in found {
+        items.push(item.ok_or(Error::Invariant {
+            detail: "a piece was left out of a file",
+        })?);
+    }
+    Ok(())
 }
 
 /// What a builder does with a link or a special file that it finds in a
@@ -221,7 +335,9 @@ impl BuildOptions {
         self
     }
 
-    /// How many files are cut at once. Zero is one for each core.
+    /// How many threads build the tree. Zero is one for each core. Files
+    /// are cut several at once, and a thread that has no file of its own
+    /// helps to hash the pieces of a long one.
     pub fn workers(mut self, workers: usize) -> Self {
         self.workers = workers;
         self
@@ -262,7 +378,7 @@ pub fn build_with(
         extra.insert(TIMESTAMP_KEY, timestamp(SystemTime::now())?)?;
     }
     let metadata = fs::metadata(path).map_err(|error| io_error("look at", path, error))?;
-    let mut builder = Builder::new(store, cutting);
+    let mut builder = Builder::new(store, cutting).threads(options.workers);
     if !metadata.is_dir() {
         let top = builder.file_at(path)?;
         return builder.finish(top, extra);
@@ -383,15 +499,17 @@ fn store_files(
     files: &[PathBuf],
     workers: usize,
 ) -> Result<Vec<Target>> {
-    let workers = match workers {
-        0 => std::thread::available_parallelism().map_or(1, usize::from),
+    let threads = match workers {
+        0 => cores(),
         workers => workers,
-    }
-    .min(files.len());
+    };
+    let workers = threads.min(files.len());
+    // The threads that have no file of their own help with the long files.
+    let helpers = Helpers::new(threads - workers);
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let work = || -> Result<Vec<(usize, Target)>> {
-        let mut builder = Builder::new(store, cutting);
+        let mut builder = Builder::sharing(store, cutting, Arc::clone(&helpers));
         let mut done = Vec::new();
         while !failed.load(Ordering::Relaxed) {
             let index = next.fetch_add(1, Ordering::Relaxed);
@@ -406,6 +524,9 @@ fn store_files(
                 }
             }
         }
+        // This thread has no file left, and may help with the ones that
+        // are still being cut.
+        helpers.give(1);
         Ok(done)
     };
     let results: Vec<Result<Vec<(usize, Target)>>> = if workers <= 1 {

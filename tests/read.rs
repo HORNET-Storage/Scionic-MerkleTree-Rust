@@ -199,7 +199,7 @@ fn a_file_with_a_piece_missing_gives_an_error_and_no_bytes() {
         .unwrap();
     assert!(matches!(
         read_file_to_vec(&store, &file),
-        Err(Error::HashMismatch { .. })
+        Err(Error::Corrupt { .. })
     ));
     store.remove(Stored::Piece, &piece.hash).unwrap();
     store

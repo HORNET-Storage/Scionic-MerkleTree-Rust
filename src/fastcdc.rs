@@ -124,10 +124,15 @@ pub(crate) static FASTCDC_GEAR: [u64; 256] = [
 /// ends at EOF — under that contract the decision is final: a boundary can
 /// never depend on bytes past the forced maximum.
 ///
-/// This loop IS the normative fastcdc-v1 boundary definition. The rolling
-/// hash starts at zero for every chunk, bytes `[0, FASTCDC_MIN_SIZE)` are
-/// skipped without hashing, arithmetic is wrapping u64, and a match on byte
-/// index `i` cuts AFTER that byte (length `i + 1`).
+/// The normative fastcdc-v1 boundary definition is one byte a step: the
+/// rolling hash starts at zero for every chunk, bytes `[0, FASTCDC_MIN_SIZE)`
+/// are skipped without hashing, each later byte `b` turns the hash `h` into
+/// `(h << 1) + G[b]` in wrapping u64 arithmetic, and the first byte index `i`
+/// whose hash has no bit of the mask set cuts AFTER that byte (length
+/// `i + 1`). The strict mask judges indexes below [`FASTCDC_TARGET_SIZE`] and
+/// the loose mask the ones from it on. This function gives exactly that, with
+/// four hashes at work side by side; the tests hold it against the one-byte
+/// loop.
 pub(crate) fn fastcdc_boundary(data: &[u8]) -> usize {
     let n = data.len();
     if n <= FASTCDC_MIN_SIZE {
@@ -136,14 +141,114 @@ pub(crate) fn fastcdc_boundary(data: &[u8]) -> usize {
     let limit = n.min(FASTCDC_MAX_SIZE);
     let normal = FASTCDC_TARGET_SIZE.min(limit);
     let mut h: u64 = 0;
-    for i in FASTCDC_MIN_SIZE..normal {
-        h = (h << 1).wrapping_add(FASTCDC_GEAR[data[i] as usize]);
+    if let Some(cut) = scan(data, FASTCDC_MIN_SIZE, normal, FASTCDC_STRICT_MASK, &mut h) {
+        return cut;
+    }
+    if let Some(cut) = scan(data, normal, limit, FASTCDC_LOOSE_MASK, &mut h) {
+        return cut;
+    }
+    limit
+}
+
+/// How many bytes a hash remembers. Every step shifts it one bit to the left,
+/// so a byte has left it for good 64 steps later: the hash after a byte is
+/// made of that byte and the 63 before it, and of nothing else.
+const GEAR_WINDOW: usize = 64;
+
+/// How many bytes each of the four hashes rolls over in a round.
+const STRIDE: usize = 4096;
+
+#[inline(always)]
+fn roll(hash: u64, byte: u8) -> u64 {
+    (hash << 1).wrapping_add(FASTCDC_GEAR[byte as usize])
+}
+
+/// Rolls the hash `h` over `data[from..to]`, and gives the length that the
+/// first matching byte cuts at. Without a match, `h` is left as the hash
+/// after byte `to - 1`.
+///
+/// One hash can take a byte only when it is done with the byte before, and
+/// that wait is what bounds a plain loop. So four stretches that follow one
+/// another are rolled over side by side, a byte of each in turn. The first
+/// hash carries on from where it was. Each of the others starts 64 bytes
+/// before its own stretch, which is all a hash remembers, so it holds what a
+/// single hash would hold there. When any of the four matches, the first one
+/// goes on alone to the first match in the order of the bytes.
+///
+/// `from` is at least [`FASTCDC_MIN_SIZE`], where hashing begins: a stretch
+/// that is not the first one always has 64 hashed bytes before it.
+#[inline]
+fn scan(data: &[u8], from: usize, to: usize, mask: u64, h: &mut u64) -> Option<usize> {
+    let mut hash = *h;
+    let mut at = from;
+    while to - at >= 4 * STRIDE {
+        let (first, rest) = data[at..at + 4 * STRIDE].split_at(STRIDE);
+        let (second, rest) = rest.split_at(STRIDE);
+        let (third, fourth) = rest.split_at(STRIDE);
+        let warm = |before: &[u8]| {
+            before[STRIDE - GEAR_WINDOW..]
+                .iter()
+                .fold(0_u64, |hash, &byte| roll(hash, byte))
+        };
+        let mut h0 = hash;
+        let mut h1 = warm(first);
+        let mut h2 = warm(second);
+        let mut h3 = warm(third);
+        let mut steps = 0_usize;
+        let mut matched = false;
+        for (((&a, &b), &c), &d) in first.iter().zip(second).zip(third).zip(fourth) {
+            h0 = roll(h0, a);
+            h1 = roll(h1, b);
+            h2 = roll(h2, c);
+            h3 = roll(h3, d);
+            steps += 1;
+            if (h0 & mask == 0) | (h1 & mask == 0) | (h2 & mask == 0) | (h3 & mask == 0) {
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            if h0 & mask == 0 {
+                return Some(at + steps);
+            }
+            // A later stretch matched. An earlier byte may match too, so the
+            // first hash goes on alone, and stops at the first match there is.
+            hash = h0;
+            at += steps;
+            break;
+        }
+        hash = h3;
+        at += 4 * STRIDE;
+    }
+    for &byte in &data[at..to] {
+        hash = roll(hash, byte);
+        at += 1;
+        if hash & mask == 0 {
+            return Some(at);
+        }
+    }
+    *h = hash;
+    None
+}
+
+/// The boundary definition as it is written down: one byte a step.
+#[cfg(test)]
+fn fastcdc_boundary_plain(data: &[u8]) -> usize {
+    let n = data.len();
+    if n <= FASTCDC_MIN_SIZE {
+        return n;
+    }
+    let limit = n.min(FASTCDC_MAX_SIZE);
+    let normal = FASTCDC_TARGET_SIZE.min(limit);
+    let mut h: u64 = 0;
+    for (i, &byte) in data.iter().enumerate().take(normal).skip(FASTCDC_MIN_SIZE) {
+        h = (h << 1).wrapping_add(FASTCDC_GEAR[byte as usize]);
         if h & FASTCDC_STRICT_MASK == 0 {
             return i + 1;
         }
     }
-    for i in normal..limit {
-        h = (h << 1).wrapping_add(FASTCDC_GEAR[data[i] as usize]);
+    for (i, &byte) in data.iter().enumerate().take(limit).skip(normal) {
+        h = (h << 1).wrapping_add(FASTCDC_GEAR[byte as usize]);
         if h & FASTCDC_LOOSE_MASK == 0 {
             return i + 1;
         }
@@ -174,8 +279,16 @@ impl Cutting {
     }
 }
 
-/// Cuts a stream into pieces without holding more than one window of it. One
-/// cutter serves many files, one after another, with the same window.
+/// What a cutter's window holds when it starts on its first stream. The
+/// window grows only as a stream turns out to be longer, so a small file
+/// never costs a large window.
+const WINDOW_START: usize = 64 * 1024;
+
+/// The most pieces of a fixed size that are handed on at a time.
+const FIXED_PIECES_AT_A_TIME: usize = 1024;
+
+/// Cuts a stream into pieces, holding a window of it and no more. One cutter
+/// serves many files, one after another, with the same window.
 pub(crate) struct StreamCutter {
     window: Vec<u8>,
 }
@@ -185,39 +298,57 @@ impl StreamCutter {
         Self { window: Vec::new() }
     }
 
-    /// Reads with `read` until it gives no more bytes, and hands each piece
-    /// to `on_piece`, in order. A piece is lent only for the call.
+    /// Makes the window longer: twice as long, and never longer than `room`.
+    fn grow(&mut self, room: usize) -> Result<()> {
+        let length = (self.window.len() * 2).max(WINDOW_START).min(room);
+        let more = length.saturating_sub(self.window.len());
+        self.window
+            .try_reserve_exact(more)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "the cutting window",
+                requested: length as u64,
+            })?;
+        self.window.resize(length, 0);
+        Ok(())
+    }
+
+    /// Reads with `read` until it gives no more bytes, and hands the pieces
+    /// to `on_pieces` in order: each time, all the pieces that the window
+    /// holds whole. The pieces are lent only for the call.
+    ///
+    /// `room` is the most bytes the window may hold. It always holds one
+    /// piece of the longest kind; with more room, more pieces are handed on
+    /// at a time, and fewer bytes are moved to make room for the next ones.
     ///
     /// The windowing rule: where a piece ends is settled only once the window
-    /// holds [`FASTCDC_MAX_SIZE`] bytes or the input has ended. That is what
-    /// makes cutting a stream the same as cutting the whole of it at once.
+    /// holds [`FASTCDC_MAX_SIZE`] bytes from the piece's start, or the input
+    /// has ended. That is what makes cutting a stream the same as cutting
+    /// the whole of it at once.
     pub(crate) fn cut(
         &mut self,
         cutting: Cutting,
+        room: usize,
         mut read: impl FnMut(&mut [u8]) -> Result<usize>,
-        mut on_piece: impl FnMut(&[u8]) -> Result<()>,
+        mut on_pieces: impl FnMut(&[&[u8]]) -> Result<()>,
     ) -> Result<()> {
-        let window_len = match cutting {
-            Cutting::FastCdcV1 => FASTCDC_MAX_SIZE,
-            Cutting::Fixed(size) => size.get() as usize,
+        let (longest, room) = match cutting {
+            Cutting::FastCdcV1 => (FASTCDC_MAX_SIZE, room.max(FASTCDC_MAX_SIZE)),
+            Cutting::Fixed(size) => {
+                let size = size.get() as usize;
+                let most = size.saturating_mul(FIXED_PIECES_AT_A_TIME);
+                (size, room.min(most).max(size))
+            }
         };
-        if self.window.len() != window_len {
-            self.window.clear();
-            self.window
-                .try_reserve_exact(window_len)
-                .map_err(|_| Error::AllocationFailed {
-                    resource: "the cutting window",
-                    requested: window_len as u64,
-                })?;
-            self.window.resize(window_len, 0);
-        }
-        let window = &mut self.window;
         let mut filled = 0_usize;
         let mut ended = false;
         loop {
-            while filled < window.len() && !ended {
-                let count = read(&mut window[filled..])?;
-                if count > window.len() - filled {
+            while !ended && filled < room {
+                if filled == self.window.len() {
+                    self.grow(room)?;
+                }
+                let end = self.window.len().min(room);
+                let count = read(&mut self.window[filled..end])?;
+                if count > end - filled {
                     return Err(Error::Invariant {
                         detail: "a reader gave more bytes than it was asked for",
                     });
@@ -228,18 +359,26 @@ impl StreamCutter {
                     filled += count;
                 }
             }
-            while filled == window.len() || (ended && filled > 0) {
-                let cut = match cutting {
-                    Cutting::FastCdcV1 => fastcdc_boundary(&window[..filled]),
-                    Cutting::Fixed(_) => filled,
-                };
-                on_piece(&window[..cut])?;
-                window.copy_within(cut..filled, 0);
-                filled -= cut;
-                if !ended {
-                    break; // fill the window again before the next cut
+            let window = &self.window[..filled];
+            let mut pieces: Vec<&[u8]> = Vec::new();
+            let mut start = 0_usize;
+            while start < filled {
+                let rest = &window[start..];
+                if !ended && rest.len() < longest {
+                    break; // not settled: fill the window again first
                 }
+                let cut = match cutting {
+                    Cutting::FastCdcV1 => fastcdc_boundary(rest),
+                    Cutting::Fixed(_) => rest.len().min(longest),
+                };
+                pieces.push(&rest[..cut]);
+                start += cut;
             }
+            if !pieces.is_empty() {
+                on_pieces(&pieces)?;
+            }
+            self.window.copy_within(start..filled, 0);
+            filled -= start;
             if ended && filled == 0 {
                 return Ok(());
             }
@@ -382,34 +521,77 @@ mod tests {
             3 << 20,
             20 << 20,
         ];
+        let corpus = corpus_bytes("scionic-fastcdc-v1:test:stream", 20 << 20);
         let mut cutter = StreamCutter::new();
         for cutting in [Cutting::FastCdcV1, Cutting::fixed(1 << 20).unwrap()] {
             for length in lengths {
-                let data = corpus_bytes("scionic-fastcdc-v1:test:stream", length);
+                let data = &corpus[..length];
                 let expected: Vec<Vec<u8>> =
-                    cutting.cut(&data).into_iter().map(<[u8]>::to_vec).collect();
-                let mut streamed: Vec<Vec<u8>> = Vec::new();
-                let mut reader = StutterReader {
-                    data: data.clone(),
-                    offset: 0,
-                    step: 64 * 1024 + 17,
-                };
-                cutter
-                    .cut(
-                        cutting,
-                        |buffer| Ok(reader.read(buffer).unwrap()),
-                        |piece| {
-                            streamed.push(piece.to_vec());
-                            Ok(())
-                        },
-                    )
-                    .unwrap();
-                assert_eq!(
-                    streamed, expected,
-                    "{cutting:?}, length {length}: streaming vs slice cutting"
-                );
+                    cutting.cut(data).into_iter().map(<[u8]>::to_vec).collect();
+                // The smallest window, one that is filled several times, and
+                // one that the whole stream fits into.
+                for room in [0, 2 * FASTCDC_MAX_SIZE, 5 * FASTCDC_MAX_SIZE + 3] {
+                    let mut streamed: Vec<Vec<u8>> = Vec::new();
+                    let mut reader = StutterReader {
+                        data: data.to_vec(),
+                        offset: 0,
+                        step: 64 * 1024 + 17,
+                    };
+                    cutter
+                        .cut(
+                            cutting,
+                            room,
+                            |buffer| Ok(reader.read(buffer).unwrap()),
+                            |pieces| {
+                                streamed.extend(pieces.iter().map(|piece| piece.to_vec()));
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        streamed, expected,
+                        "{cutting:?}, length {length}, room {room}: streaming vs slice cutting"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn the_fast_boundary_is_the_plain_one() {
+        let corpus = corpus_bytes("scionic-fastcdc-v1:test:boundary", 24 << 20);
+        let mut strict = 0;
+        let mut loose = 0;
+        let mut steps = BTreeSet::new();
+        let mut check = |data: &[u8]| {
+            let cut = fastcdc_boundary(data);
+            assert_eq!(cut, fastcdc_boundary_plain(data), "length {}", data.len());
+            if cut > FASTCDC_MIN_SIZE && cut < data.len().min(FASTCDC_MAX_SIZE) {
+                steps.insert((cut - FASTCDC_MIN_SIZE) % 4);
+                if cut <= FASTCDC_TARGET_SIZE {
+                    strict += 1;
+                } else {
+                    loose += 1;
+                }
+            }
+        };
+        // Whole windows, from many starts.
+        for start in (0..corpus.len() - FASTCDC_MAX_SIZE).step_by(262_139) {
+            check(&corpus[start..]);
+        }
+        // Windows that end at every kind of place: around the floor, around
+        // the switch of masks, around the ceiling, and a few bytes on.
+        for edge in [FASTCDC_MIN_SIZE, FASTCDC_TARGET_SIZE, FASTCDC_MAX_SIZE] {
+            for length in edge - 5..=edge + 9 {
+                check(&corpus[1_000_003..1_000_003 + length]);
+            }
+        }
+        // Bytes that never match are cut at the ceiling, or where they end.
+        let zeros = vec![0_u8; FASTCDC_MAX_SIZE + 7];
+        check(&zeros);
+        check(&zeros[..FASTCDC_TARGET_SIZE + 2]);
+        assert_eq!(steps.len(), 4, "a cut at every place within a step of four");
+        assert!(strict > 0 && loose > 0, "cuts under both masks");
     }
 
     #[test]

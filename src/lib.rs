@@ -112,6 +112,12 @@ pub enum Error {
     NotWanted {
         what: &'static str,
     },
+    /// A store holds, under a hash, bytes that are not what the hash says.
+    /// Removing them from the store and fetching the tree again mends it.
+    Corrupt {
+        what: &'static str,
+        hash: Hash,
+    },
     /// A store does not hold something that the tree needs.
     Missing {
         what: &'static str,
@@ -192,6 +198,10 @@ impl fmt::Display for Error {
             Self::NotWanted { what } => {
                 write!(f, "{what} is not tied to the root, or was not asked for")
             }
+            Self::Corrupt { what, hash } => write!(
+                f,
+                "{what} {hash} is damaged: its bytes are not what its hash says"
+            ),
             Self::Missing { what, hash } => write!(f, "{what} {hash} is not held"),
             Self::TooDeep { limit } => {
                 write!(f, "folders sit inside one another more than {limit} deep")

@@ -18,14 +18,15 @@
 
 use crate::fastcdc::StreamCutter;
 use crate::format::{
-    Cutting, FileList, FolderList, Kind, Record, Target, Totals, LIST_ITEM_BYTES, MAX_FOLDER_DEPTH,
-    MAX_PIECE_BYTES, MAX_RECORD_BYTES,
+    Cutting, FileList, FolderList, Kind, PieceRef, Record, Target, Totals, LIST_ITEM_BYTES,
+    MAX_FOLDER_DEPTH, MAX_PIECE_BYTES, MAX_RECORD_BYTES,
 };
 use crate::hash::{Hash, Root};
-use crate::store::{load_piece, load_record, missing, Store, Stored};
+use crate::store::{load_record, missing, Store, Stored};
 use crate::wire::{Request, FRAME_FILE_LIST, FRAME_FOLDER_LIST, FRAME_PIECE, FRAME_RECORD};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// The most pieces one request asks for.
@@ -68,6 +69,8 @@ pub struct Summary {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VerifyOptions {
     recut: bool,
+    discard: bool,
+    workers: usize,
 }
 
 impl VerifyOptions {
@@ -82,13 +85,30 @@ impl VerifyOptions {
         self.recut = on;
         self
     }
+
+    /// Removes from the store what is damaged there: a piece, a list or a
+    /// record whose bytes are not what its hash says. The check then ends
+    /// with one of them as missing, and a fetch of the tree brings them all
+    /// again. Without this the check stops at a damaged thing and names it,
+    /// and the store is left as it is.
+    pub fn discard_damaged(mut self, on: bool) -> Self {
+        self.discard = on;
+        self
+    }
+
+    /// How many pieces are hashed at once. Zero is one for each core.
+    pub fn workers(mut self, workers: usize) -> Self {
+        self.workers = workers;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Default)]
 struct Mode {
-    /// Hash again the pieces that the store holds already.
-    rehash: bool,
+    /// Cut again the files that are held whole.
     recut: bool,
+    /// Remove from the store what is damaged there, and want it again.
+    discard: bool,
 }
 
 struct FolderSlot {
@@ -122,11 +142,18 @@ struct PieceSlot {
 /// that is named and then fails a check shows that the tree itself is wrong.
 /// The list is not kept, and the intake is done: every later call gives
 /// [`Error::IntakeFailed`]. A new intake picks up from what the store holds.
+///
+/// What the store holds under a hash and is not what the hash says is
+/// damaged. An intake removes it from the store and wants it again, so a tree
+/// that was harmed where it is kept is made whole by fetching it once more.
+/// Nothing a peer sends can make an intake remove what is sound.
 pub struct Intake<'s> {
     store: &'s dyn Store,
     root: Root,
     mode: Mode,
     record: Option<Record>,
+    /// How the files are cut, for a tree that has no record yet.
+    measuring: Option<Cutting>,
     folders: HashMap<Hash, FolderSlot>,
     files: HashMap<Hash, FileSlot>,
     pieces: HashMap<Hash, PieceSlot>,
@@ -138,6 +165,8 @@ pub struct Intake<'s> {
     next_order: u64,
     counted: Totals,
     pending: Vec<Target>,
+    /// The files to cut again, once their pieces are hashed.
+    to_recut: Vec<Hash>,
     cutter: Option<StreamCutter>,
     /// A step that changes what the intake knows failed half way.
     failed: bool,
@@ -147,15 +176,20 @@ impl<'s> Intake<'s> {
     /// Starts taking in the tree with this root. If the store holds the
     /// tree's record, everything else it holds of the tree is found now.
     pub fn new(store: &'s dyn Store, root: Root) -> Result<Self> {
-        Self::with_mode(store, root, Mode::default())
+        let mode = Mode {
+            discard: true,
+            ..Mode::default()
+        };
+        Self::with_mode(store, root, mode)
     }
 
-    fn with_mode(store: &'s dyn Store, root: Root, mode: Mode) -> Result<Self> {
-        let mut intake = Self {
+    fn bare(store: &'s dyn Store, root: Root, mode: Mode) -> Self {
+        Self {
             store,
             root,
             mode,
             record: None,
+            measuring: None,
             folders: HashMap::new(),
             files: HashMap::new(),
             pieces: HashMap::new(),
@@ -165,13 +199,39 @@ impl<'s> Intake<'s> {
             next_order: 0,
             counted: Totals::default(),
             pending: Vec::new(),
+            to_recut: Vec::new(),
             cutter: None,
             failed: false,
-        };
-        if let Some(record) = load_record(store, &root)? {
-            intake.begin(record)?;
+        }
+    }
+
+    fn with_mode(store: &'s dyn Store, root: Root, mode: Mode) -> Result<Self> {
+        let mut intake = Self::bare(store, root, mode);
+        match load_record(store, &root) {
+            Ok(Some(record)) => intake.begin(record)?,
+            Ok(None) => {}
+            // A record that is damaged where it is kept is fetched again.
+            Err(Error::Corrupt { .. }) if mode.discard => {
+                store.remove(Stored::Record, root.as_hash())?;
+            }
+            Err(error) => return Err(error),
         }
         Ok(intake)
+    }
+
+    /// Checks every list under `top` as an intake checks it, for a tree that
+    /// has no record yet, and counts what its record has to say: each
+    /// different piece and each different list, once. The store must hold
+    /// every list. This is how a builder comes by a record's totals, so a
+    /// tree that is built has passed the checks of a tree that is taken in.
+    pub(crate) fn measure(store: &'s dyn Store, top: Target, cutting: Cutting) -> Result<Totals> {
+        let mut intake = Self::bare(store, Root::from_hash(Hash::ZERO), Mode::default());
+        intake.measuring = Some(cutting);
+        intake.refer(top)?;
+        intake.drain()?;
+        intake.lists_held()?;
+        intake.check_depth(&top)?;
+        Ok(intake.counted)
     }
 
     pub fn root(&self) -> &Root {
@@ -268,6 +328,64 @@ impl<'s> Intake<'s> {
         })
     }
 
+    /// How the tree's files are cut.
+    fn cutting(&self) -> Result<Cutting> {
+        match self.measuring {
+            Some(cutting) => Ok(cutting),
+            None => Ok(self.recorded()?.cutting()),
+        }
+    }
+
+    /// Every list that is named has to be held.
+    fn lists_held(&self) -> Result<()> {
+        match self.wanted_lists.values().next() {
+            Some(target) => Err(missing(
+                match target.kind {
+                    Kind::Folder => "the list of the folder",
+                    Kind::File => "the list of the file",
+                },
+                &target.hash,
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The store holds, under `hash`, bytes that are not what the hash says.
+    /// They are removed when this intake may do that, so that they are
+    /// wanted again. Otherwise they are an error that names them.
+    fn damaged(&self, kind: Stored, hash: &Hash, what: &'static str) -> Result<()> {
+        if self.mode.discard {
+            self.store.remove(kind, hash)
+        } else {
+            Err(Error::Corrupt { what, hash: *hash })
+        }
+    }
+
+    /// Whether the store holds the piece that `item` names. The piece's
+    /// bytes are counted here, not hashed.
+    fn holds(&self, item: &PieceRef) -> Result<bool> {
+        let size = match self.store.size(Stored::Piece, &item.hash)? {
+            None => return Ok(false),
+            Some(size) if size == u64::from(item.length) => return Ok(true),
+            Some(size) => size,
+        };
+        // Either the store's bytes are damaged, or the list gives the piece
+        // a length it does not have. Only damaged bytes are ever removed: a
+        // list that names a sound piece wrongly must not cost the store it.
+        match self.store.get(Stored::Piece, &item.hash)? {
+            None => Ok(false),
+            Some(bytes) if Hash::of(&bytes) == item.hash => Err(Error::SizeMismatch {
+                what: "a held piece",
+                expected: u64::from(item.length),
+                actual: size,
+            }),
+            Some(_) => {
+                self.damaged(Stored::Piece, &item.hash, "a stored piece")?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Notes that a checked parent names `target`.
     fn refer(&mut self, target: Target) -> Result<()> {
         let known = match target.kind {
@@ -317,34 +435,45 @@ impl<'s> Intake<'s> {
 
     /// Looks in the store for every list that was newly named. A list that
     /// is there is checked like one that arrives, and the lists it names are
-    /// looked for in turn. A list that is not there is wanted.
+    /// looked for in turn. A list that is not there is wanted, and so is one
+    /// that is damaged there.
     fn drain(&mut self) -> Result<()> {
         while let Some(target) = self.pending.pop() {
             match target.kind {
-                Kind::Folder => match self.store.get(Stored::FolderList, &target.hash)? {
-                    Some(bytes) => {
-                        let list = FolderList::decode(&bytes)?;
-                        if *list.hash() != target.hash {
-                            return Err(Error::HashMismatch {
-                                what: "a stored folder's list",
-                            });
+                Kind::Folder => {
+                    let held = self.store.get(Stored::FolderList, &target.hash)?;
+                    let list = held.as_deref().map(|bytes| {
+                        FolderList::decode(bytes)
+                            .ok()
+                            .filter(|list| *list.hash() == target.hash)
+                    });
+                    match list {
+                        Some(Some(list)) => self.admit_folder(&list)?,
+                        Some(None) => {
+                            let what = "a stored folder's list";
+                            self.damaged(Stored::FolderList, &target.hash, what)?;
+                            self.want(target);
                         }
-                        self.admit_folder(&list)?;
+                        None => self.want(target),
                     }
-                    None => self.want(target),
-                },
-                Kind::File => match self.store.get(Stored::FileList, &target.hash)? {
-                    Some(bytes) => {
-                        let list = FileList::decode(&bytes)?;
-                        if *list.hash() != target.hash {
-                            return Err(Error::HashMismatch {
-                                what: "a stored file's list",
-                            });
+                }
+                Kind::File => {
+                    let held = self.store.get(Stored::FileList, &target.hash)?;
+                    let list = held.as_deref().map(|bytes| {
+                        FileList::decode(bytes)
+                            .ok()
+                            .filter(|list| *list.hash() == target.hash)
+                    });
+                    match list {
+                        Some(Some(list)) => self.admit_file(&list)?,
+                        Some(None) => {
+                            let what = "a stored file's list";
+                            self.damaged(Stored::FileList, &target.hash, what)?;
+                            self.want(target);
                         }
-                        self.admit_file(&list)?;
+                        None => self.want(target),
                     }
-                    None => self.want(target),
-                },
+                }
             }
         }
         Ok(())
@@ -368,7 +497,11 @@ impl<'s> Intake<'s> {
                 .ok_or(Error::SizeOverflow {
                     field: "list bytes",
                 })?;
-        let recorded = self.recorded()?.totals().list_bytes;
+        // A tree that is being measured has no record to be held to yet.
+        let Some(record) = &self.record else {
+            return Ok(());
+        };
+        let recorded = record.totals().list_bytes;
         if self.counted.list_bytes > recorded {
             return Err(Error::TotalsMismatch {
                 field: "list bytes",
@@ -392,7 +525,10 @@ impl<'s> Intake<'s> {
             .ok_or(Error::SizeOverflow {
                 field: "piece bytes",
             })?;
-        let recorded = self.recorded()?.totals();
+        let Some(record) = &self.record else {
+            return Ok(());
+        };
+        let recorded = record.totals();
         if self.counted.pieces > recorded.pieces {
             return Err(Error::TotalsMismatch {
                 field: "pieces",
@@ -442,7 +578,7 @@ impl<'s> Intake<'s> {
 
     /// Takes a file's list that is named, and notes the pieces it names.
     fn admit_file(&mut self, list: &FileList) -> Result<()> {
-        let cutting = self.recorded()?.cutting();
+        let cutting = self.cutting()?;
         list.check_cutting(cutting)?;
         let slot = self.files.get_mut(list.hash()).ok_or(Error::Invariant {
             detail: "a file is admitted before it is named",
@@ -458,7 +594,6 @@ impl<'s> Intake<'s> {
         let order = slot.order;
         self.wanted_lists.remove(&order);
         self.count_list_bytes(list.encoded_len())?;
-        let mut whole = true;
         for (number, item) in (0_u64..).zip(list.items()) {
             if let Some(slot) = self.pieces.get(&item.hash) {
                 if slot.length != item.length {
@@ -468,29 +603,13 @@ impl<'s> Intake<'s> {
                         actual: u64::from(item.length),
                     });
                 }
-                whole &= slot.wanted_at.is_none();
                 continue;
             }
             self.count_piece(item.length)?;
-            let held = if self.mode.rehash {
-                load_piece(self.store, item)?.is_some()
-            } else {
-                match self.store.size(Stored::Piece, &item.hash)? {
-                    Some(size) if size == u64::from(item.length) => true,
-                    Some(size) => {
-                        return Err(Error::SizeMismatch {
-                            what: "a held piece",
-                            expected: u64::from(item.length),
-                            actual: size,
-                        })
-                    }
-                    None => false,
-                }
-            };
+            let held = self.holds(item)?;
             let wanted_at = (!held).then_some((order, number));
             if let Some(at) = wanted_at {
                 self.wanted_pieces.insert(at, item.hash);
-                whole = false;
             }
             self.pieces.insert(
                 item.hash,
@@ -500,8 +619,97 @@ impl<'s> Intake<'s> {
                 },
             );
         }
-        if self.mode.recut && whole && cutting == Cutting::FastCdcV1 {
-            self.recut(list)?;
+        if self.mode.recut && cutting == Cutting::FastCdcV1 {
+            self.to_recut.push(*list.hash());
+        }
+        Ok(())
+    }
+
+    /// Hashes again every piece of this tree that the store holds, several
+    /// at once. A piece whose bytes are not what its hash says is damaged.
+    fn rehash_held(&mut self, workers: usize) -> Result<()> {
+        let mut held: Vec<PieceRef> = self
+            .pieces
+            .iter()
+            .filter(|(_, slot)| slot.wanted_at.is_none())
+            .map(|(hash, slot)| PieceRef {
+                hash: *hash,
+                length: slot.length,
+            })
+            .collect();
+        held.sort_unstable_by_key(|item| item.hash);
+        let store = self.store;
+        let next = AtomicUsize::new(0);
+        // Gives the places, in `held`, of the pieces that are damaged.
+        let work = || -> Result<Vec<usize>> {
+            let mut spoiled = Vec::new();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = held.get(index) else {
+                    return Ok(spoiled);
+                };
+                let bytes = store
+                    .get(Stored::Piece, &item.hash)
+                    .and_then(|bytes| bytes.ok_or_else(|| missing("the piece", &item.hash)));
+                match bytes {
+                    Ok(bytes) if item.matches(&bytes) => {}
+                    Ok(_) => spoiled.push(index),
+                    Err(error) => {
+                        next.store(held.len(), Ordering::Relaxed);
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        let workers = match workers {
+            0 => std::thread::available_parallelism().map_or(1, usize::from),
+            workers => workers,
+        }
+        .min(held.len());
+        let results: Vec<Result<Vec<usize>>> = if workers <= 1 {
+            vec![work()]
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers).map(|_| scope.spawn(work)).collect();
+                handles
+                    .into_iter()
+                    .map(|handle| match handle.join() {
+                        Ok(result) => result,
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    })
+                    .collect()
+            })
+        };
+        let mut spoiled = Vec::new();
+        for result in results {
+            spoiled.extend(result?);
+        }
+        spoiled.sort_unstable();
+        for &index in &spoiled {
+            self.damaged(Stored::Piece, &held[index].hash, "a stored piece")?;
+        }
+        match spoiled.first() {
+            Some(&index) => Err(missing("the piece", &held[index].hash)),
+            None => Ok(()),
+        }
+    }
+
+    /// Cuts again every file that is held whole, and holds the result
+    /// against the file's list. The pieces were hashed before this.
+    fn recut_held(&mut self) -> Result<()> {
+        for file in std::mem::take(&mut self.to_recut) {
+            let Some(bytes) = self.store.get(Stored::FileList, &file)? else {
+                continue;
+            };
+            let list = FileList::decode(&bytes)?;
+            let whole = list.items().iter().all(|item| {
+                self.pieces
+                    .get(&item.hash)
+                    .is_some_and(|slot| slot.wanted_at.is_none())
+            });
+            if whole {
+                self.recut(&list)?;
+            }
         }
         Ok(())
     }
@@ -516,6 +724,7 @@ impl<'s> Intake<'s> {
         let miscut = || invalid("a file is not cut where its bytes say it is cut");
         cutter.cut(
             Cutting::FastCdcV1,
+            2 * MAX_PIECE_BYTES,
             |buffer| loop {
                 if let Some((bytes, at)) = &mut current {
                     if *at < bytes.len() {
@@ -527,16 +736,23 @@ impl<'s> Intake<'s> {
                 }
                 match unread.next() {
                     Some(item) => {
-                        let bytes = load_piece(store, item)?
+                        let bytes = store
+                            .get(Stored::Piece, &item.hash)?
+                            .filter(|bytes| bytes.len() == item.length as usize)
                             .ok_or_else(|| missing("the piece", &item.hash))?;
                         current = Some((bytes, 0));
                     }
                     None => return Ok(0),
                 }
             },
-            |piece| match uncut.next() {
-                Some(item) if item.length as usize == piece.len() => Ok(()),
-                _ => Err(miscut()),
+            |pieces| {
+                for piece in pieces {
+                    match uncut.next() {
+                        Some(item) if item.length as usize == piece.len() => {}
+                        _ => return Err(miscut()),
+                    }
+                }
+                Ok(())
             },
         )?;
         if uncut.next().is_some() {
@@ -824,15 +1040,7 @@ impl<'s> Intake<'s> {
         let Some(record) = &self.record else {
             return Err(missing("the record of", self.root.as_hash()));
         };
-        if let Some(target) = self.wanted_lists.values().next() {
-            return Err(missing(
-                match target.kind {
-                    Kind::Folder => "the list of the folder",
-                    Kind::File => "the list of the file",
-                },
-                &target.hash,
-            ));
-        }
+        self.lists_held()?;
         self.check_depth(&record.top())?;
         let recorded = record.totals();
         for (field, recorded, counted) in [
@@ -868,10 +1076,16 @@ pub fn verify(store: &dyn Store, root: &Root) -> Result<Summary> {
 }
 
 /// Checks a whole tree that a store holds, with more checks switched on.
+///
+/// The lists are checked first. Then every piece is hashed again, several at
+/// once, and last, when that is asked for, every file is cut again.
 pub fn verify_with(store: &dyn Store, root: &Root, options: VerifyOptions) -> Result<Summary> {
     let mode = Mode {
-        rehash: true,
         recut: options.recut,
+        discard: options.discard,
     };
-    Intake::with_mode(store, *root, mode)?.finish()
+    let mut intake = Intake::with_mode(store, *root, mode)?;
+    intake.rehash_held(options.workers)?;
+    intake.recut_held()?;
+    intake.finish()
 }

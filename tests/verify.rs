@@ -125,9 +125,7 @@ fn bytes_that_changed_in_the_store_are_found() {
         assert!(
             matches!(
                 verdict,
-                Err(Error::HashMismatch { .. }
-                    | Error::SizeMismatch { .. }
-                    | Error::InvalidData { .. })
+                Err(Error::Corrupt { .. } | Error::SizeMismatch { .. } | Error::InvalidData { .. })
             ),
             "{what}: {verdict:?}"
         );
@@ -374,7 +372,7 @@ fn a_tree_is_checked_by_its_root_and_by_nothing_else() {
         .unwrap();
     assert!(matches!(
         verify(&store, &unknown),
-        Err(Error::HashMismatch { .. })
+        Err(Error::Corrupt { .. })
     ));
     // A folder is checked once, however many names it has.
     let weights = lookup(&store, &root, "weights").unwrap().unwrap().target();
