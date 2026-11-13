@@ -92,6 +92,8 @@ A tree's record says how its files were cut, and every file in the tree is held 
 - **`fixed-<n>`** cuts every `n` bytes, and is for tests. `n` is written in decimal with no leading zero, from 1 to 8388608. Every piece but a file's last holds exactly `n` bytes, and the last holds 1 to `n`.
 - A file with no bytes has no pieces, under either.
 - The lengths do not show that a file was cut where `fastcdc-v1` would cut it. A checker that holds a file's bytes can cut them again, and refuse a file whose list is not the cutter's. With that on, the same bytes always have the same file hash.
+- The steps above are the definition, and a cutter may be faster as long as it cuts at the same bytes. One way: `h` holds no more than the last 64 bytes it took, because every step shifts it one bit and a byte has left it 64 steps later. So several stretches that follow one another can be rolled over side by side, each by its own `h` that starts at 0 and takes the 64 bytes before its stretch first. The Rust library does this with four, and its tests hold the result to the steps above.
+- Where a piece ends decides where the next one begins, so a file is cut in order. Hashing the pieces needs no order, and can use every core.
 
 `spec/fastcdc-vectors/manifest.json` gives, for inputs of several kinds, where each piece ends and what each piece and file hashes to.
 
@@ -129,6 +131,8 @@ A receiver starts from a root it trusts. It takes a tree from a peer, from a bun
 - **A list that is named and then fails a check is not kept,** and shows that the tree itself is wrong. The receiver takes nothing more for that tree.
 - **What a receiver holds already, it does not ask for:** a piece, a file or a whole folder, by its hash, from whatever tree it came.
 - **A file is read whole or not at all.** If a piece of a stretch is missing, reading it is an error, and never a shorter file.
+- **Bytes that a store holds under a hash they do not have are damaged.** A checker names them by that hash. A receiver may remove them and ask for them again, and so mend a tree that was harmed where it is kept.
+- **Bytes that do have the hash they are kept under are never removed for what a list says of them.** A list that gives a held piece another length than it has is wrong, and is refused. Before a receiver removes a piece whose length does not fit, it hashes the piece's bytes to tell the two apart.
 
 ## Requests
 
@@ -210,6 +214,7 @@ A tree can hold a name that one system cannot. Writing out is stricter than hold
 
 ## Building a tree
 
-- A file is read a piece at a time, and its hash does not depend on how it was read.
+- A file is read a part at a time and never held whole, and its hash does not depend on how it was read.
+- The record's totals are counted by the checks that a receiver runs, so a tree that is built has passed them.
 - A link is never followed. It is refused, or left out when the builder is told to. Anything that is neither a file nor a folder is refused.
 - A name that is not UTF-8 is refused.

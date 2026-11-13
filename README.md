@@ -48,6 +48,10 @@ println!("{} bytes", summary.record.top().size);
 write_to_disk(&store, &root, "restored")?;
 ```
 
+Building and checking use every processor core unless they are told otherwise: `BuildOptions::workers`, `Builder::threads` and `VerifyOptions::workers` say how many. Several files are cut at once, and the pieces of one long file are hashed several at once. A file is never held in memory whole. A builder holds up to 16 MiB of it, or up to 64 MiB while other threads help it.
+
+When bytes were harmed in the store, `verify` says which thing it is: `Error::Corrupt` carries its hash. It changes nothing. With `VerifyOptions::new().discard_damaged(true)` it removes what is damaged, and a `fetch` then brings those parts again. A `fetch` on its own replaces a damaged list or record, because it cannot go on with one.
+
 Syncing runs over anything that reads and writes bytes. One side serves, and the other asks.
 
 ```rust
@@ -77,6 +81,12 @@ if let Some(entry) = remote.lookup("weights/model.safetensors")? {
 cargo run --release --example roundtrip -- <folder> <work-dir>
 ```
 
+`examples/speed.rs` measures cutting, hashing, building and checking on one file held in memory, so that no disk is in the way:
+
+```sh
+cargo run --release --example speed -- <MiB>
+```
+
 ## What it guards against
 
 The tests under `tests/` hold the library to these, with forged bytes made by a second copy of the format's rules (`tests/support/oracle.rs`):
@@ -88,16 +98,19 @@ The tests under `tests/` hold the library to these, with forged bytes made by a 
 - A peer cannot make a receiver set aside more memory than the tree it trusts calls for: every request says how long its answer may be.
 - A tree's record says how much the tree holds, and taking it in stops as soon as it holds more.
 - A small tree that stands for an endless one, by holding one folder under many names, is counted before it is written out, and refused.
-- A link is never followed when a tree is built. A tree is written only to a new place, and only with names the system can hold as they are.
+- Bytes that were harmed in a store are found when the tree is checked, and named by their hash. They can be removed and fetched again.
+- Nothing a peer sends makes a store remove bytes that are sound. A list that names a held piece with a wrong length is refused, and the piece stays.
+- A link that is in a folder is never followed when a tree is built. A tree is written only to a new place, and only with names the system can hold as they are.
 - Malformed input is an error, and never a crash or a loop.
 
 ## What it does not do well yet
 
-- One long file is cut and hashed on one processor core. Several files go on several cores.
-- Checking or fetching a whole tree keeps about a hundred bytes in memory for every different piece: about 60 MB for a terabyte.
+- One file is cut on one processor core, because where a piece ends decides where the next begins. On the desktop it was measured on, that is about 5 GB a second. Hashing the pieces, which is the greater part of the work, uses every core.
+- Fetching a tree and writing a tree out use one core each. On the disks they were tried on, the disk was the slower part.
+- Checking or fetching a whole tree keeps about a hundred bytes in memory for every different piece, so that each piece is counted once: about 50 MB for a terabyte.
 - A list is taken in whole. A file's list is about 19 MB for each terabyte of the file, and a folder's list has to fit in memory.
-- A `Responder` keeps the tree of the last long list it showed a part of, and builds another list's tree again.
-- Another program on the same machine that swaps a file for a link while a tree is built or written out is not guarded against.
+- A responder that tells a peer which pieces of a file it holds looks into its store for each of them. `Responder::have(false)` switches that off for one that serves strangers.
+- A tree is built from a folder as the folder is while it is read. If another program on the same machine changes the folder during the build, the tree can hold a mix of old and new, and if that program swaps a folder for a link in that time, the build goes where the link leads. Closing this for good takes a way of opening files that Rust's standard library does not offer without code marked `unsafe` or another dependency, and this library has neither. Build from a folder that no other program is writing to. A tree is written out into a new folder of its own, which other users cannot change; a program that runs as the same user is not guarded against.
 
 ## Checking a change
 
