@@ -19,8 +19,8 @@ use scionic_merkletree::{
     build, fetch, folder_of, record_of, verify, write_to_disk, BuildOptions, Error, Hash, Kind,
     Remote, Responder, Result, Store, Stored, Target,
 };
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -88,11 +88,27 @@ impl Store for DirStore {
 
     fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>> {
         let path = self.path(kind, hash);
-        match fs::read(&path) {
-            Ok(bytes) => Ok(Some(bytes.into())),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(failed("read", &path, error)),
-        }
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(failed("open", &path, error)),
+        };
+        let length = file
+            .metadata()
+            .map_err(|error| failed("look at", &path, error))?
+            .len();
+        let length = usize::try_from(length).map_err(|_| {
+            let too_long = std::io::Error::other("it is longer than this machine can hold");
+            failed("read", &path, too_long)
+        })?;
+        // The bytes are read straight into the memory that is handed out. A
+        // `Vec` that is turned into an `Arc` is copied once more, and a piece
+        // is megabytes long.
+        let mut bytes: Arc<[u8]> = std::iter::repeat_n(0, length).collect();
+        let room = Arc::get_mut(&mut bytes).expect("nothing else holds what was just made");
+        file.read_exact(room)
+            .map_err(|error| failed("read", &path, error))?;
+        Ok(Some(bytes))
     }
 
     fn size(&self, kind: Stored, hash: &Hash) -> Result<Option<u64>> {

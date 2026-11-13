@@ -29,6 +29,10 @@ pub enum Stored {
 }
 
 /// A place that keeps bytes under hashes.
+///
+/// A store that can say how long a thing is without reading it should have
+/// its own [`Store::size`]: a store on disk above all. Without it, seeing
+/// whether a piece is there takes a read of the whole piece.
 pub trait Store: Send + Sync {
     /// Keeps `bytes` under `hash`. Keeping what is kept already changes
     /// nothing.
@@ -37,9 +41,11 @@ pub trait Store: Send + Sync {
     /// What is kept under `hash`, if anything.
     fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>>;
 
-    /// Whether anything is kept under `hash`.
+    /// Whether anything is kept under `hash`. Unless a store has its own,
+    /// this asks how long the thing is, so a store that can say that without
+    /// reading the bytes is not read.
     fn has(&self, kind: Stored, hash: &Hash) -> Result<bool> {
-        Ok(self.get(kind, hash)?.is_some())
+        Ok(self.size(kind, hash)?.is_some())
     }
 
     /// How many bytes are kept under `hash`.
@@ -248,6 +254,54 @@ mod tests {
         assert_eq!(store.hashes(Stored::Piece), vec![hash]);
         store.remove(Stored::Piece, &hash).unwrap();
         assert!(store.get(Stored::Piece, &hash).unwrap().is_none());
+    }
+
+    /// A store that says how long a thing is, and counts how often a thing
+    /// is read from it.
+    struct Sized {
+        inner: MemoryStore,
+        read: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Store for Sized {
+        fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
+            self.inner.put(kind, hash, bytes)
+        }
+
+        fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>> {
+            self.read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get(kind, hash)
+        }
+
+        fn size(&self, kind: Stored, hash: &Hash) -> Result<Option<u64>> {
+            self.inner.size(kind, hash)
+        }
+
+        fn remove(&self, kind: Stored, hash: &Hash) -> Result<()> {
+            self.inner.remove(kind, hash)
+        }
+    }
+
+    #[test]
+    fn a_store_that_says_how_long_a_thing_is_is_not_read_to_see_what_it_holds() {
+        let store = Sized {
+            inner: MemoryStore::new(),
+            read: Default::default(),
+        };
+        let content: Vec<u8> = (0..5000_u32).map(|at| (at % 251) as u8).collect();
+        let mut builder = crate::Builder::new(&store, crate::Cutting::fixed(16).unwrap());
+        let first = builder.file_from_bytes(&content).unwrap();
+        // Built again, every piece and the list are there already. Seeing
+        // that takes no read: for a store on disk, a read is the whole of a
+        // piece.
+        let again = builder.file_from_bytes(&content).unwrap();
+        assert_eq!(again, first);
+        assert!(store.inner.count(Stored::Piece) > 100);
+        assert_eq!(store.read.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // And it is still asked rightly.
+        assert!(!store.has(Stored::Piece, &Hash::of(b"not there")).unwrap());
+        assert!(store.has(Stored::FileList, &first.hash).unwrap());
+        assert!(!store.has(Stored::FolderList, &first.hash).unwrap());
     }
 
     #[test]

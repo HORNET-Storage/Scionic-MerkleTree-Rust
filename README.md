@@ -372,7 +372,7 @@ pub trait Store: Send + Sync {
 }
 ```
 
-`Stored` says which of four kinds of thing it is: a chunk, a file's chunk list, a folder's listing, or a tree's record. A store never has to understand what it holds: every byte it hands back is checked again before it is used. `examples/roundtrip.rs` has a complete store that keeps each thing as a file named by its hash.
+`Stored` says which of four kinds of thing it is: a chunk, a file's chunk list, a folder's listing, or a tree's record. A store never has to understand what it holds: every byte it hands back is checked again before it is used. A store on disk should have its own `size`: `has` asks it, and without it, seeing whether a chunk is there takes a read of the whole chunk. `examples/roundtrip.rs` has a complete store that keeps each thing as a file named by its hash.
 
 ## Words Used in the API
 
@@ -415,13 +415,13 @@ Measured on a Windows 11 laptop with Rust 1.100, built with `--release`. The two
 
 | With a store on disk, a folder of 3.5 GiB (`examples/roundtrip.rs`) | |
 | --- | ---: |
-| Building the tree into the store | 1.8 s |
-| Verifying every byte from the store | 0.3 s |
-| Fetching the tree into a second store | 5.1 s |
-| Reading 4 KiB from the middle of a file of 1.5 GiB, through a peer | 4 ms |
-| Writing the tree back out as files | 4.6 s |
+| Building the tree into the store | 1.5 s |
+| Verifying every byte from the store | 0.2 s |
+| Fetching the tree into a second store | 4.0 s |
+| Reading 4 KiB from the middle of a file of 1.5 GiB, through a peer | 2 ms |
+| Writing the tree back out as files | 3.2 s |
 
-That folder holds one file of 1 GiB twice. The tree stores it once: 3.5 GiB of files are kept as 2.5 GiB of chunks and 59 KB of lists.
+That folder holds one file of 1 GiB twice. The tree stores it once: 3.5 GiB of files are kept as 2.5 GiB of chunks and 40 KB of lists.
 
 ## Security
 
