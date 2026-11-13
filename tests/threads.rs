@@ -138,3 +138,55 @@ fn the_failure_that_is_told_is_the_one_that_happened() {
         }
     }
 }
+
+/// A store that falls over whenever it is handed a piece, as one would whose
+/// own code has a fault.
+struct Falling(MemoryStore);
+
+impl Store for Falling {
+    fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
+        assert!(kind != Stored::Piece, "this store falls over");
+        self.0.put(kind, hash, bytes)
+    }
+
+    fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>> {
+        self.0.get(kind, hash)
+    }
+
+    fn remove(&self, kind: Stored, hash: &Hash) -> Result<()> {
+        self.0.remove(kind, hash)
+    }
+}
+
+#[test]
+fn a_store_that_falls_over_does_not_leave_a_build_waiting() {
+    // More files than the threads take at once: if every thread that cuts
+    // is gone, the one that reads the folder must not wait for them.
+    let temp = TempDir::new("threads-falling").unwrap();
+    let folder = temp.path().join("tree");
+    for number in 0..400 {
+        let data = bytes(&format!("falling-{number}"), 16);
+        write(
+            folder.join(format!("dir-{}/file-{number:03}", number % 40)),
+            &data,
+        )
+        .unwrap();
+    }
+    for workers in [1, 2, 8] {
+        let folder = folder.clone();
+        let (tell, hear) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let store = Falling(MemoryStore::new());
+            let options = small_options().workers(workers);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build(&store, &folder, &options).map(|_| ())
+            }));
+            let _ = tell.send(outcome.is_err());
+        });
+        // The build ends, and it ends as the store did: by falling over.
+        match hear.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(fell) => assert!(fell, "{workers} workers"),
+            Err(_) => panic!("with {workers} workers the build was left waiting"),
+        }
+    }
+}

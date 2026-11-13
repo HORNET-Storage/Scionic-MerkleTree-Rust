@@ -113,7 +113,7 @@ The tests under `tests/` hold the library to these, with forged bytes made by a 
 - A list is taken in whole. A file's list is about 19 MB for each terabyte of the file, and a folder's list has to fit in memory.
 - A responder that tells a peer which pieces of a file it holds looks into its store for each of them. `Responder::have(false)` switches that off for one that serves strangers.
 - A tree is built from a folder as the folder is while it is read. If another program changes files in it meanwhile, the tree can hold a mix of old and new. It cannot be led outside the folder.
-- Opening every file from its folder costs a little for each file on Windows: a folder of 20,000 small files took 0.19 seconds to build where it had taken 0.15. While a folder is being read there, other programs cannot rename or delete it. On systems that are neither Unix nor Windows, a folder is not held open, and a link that is swapped in while a folder is read can be followed.
+- On Windows, opening a file so that it cannot be led astray costs about 16 millionths of a second for each file. With every core at work it does not show: a folder of 20,000 files of 4 KiB builds in 0.14 seconds, as it did before. On one thread it takes 1.0 second where it took 0.7. On Linux it costs nothing. While a folder is being read on Windows, other programs cannot rename or delete it. On systems that are neither Unix nor Windows, a folder is not held open, and a link that is swapped in while a folder is read can be followed.
 
 ## Checking a change
 
