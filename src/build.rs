@@ -1,5 +1,6 @@
 //! Building a tree: from a folder or a file on disk, or part by part.
 
+use crate::disk::{Found, Held, Refused};
 use crate::fastcdc::{StreamCutter, FASTCDC_MAX_SIZE};
 use crate::format::{
     check_name, Cutting, Entry, ExtraData, FileList, FolderList, Kind, PieceRef, Record, Target,
@@ -13,7 +14,7 @@ use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Reads once, and again when the read was only interrupted.
@@ -384,8 +385,11 @@ pub fn build_with(
         return builder.finish(top, extra);
     }
 
-    let (folders, files) = walk(path, options.links)?;
-    let file_targets = store_files(store, cutting, &files, options.workers)?;
+    // From here on nothing is reached by its path: the folder is held open,
+    // and so is every folder under it while it is read.
+    let top = Held::open(path).map_err(|error| io_error("open", path, error))?;
+    let (folders, files, file_targets) =
+        walk_and_cut(store, cutting, &top, options.links, options.workers)?;
     // A folder is found after the folder it is in, so going backwards every
     // folder is made after the folders inside it.
     let mut folder_targets: Vec<Option<Target>> = vec![None; folders.len()];
@@ -424,139 +428,323 @@ struct Child {
     index: usize,
 }
 
-/// Finds every folder and every file under `top`. Nothing is read yet. A
-/// link is never followed.
-fn walk(top: &Path, links: Links) -> Result<(Vec<Folder>, Vec<PathBuf>)> {
-    let mut folders = vec![Folder {
-        path: top.to_path_buf(),
-        children: Vec::new(),
-    }];
-    // How many folders lie on the way to each folder, itself counted.
-    let mut depths = vec![1_usize];
-    let mut files = Vec::new();
-    let mut next = 0;
-    while next < folders.len() {
-        let folder_path = folders[next].path.clone();
-        let mut children = Vec::new();
-        let listing =
-            fs::read_dir(&folder_path).map_err(|error| io_error("list", &folder_path, error))?;
-        for entry in listing {
-            let entry = entry.map_err(|error| io_error("list", &folder_path, error))?;
-            let path = entry.path();
-            let name = entry
-                .file_name()
+/// A folder on the way down to the one that is read, held open, with the
+/// folders inside it that are still to be read: each by its name and its
+/// place among the folders.
+type OnTheWay = (Arc<Held>, Vec<(String, usize)>);
+
+/// How many files the walk may be ahead of the cutting. Each of them keeps
+/// its folder open, so this bounds how many folders are open at a time.
+const FILES_AHEAD: usize = 16;
+
+/// A file that the walk found, for a thread to cut: the folder it is in,
+/// held open, and its name there.
+struct Job {
+    /// The file's place among the files.
+    index: usize,
+    folder: Arc<Held>,
+    name: String,
+}
+
+/// What was there when a folder was read has to be there still when it is
+/// opened. If a link took its place meanwhile, the link is not followed.
+fn changed(path: &Path, refused: Refused) -> Error {
+    let what = match refused {
+        Refused::Io(error) => return io_error("open", path, error),
+        Refused::Link => "a link now, where a file or a folder was when the build began",
+        Refused::Other => "something else now than it was when the build began",
+    };
+    Error::UnsupportedEntry {
+        path: path.to_path_buf(),
+        what,
+    }
+}
+
+/// Cuts and keeps the file `name` of a folder that is held open. The file is
+/// opened from the folder itself. `path` is for messages. Once `stop` is set,
+/// the file is given up, however much of it is left.
+fn cut_file_in(
+    builder: &mut Builder<'_>,
+    folder: &Held,
+    name: &str,
+    path: &Path,
+    stop: Option<&AtomicBool>,
+) -> Result<Target> {
+    let mut file = folder
+        .open_file(name)
+        .map_err(|refused| changed(path, refused))?;
+    builder.file_from(|buffer| {
+        if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+            return Err(STOPPED);
+        }
+        read_some(&mut file, buffer).map_err(|error| io_error("read", path, error))
+    })
+}
+
+/// What a walk through a folder has found so far.
+struct Walk<'a> {
+    links: Links,
+    folders: Vec<Folder>,
+    files: Vec<PathBuf>,
+    /// Takes each file as it is found, with its path for messages.
+    on_file: &'a mut dyn FnMut(Job, &Path) -> Result<()>,
+}
+
+impl Walk<'_> {
+    /// Reads one folder, which is `depth` folders down from the top, the top
+    /// counted. Notes what is in it, hands its files on, and gives the
+    /// folders inside it, each with its place among the folders.
+    fn read(
+        &mut self,
+        held: &Arc<Held>,
+        index: usize,
+        depth: usize,
+    ) -> Result<Vec<(String, usize)>> {
+        let folder_path = held.path().to_path_buf();
+        let listed = held
+            .list()
+            .map_err(|error| io_error("list", &folder_path, error))?;
+        let mut children = Vec::with_capacity(listed.len());
+        let mut inside = Vec::new();
+        for (name, found) in listed {
+            let path = folder_path.join(&name);
+            let name = name
                 .into_string()
                 .map_err(|_| Error::NonUtf8FileName { path: path.clone() })?;
             check_name(&name)?;
-            let file_type = entry
-                .file_type()
-                .map_err(|error| io_error("look at", &path, error))?;
-            if file_type.is_dir() {
-                if depths[next] >= MAX_FOLDER_DEPTH {
-                    return Err(Error::TooDeep {
-                        limit: MAX_FOLDER_DEPTH,
+            match found {
+                Found::Folder => {
+                    if depth >= MAX_FOLDER_DEPTH {
+                        return Err(Error::TooDeep {
+                            limit: MAX_FOLDER_DEPTH,
+                        });
+                    }
+                    let below = self.folders.len();
+                    children.push(Child {
+                        name: name.clone(),
+                        kind: Kind::Folder,
+                        index: below,
                     });
+                    self.folders.push(Folder {
+                        path,
+                        children: Vec::new(),
+                    });
+                    inside.push((name, below));
                 }
-                children.push(Child {
-                    name,
-                    kind: Kind::Folder,
-                    index: folders.len(),
-                });
-                folders.push(Folder {
-                    path,
-                    children: Vec::new(),
-                });
-                depths.push(depths[next] + 1);
-            } else if file_type.is_file() {
-                children.push(Child {
-                    name,
-                    kind: Kind::File,
-                    index: files.len(),
-                });
-                files.push(path);
-            } else if links == Links::Refuse {
-                return Err(Error::UnsupportedEntry {
-                    path,
-                    what: if file_type.is_symlink() {
-                        "a link"
-                    } else {
-                        "a special file"
-                    },
-                });
+                Found::File => {
+                    let file = self.files.len();
+                    children.push(Child {
+                        name: name.clone(),
+                        kind: Kind::File,
+                        index: file,
+                    });
+                    self.files.push(path);
+                    let job = Job {
+                        index: file,
+                        folder: Arc::clone(held),
+                        name,
+                    };
+                    (self.on_file)(job, &self.files[file])?;
+                }
+                Found::Link | Found::Other => {
+                    if self.links == Links::Refuse {
+                        return Err(Error::UnsupportedEntry {
+                            path,
+                            what: if found == Found::Link {
+                                "a link"
+                            } else {
+                                "a special file"
+                            },
+                        });
+                    }
+                }
             }
         }
         children.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
-        folders[next].children = children;
-        next += 1;
+        self.folders[index].children = children;
+        Ok(inside)
     }
-    Ok((folders, files))
 }
 
-/// Cuts and keeps every file, several at once, and gives what each one is.
-fn store_files(
+/// Finds every folder and every file under `top`, and hands each file to
+/// `on_file` as it is found. A link is never followed.
+///
+/// A folder is opened from the folder it is in, which is held open, and is
+/// held open itself while it is read. So no folder on the way to a file can
+/// be swapped for a link between the reading of a folder and the opening of
+/// what is in it.
+fn walk(
+    top: &Arc<Held>,
+    links: Links,
+    on_file: &mut dyn FnMut(Job, &Path) -> Result<()>,
+) -> Result<(Vec<Folder>, Vec<PathBuf>)> {
+    let mut walk = Walk {
+        links,
+        folders: vec![Folder {
+            path: top.path().to_path_buf(),
+            children: Vec::new(),
+        }],
+        files: Vec::new(),
+        on_file,
+    };
+    // The folders on the way down to the one that is read, each held open,
+    // with the folders inside it that are still to be read.
+    let mut way: Vec<OnTheWay> = Vec::new();
+    let mut next = Some((Arc::clone(top), 0_usize));
+    loop {
+        if let Some((held, index)) = next.take() {
+            let inside = walk.read(&held, index, way.len() + 1)?;
+            way.push((held, inside));
+        }
+        let Some((held, inside)) = way.last_mut() else {
+            break;
+        };
+        match inside.pop() {
+            Some((name, index)) => {
+                let below = held
+                    .open_folder(&name)
+                    .map_err(|refused| changed(&walk.folders[index].path, refused))?;
+                next = Some((below, index));
+            }
+            None => {
+                way.pop();
+            }
+        }
+    }
+    Ok((walk.folders, walk.files))
+}
+
+/// What a thread gives when it stopped because the build had failed
+/// somewhere else. The error that the caller is given is that failure's.
+const STOPPED_DETAIL: &str = "the build was stopped";
+const STOPPED: Error = Error::Invariant {
+    detail: STOPPED_DETAIL,
+};
+
+fn is_stopped(error: &Error) -> bool {
+    matches!(error, Error::Invariant { detail } if *detail == STOPPED_DETAIL)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Finds every folder and every file under `top`, and cuts and keeps the
+/// files while they are found, several at once. Gives the folders, the
+/// files' paths, and what each file is.
+fn walk_and_cut(
     store: &dyn Store,
     cutting: Cutting,
-    files: &[PathBuf],
-    workers: usize,
-) -> Result<Vec<Target>> {
-    let threads = match workers {
+    top: &Arc<Held>,
+    links: Links,
+    threads: usize,
+) -> Result<(Vec<Folder>, Vec<PathBuf>, Vec<Target>)> {
+    let threads = match threads {
         0 => cores(),
-        workers => workers,
+        threads => threads,
     };
-    let workers = threads.min(files.len());
-    // The threads that have no file of their own help with the long files.
-    let helpers = Helpers::new(threads - workers);
-    let next = AtomicUsize::new(0);
+    // A thread that has no file left gives itself up to help with the long
+    // files that are still being cut.
+    let helpers = Helpers::new(0);
+    if threads == 1 {
+        // One thread walks and cuts in turn.
+        let mut builder = Builder::sharing(store, cutting, helpers);
+        let mut targets = Vec::new();
+        let (folders, files) = walk(top, links, &mut |job, path| {
+            let target = cut_file_in(&mut builder, &job.folder, &job.name, path, None)?;
+            targets.push(target);
+            Ok(())
+        })?;
+        return Ok((folders, files, targets));
+    }
     let failed = AtomicBool::new(false);
+    let (send, receive) = std::sync::mpsc::sync_channel::<(Job, PathBuf)>(FILES_AHEAD);
+    let receive = Mutex::new(receive);
     let work = || -> Result<Vec<(usize, Target)>> {
         let mut builder = Builder::sharing(store, cutting, Arc::clone(&helpers));
         let mut done = Vec::new();
-        while !failed.load(Ordering::Relaxed) {
-            let index = next.fetch_add(1, Ordering::Relaxed);
-            let Some(path) = files.get(index) else {
-                break;
+        let mut first_error = None;
+        loop {
+            // Taken on a line of its own: the lock is let go before the file
+            // is cut, so that the other threads can take theirs.
+            let next = lock(&receive).recv();
+            let Ok((job, path)) = next else {
+                break; // the walk is over, and every file is taken
             };
-            match builder.file_at(path) {
-                Ok(target) => done.push((index, target)),
+            // After a failure the files are still taken, and no longer cut:
+            // the walk must never be left waiting for a thread.
+            if failed.load(Ordering::Relaxed) {
+                continue;
+            }
+            let cut = cut_file_in(&mut builder, &job.folder, &job.name, &path, Some(&failed));
+            match cut {
+                Ok(target) => done.push((job.index, target)),
                 Err(error) => {
                     failed.store(true, Ordering::Relaxed);
-                    return Err(error);
+                    first_error.get_or_insert(error);
                 }
             }
         }
-        // This thread has no file left, and may help with the ones that
-        // are still being cut.
         helpers.give(1);
-        Ok(done)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(done),
+        }
     };
-    let results: Vec<Result<Vec<(usize, Target)>>> = if workers <= 1 {
-        vec![work()]
-    } else {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..workers).map(|_| scope.spawn(work)).collect();
-            handles
-                .into_iter()
-                .map(|handle| match handle.join() {
-                    Ok(result) => result,
-                    Err(payload) => std::panic::resume_unwind(payload),
-                })
-                .collect()
-        })
-    };
-    let mut targets: Vec<Option<Target>> = vec![None; files.len()];
-    for result in results {
-        for (index, target) in result? {
-            targets[index] = Some(target);
+    let (walked, cut) = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads).map(|_| scope.spawn(work)).collect();
+        let walked = walk(top, links, &mut |job, path| {
+            if failed.load(Ordering::Relaxed) {
+                return Err(STOPPED);
+            }
+            send.send((job, path.to_path_buf())).map_err(|_| STOPPED)
+        });
+        // A walk that failed stops the cutting too: a thread gives up the
+        // file it is on, however long that file is.
+        if walked.is_err() {
+            failed.store(true, Ordering::Relaxed);
+        }
+        // With the sender gone, the threads run out of files and end.
+        drop(send);
+        let cut: Vec<Result<Vec<(usize, Target)>>> = handles
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            })
+            .collect();
+        (walked, cut)
+    });
+    // The failure that came first in its thread is the one to tell. A thread
+    // that only stopped for another's failure has nothing to tell.
+    let mut done = Vec::new();
+    let mut stopped = false;
+    for result in cut {
+        match result {
+            Ok(part) => done.extend(part),
+            Err(error) if is_stopped(&error) => stopped = true,
+            Err(error) => return Err(error),
         }
     }
-    targets
+    let (folders, files) = walked?;
+    if stopped {
+        return Err(STOPPED);
+    }
+    let mut targets: Vec<Option<Target>> = vec![None; files.len()];
+    for (index, target) in done {
+        targets[index] = Some(target);
+    }
+    let targets = targets
         .into_iter()
         .map(|target| {
             target.ok_or(Error::Invariant {
                 detail: "a file was left out of the build",
             })
         })
-        .collect()
+        .collect::<Result<Vec<Target>>>()?;
+    Ok((folders, files, targets))
 }
 
 /// The time as text: `2026-11-12T08:30:00Z`, in UTC, to the second.

@@ -12,6 +12,7 @@
 
 mod build;
 mod diff;
+mod disk;
 mod encoding;
 mod fastcdc;
 mod format;

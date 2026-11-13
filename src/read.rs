@@ -6,6 +6,7 @@
 //! length its file gives it. A file's bytes are handed out only when every
 //! piece they need is there. Otherwise it is an error, never a shorter file.
 
+use crate::disk::{Held, Refused};
 use crate::format::{
     check_name, Entry, FileList, FolderList, Kind, OpenFile, PieceRef, Record, Target,
     MAX_FOLDER_DEPTH,
@@ -17,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn invalid(detail: &str) -> Error {
     Error::InvalidData {
@@ -351,30 +353,89 @@ pub fn write_to_disk_with(
         });
     }
     if top.kind == Kind::File {
-        return write_file(store, &top, dest, None);
+        // The place a caller names is the caller's.
+        let out = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dest)
+            .map_err(|error| io_error("create the file", dest, error))?;
+        return fill_file(store, &top, out, dest);
     }
 
-    // Then: write. A folder is made with its folder's other entries, and
-    // filled when its turn comes, so no more is held in memory than the
-    // folders that still wait to be filled.
-    create_new_dir(dest)?;
-    let mut pending = vec![(top, dest.to_path_buf())];
-    while let Some((folder, path)) = pending.pop() {
-        let list = folder_of(store, &folder)?;
-        for entry in list.entries() {
-            let child = child_path(&path, entry.name())?;
-            match entry.kind() {
-                Kind::File => write_file(store, &entry.target(), &child, Some(entry.name()))?,
-                Kind::Folder => {
-                    create_new_dir(&child)?;
-                    pending.push((entry.target(), child));
-                }
+    // Then: write. From here on nothing is reached by its path. The new
+    // folder is held open, and so is every folder under it while it is
+    // filled, so no folder on the way can be swapped for a link.
+    //
+    // A folder is made with its folder's other entries, and filled when its
+    // turn comes. The folders on the way down to the one that is filled stay
+    // open, and no others.
+    let held = Held::create(dest).map_err(|error| not_made(dest, error))?;
+    let mut way: Vec<ToFill> = Vec::new();
+    let mut next = Some((held, top));
+    loop {
+        if let Some((held, folder)) = next.take() {
+            let inside = fill_folder(store, &held, &folder)?;
+            way.push((held, inside));
+        }
+        let Some((held, inside)) = way.last_mut() else {
+            break;
+        };
+        match inside.pop() {
+            Some((name, folder)) => {
+                let below = held
+                    .open_folder(&name)
+                    .map_err(|refused| reopened(&held.path().join(&name), refused))?;
+                next = Some((below, folder));
+            }
+            None => {
+                way.pop();
             }
         }
-        // The folder must now hold exactly the names it was given.
-        confirm_names(&path, &list)?;
     }
     Ok(())
+}
+
+/// A folder on the way down to the one that is filled, held open, with the
+/// folders inside it that are still to be filled.
+type ToFill = (Arc<Held>, Vec<(String, Target)>);
+
+/// Fills a new folder that is held open: writes its files, makes the folders
+/// inside it, and holds what it then lists against what it was given. Gives
+/// the folders inside it, which are still to be filled.
+fn fill_folder(
+    store: &dyn Store,
+    held: &Arc<Held>,
+    folder: &Target,
+) -> Result<Vec<(String, Target)>> {
+    let list = folder_of(store, folder)?;
+    let mut inside = Vec::new();
+    for entry in list.entries() {
+        let name = entry.name();
+        let child = child_path(held.path(), name)?;
+        match entry.kind() {
+            Kind::File => {
+                let out = held.create_file(name).map_err(|error| {
+                    if taken(&child, &error) {
+                        unwritable_error(name, "another name of its folder lands on the same place")
+                    } else {
+                        io_error("create the file", &child, error)
+                    }
+                })?;
+                fill_file(store, &entry.target(), out, &child)?;
+            }
+            Kind::Folder => {
+                // Made now, with the names beside it. It is opened again
+                // when its turn comes, so that a folder of many folders
+                // does not keep them all open.
+                held.create_folder(name)
+                    .map_err(|error| not_made(&child, error))?;
+                inside.push((name.to_owned(), entry.target()));
+            }
+        }
+    }
+    // The folder must now hold exactly the names it was given.
+    confirm_names(held, &list)?;
+    Ok(inside)
 }
 
 /// Looks through a whole tree before it is written out, each folder once,
@@ -498,30 +559,29 @@ fn taken(path: &Path, error: &std::io::Error) -> bool {
     error.kind() == ErrorKind::AlreadyExists || fs::symlink_metadata(path).is_ok()
 }
 
-fn create_new_dir(path: &Path) -> Result<()> {
-    fs::create_dir(path).map_err(|error| {
-        if taken(path, &error) {
-            match path.file_name().and_then(|name| name.to_str()) {
-                Some(name) => unwritable_error(name, "something is there already under that name"),
-                None => io_error("create the folder", path, error),
-            }
-        } else {
-            io_error("create the folder", path, error)
+/// Why a folder was not made at `path`.
+fn not_made(path: &Path, error: std::io::Error) -> Error {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) if taken(path, &error) => {
+            unwritable_error(name, "something is there already under that name")
         }
-    })
+        _ => io_error("create the folder", path, error),
+    }
 }
 
-fn write_file(store: &dyn Store, file: &Target, path: &Path, name: Option<&str>) -> Result<()> {
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| match name {
-            Some(name) if taken(path, &error) => {
-                unwritable_error(name, "another name of its folder lands on the same place")
-            }
-            _ => io_error("create the file", path, error),
-        })?;
+/// A folder that was made has to be that folder still when its turn comes.
+fn reopened(path: &Path, refused: Refused) -> Error {
+    match refused {
+        Refused::Io(error) => io_error("open the folder", path, error),
+        Refused::Link | Refused::Other => {
+            invalid("a folder that was written was swapped for something else before it was filled")
+        }
+    }
+}
+
+/// Writes a file's bytes into a file that was just made. `path` is for
+/// messages.
+fn fill_file(store: &dyn Store, file: &Target, mut out: fs::File, path: &Path) -> Result<()> {
     read_file(store, file, &mut out).map_err(|error| match error {
         Error::Stream { source, .. } => io_error("write", path, source),
         other => other,
@@ -531,12 +591,14 @@ fn write_file(store: &dyn Store, file: &Target, path: &Path, name: Option<&str>)
 /// A folder that was written must list exactly the names it was given, byte
 /// for byte. Where the system changed a name, the tree was not written as it
 /// is.
-fn confirm_names(path: &Path, folder: &FolderList) -> Result<()> {
-    let mut written = std::collections::HashSet::with_capacity(folder.entries().len());
-    for entry in fs::read_dir(path).map_err(|error| io_error("list", path, error))? {
-        let entry = entry.map_err(|error| io_error("list", path, error))?;
-        written.insert(entry.file_name());
-    }
+fn confirm_names(held: &Held, folder: &FolderList) -> Result<()> {
+    let path = held.path();
+    let written: HashSet<std::ffi::OsString> = held
+        .list()
+        .map_err(|error| io_error("list", path, error))?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
     for entry in folder.entries() {
         if !written.contains(std::ffi::OsStr::new(entry.name())) {
             return Err(unwritable_error(

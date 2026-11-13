@@ -7,7 +7,7 @@ use scionic_merkletree::{
     Store, Stored, VerifyOptions,
 };
 use std::sync::Arc;
-use support::{bytes, contents, sample_folder, small_options, small_pieces, TempDir};
+use support::{bytes, contents, sample_folder, small_options, small_pieces, write, TempDir};
 
 #[test]
 fn one_file_is_the_same_whatever_number_of_threads_keep_its_pieces() {
@@ -111,5 +111,30 @@ fn a_piece_that_cannot_be_kept_stops_the_file_whoever_was_keeping_it() {
         }
         // A file whose pieces are not all kept has no list.
         assert_eq!(store.inner.count(Stored::FileList), 0);
+    }
+}
+
+#[test]
+fn the_failure_that_is_told_is_the_one_that_happened() {
+    // A folder of many files, one of which holds a piece the store refuses.
+    // The threads that stop because of it have nothing of their own to tell.
+    let temp = TempDir::new("threads-failure").unwrap();
+    let folder = temp.path().join("tree");
+    for number in 0..64 {
+        let data = bytes(&format!("failure-{number}"), 64);
+        write(folder.join(format!("file-{number:02}")), &data).unwrap();
+    }
+    let refused = PieceRef::of(&bytes("failure-40", 64)[..16]).unwrap().hash;
+    for workers in [1, 2, 8] {
+        let store = Refusing {
+            inner: MemoryStore::new(),
+            refused,
+        };
+        match build(&store, &folder, &small_options().workers(workers)) {
+            Err(Error::Invariant { detail }) => {
+                assert_eq!(detail, "this store will not keep that piece");
+            }
+            other => panic!("{workers} workers: {other:?}"),
+        }
     }
 }

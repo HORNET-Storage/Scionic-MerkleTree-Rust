@@ -9,3 +9,9 @@ license = "MIT"
 
 [dependencies]
 sha2 = { version = "0.11", default-features = false }
+
+# Opening a file from the folder it is in, and never through a link: the
+# standard library has no way to do that without `unsafe`. Used on Unix only.
+# On Windows the same is done with what the standard library has.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
