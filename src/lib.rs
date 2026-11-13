@@ -254,3 +254,9 @@ pub(crate) fn io_error(operation: &'static str, path: &Path, source: io::Error) 
         source,
     }
 }
+
+/// The examples in the README are compiled with the tests, and the one that
+/// needs no files is run, so that the README cannot fall behind the code.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExamples;

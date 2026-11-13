@@ -1,126 +1,499 @@
-# Scionic Merkle trees, in Rust
+![nostr Badge](https://img.shields.io/badge/nostr-8e30eb?style=flat) ![Rust Badge](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white) <img src="https://static.wixstatic.com/media/e9326a_3823e7e6a7e14488954bb312d11636da~mv2.png" height="20"> [![CI](https://github.com/HORNET-Storage/Scionic-MerkleTree-Rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/HORNET-Storage/Scionic-MerkleTree-Rust/actions/workflows/ci.yml) ![Version](https://img.shields.io/badge/version-2.5.6-blue) ![Rust 1.85+](https://img.shields.io/badge/rustc-1.85%2B-orange) ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-A Scionic Merkle tree holds a folder of files, or one file, under one root hash.
+# Scionic Merkle Trees
 
-- **Identical things are stored once.** A piece of a file is hashed by its bytes alone, a file is the list of its pieces, and a folder is the list of its names. So the same piece, file or folder has the same hash in every tree, and a store keeps it once.
-- **Any part can be shown without the rest,** and checked against the root: one name of a folder, a run of its entries, one piece of a file, or a stretch of a file's bytes.
-- **Syncing is by file hash and piece number.** A receiver walks down from a root it trusts, asks for what it lacks, and skips what it holds. Nothing is compared between the two sides.
-- **Nothing is trusted on arrival.** Every answer is checked against a hash that is already checked, and nothing is kept before it is tied to the root.
+## Combining Merkle Trees and Merkle DAGs
 
-`spec/FORMAT.md` says exactly what every hash covers, what a receiver checks, and the bytes of every request and answer. This crate is the reference for it. The Go and Swift libraries are kept in step with this crate, and the three are held to each other by the vectors under `spec/`.
+We've designed a [new type of Merkle DAG/Merkle Tree hybrid](https://www.hornet.storage/) known as the Scionic Merkle Tree. Scionic Merkle Trees contain small branches like Classic Merkle Trees, the folder storage support of Merkle DAGs, and numbered file chunks, so anyone can sync a file by its hash and request the range of chunk numbers they are missing. Identical chunks, files and folders have identical hashes wherever they appear, so each one is stored once and sent once.
 
-## What is in it
+This repository is the **Rust implementation**, at **version 2.5.6**. It is the reference for the Scionic tree format, which is specified in [`spec/FORMAT.md`](spec/FORMAT.md). The Go and Swift libraries are held to it by the shared test vectors under [`spec/`](spec).
 
-| Module | What it does |
-| --- | --- |
-| `format` | The bytes of a piece, a file, a folder, an entry and the record, and the runs that show a part of a list. Reading is strict. |
-| `tree` | The tree of a list: its forks, showing a run of a list, and checking one. |
-| `fastcdc` | Cutting a file into pieces by its content (`fastcdc-v1`), in memory and as a stream. |
-| `build` | Building a tree from a folder on disk or from bytes: a piece at a time, several files at once. |
-| `intake` | The one set of checks for a tree that comes from a peer, comes in a bundle, or sits in a store. |
-| `read` | Finding a path, reading a file or a stretch of one, and writing a tree out to disk. |
-| `diff` | What changed between two trees. |
-| `wire` | The requests, and the frames that answer them. |
-| `sync` | Answering requests from a store, fetching a whole tree, reading parts of one straight from a peer, bundles, and all of it over a connection. |
-| `store` | What a store has to do, and a store in memory. |
+```mermaid
+flowchart TD
+    root(["Root<br/>hash of the tree's record"])
+    top["Folder<br/>Merkle tree over its entries"]
+    readme["File"]
+    v1["Folder"]
+    v2["Folder"]
+    m1["File<br/>Merkle tree over its chunks"]
+    m2["File<br/>Merkle tree over its chunks"]
+    r0["Chunk"]
+    a["Chunk A"]
+    b["Chunk B"]
+    b2["Chunk B, edited"]
+    c["Chunk C"]
 
-It depends on `sha2`, and on Unix on `rustix`, which opens a file from the folder it is in. The crate forbids `unsafe`.
-
-## Using it
-
-A store keeps bytes by their hash. `MemoryStore` is one for tests and small trees. A database implements the `Store` trait.
-
-```rust
-use scionic_merkletree::{build, verify, write_to_disk, BuildOptions, MemoryStore};
-
-let store = MemoryStore::new();
-
-// Build a tree from a folder. The root is the same wherever the folder is,
-// and whatever it is called.
-let root = build(&store, "models/my-model", &BuildOptions::new())?;
-println!("{root}"); // bafkrei...
-
-// Check everything the store holds of it: every list and every piece.
-let summary = verify(&store, &root)?;
-println!("{} bytes", summary.record.top().size);
-
-// Write it out again, to a place that does not exist yet.
-write_to_disk(&store, &root, "restored")?;
+    root --> top
+    top -- "README.md" --> readme
+    top -- "v1" --> v1
+    top -- "v2" --> v2
+    v1 -- "model.bin" --> m1
+    v2 -- "model.bin" --> m2
+    readme -- "0" --> r0
+    m1 -- "0" --> a
+    m1 -- "1" --> b
+    m1 -- "2" --> c
+    m2 -- "0" --> a
+    m2 -- "1" --> b2
+    m2 -- "2" --> c
 ```
 
-Building and checking use every processor core unless they are told otherwise: `BuildOptions::workers`, `Builder::threads` and `VerifyOptions::workers` say how many. Several files are cut at once, and the pieces of one long file are hashed several at once. A file is never held in memory whole. A builder holds up to 16 MiB of it, or up to 64 MiB while other threads help it.
+*Two versions of a model in one tree. The second version changed one chunk, so that chunk is the only new data: chunks A and C are stored once and shared. A name belongs to its folder and a chunk number belongs to its file, so a file is the same file wherever it sits and whatever it is called.*
 
-When bytes were harmed in the store, `verify` says which thing it is: `Error::Corrupt` carries its hash. It changes nothing. With `VerifyOptions::new().discard_damaged(true)` it removes what is damaged, and a `fetch` then brings those parts again. A `fetch` on its own replaces a damaged list or record, because it cannot go on with one.
+Scionic Merkle Trees maintain the advantages of IPFS Merkle DAGs with the slim Merkle Branches of Classic Merkle Trees. In plant grafting, the "Scion" is the upper part of the plant, chosen for its desirable fruits or flowers; it's grafted onto another plant's base to grow together. In a similar vein, the Scionic Merkle Tree was born from grafting together Merkle Trees and Merkle DAGs. This process emphasizes why we use the term "Scion" for the Scionic Merkle Trees: it symbolizes the digital grafting of these two similar data structures, combining their strengths into one piece of software.
 
-Syncing runs over anything that reads and writes bytes. One side serves, and the other asks.
+## Contents
 
-```rust
-use scionic_merkletree::{fetch, serve, Remote, StreamPeer};
+- [Scionic Merkle Trees: The Best of Both Worlds](#scionic-merkle-trees-the-best-of-both-worlds)
+- [Scionic Merkle Branch Statistics](#scionic-merkle-branch-statistics)
+- [Syncing by File Hash and Chunk Number](#syncing-by-file-hash-and-chunk-number)
+- [What's New in 2.5.6](#whats-new-in-256)
+- [Documentation](#documentation)
+  - [Install](#install)
+  - [Quick Start](#quick-start)
+  - [Syncing Between Two Stores](#syncing-between-two-stores)
+  - [Syncing Over a Connection](#syncing-over-a-connection)
+  - [What Else It Does](#what-else-it-does)
+  - [Stores](#stores)
+  - [Words Used in the API](#words-used-in-the-api)
+  - [Performance](#performance)
+  - [Security](#security)
+  - [Known Limitations](#known-limitations)
+  - [Specification and Test Vectors](#specification-and-test-vectors)
+  - [Other Implementations](#other-implementations)
+  - [Development](#development)
+  - [License](#license)
 
-// The side that holds the tree answers requests until the connection ends.
-serve(&store, &mut from_peer, &mut to_peer)?;
+## Scionic Merkle Trees: The Best of Both Worlds
 
-// The other side fetches the whole tree. What it holds already is skipped,
-// and a fetch that stops goes on from what the store holds.
-let mut peer = StreamPeer::new(from_peer, to_peer);
-fetch(&store, &root, &mut peer)?;
+### Classic Merkle Trees
 
-// Or it reads a part and keeps nothing: one file's entry, then 4,096 bytes
-// from the middle of that file. Only the pieces that hold them are sent.
-let mut remote = Remote::open(&mut peer, &root)?;
-if let Some(entry) = remote.lookup("weights/model.safetensors")? {
-    remote.read(&entry.target(), 1 << 30, 4096, &mut out)?;
+Merkle Trees are cryptographic structures used to manage and securely verify large amounts of data. However, there's a significant drawback: they cannot store folders of files.
+
+The number of hashes required for a Merkle proof in a Classic Merkle Tree grows logarithmically with the number of file chunks, meaning the growth rate slows as the tree grows. This pattern makes them very efficient for large datasets.
+
+### Scionic Merkle Trees vs. IPFS Merkle DAGs
+
+Merkle DAGs were developed as a solution to incorporate folders of files, addressing a key limitation of Classic Merkle Trees. However, this structure has its own challenge: to securely download a single file chunk, you must download the hash of every other file chunk inside the folder it's stored in. Each parent leaf keeps growing as the folder grows, even though the size of each Merkle chunk should always remain the same.
+
+Scionic Merkle Trees resolve this flaw, because each Scionic parent leaf is itself chunked using a Classic Merkle Tree, ensuring every part of the Scionic Merkle Tree is uniformly small. In the most extreme cases of P2P decentralization, a user could retrieve each Merkle branch from a different source without needing to download the entire parent leaf first.
+
+### Folders and Subfolders of Files
+
+Like Merkle DAGs, Scionic Merkle Trees can accommodate storing folders of files. An entire directory of files and subfolders can be converted into a Scionic Merkle Tree, and a single file can be a tree on its own.
+
+### Content-Defined File Chunking
+
+Files are split into chunks with content-defined chunking (FastCDC): chunk boundaries are derived from the bytes themselves rather than from fixed offsets, so identical content produces identical chunks no matter where it appears. Editing a large file no longer shifts every boundary after the edit: only the chunks around the edit change, and every other chunk is reused.
+
+Chunk sizes are bounded: more than 512 KiB, 2 MiB on average, and 8 MiB at most, with only a file's last chunk allowed to be smaller. No crafted content can produce a flood of tiny chunks or one giant chunk to stall producers, verifiers or transports. The algorithm is frozen as `fastcdc-v1` in [`spec/FORMAT.md`](spec/FORMAT.md) and pinned by the vectors in [`spec/fastcdc-vectors`](spec/fastcdc-vectors), so every implementation cuts the same bytes at the same places.
+
+### Deduplication at Every Level
+
+A hash covers what a thing is, and never where it sits:
+
+- **A chunk's hash** is the SHA-256 of its bytes, and nothing else.
+- **A file's hash** covers the ordered list of its chunks. It does not cover the file's name.
+- **A folder's hash** covers its entries: each name with the hash under it. It does not cover the folder's own name.
+
+So the same chunk, the same file and the same folder have the same hash in every tree. A store keeps each of them once, and a sync skips whatever the receiver already holds, whichever tree it first arrived with. A renamed file, a copied folder, and a new version of a large file that changes a few megabytes each cost only what is new.
+
+### Chunked Parent Leaves
+
+Within each parent leaf, the list of children is organized as a Classic Merkle Tree rather than one potentially large list of hashes. This holds for a folder with its entries and for a file with its chunks. Large files and large folders lead to very long lists, and chunking the parent leaf with a Classic Merkle Tree avoids that scaling problem.
+
+### File Chunk Downloading with Chunked Parent Leaves
+
+If a user wants to download a specific file chunk within a Scionic Merkle Tree, they no longer need to download the hash of every other chunk of its file, or the listing of every other file in its folder. Instead, they download a Classic Merkle branch for each parent on the way down from the root. This allows the user to verify that the chunk is part of the tree without the rest of it.
+
+### One Place for Every Name
+
+A folder's entries are sorted by name, and every fork of the folder's Merkle tree records the name at which its right half begins. A name can therefore sit in exactly one place. One branch proves that a name is in a folder and what it holds, and the same kind of branch proves that a name is *not* in the folder. A publisher cannot show one file under a name to a reviewer and a different file under the same name to everyone else.
+
+## Scionic Merkle Branch Statistics
+
+*Comparing the size of a Scionic Merkle Branch to the whole parent leaf that a Merkle DAG has you download.* These are bytes on the wire in version 2.5.6, measured by [`examples/proof_sizes.rs`](examples/proof_sizes.rs).
+
+**One file out of a folder**, proven by its name:
+
+| Entries in the folder | The whole folder listing | A Scionic branch | Smaller by |
+| ---: | ---: | ---: | ---: |
+| 10 | 610 bytes | 316 bytes | **2x** |
+| 1,000 | 61 KB | 664 bytes | **92x** |
+| 10,000 | 610 KB | 896 bytes | **681x** |
+| 1,000,000 | 61 MB | 1,244 bytes | **49,000x** |
+
+**One chunk out of a file**, proven by its number:
+
+| Chunks in the file | About | The file's whole chunk list | A Scionic branch | Smaller by |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 20 MB | 360 bytes | 219 bytes | **2x** |
+| 1,000 | 2 GB | 36 KB | 459 bytes | **78x** |
+| 10,000 | 20 GB | 360 KB | 619 bytes | **582x** |
+| 500,000 | 1 TB | 18 MB | 819 bytes | **22,000x** |
+
+```sh
+cargo run --release --example proof_sizes
+```
+
+Scionic Merkle Trees incorporate Classic Merkle Trees within their structure, so their branches grow logarithmically: each time a folder or a file doubles in size, a branch through it grows by one step. In stark contrast, a parent leaf in an IPFS Merkle DAG grows linearly, because the hash of every child must be downloaded to check any one of them.
+
+## Syncing by File Hash and Chunk Number
+
+A Scionic Merkle Tree says what is in it. The root names what is on top, a folder lists its entries, and a file lists its chunks. So a receiver that trusts a root walks down from it, skips everything it already holds by its hash, and asks for the rest:
+
+- **a file by its hash, and its chunks by their numbers**: chunks 100 to 200 of this file;
+- **a range of a file's bytes**, for which only the chunks that hold those bytes are sent;
+- **one name of a folder**, or a range of its entries.
+
+A chunk's number is its position in its file's list, and the file's hash covers that list, so nobody can lie about a number. A file's hash is the same in every tree, so the same request means the same thing wherever the file appears.
+
+Nothing is compared between the two sides: there is no set reconciliation to run, and no summary of everything held to work out or to send. A phone can read one file out of a tree of terabytes and hold almost nothing. Which chunks of a file a peer holds is one bit per chunk: about 60 KB for a file of a terabyte. Different ranges of one file can be requested from different peers at the same time.
+
+**Everything is verified on arrival.** Every answer is checked against a hash that has already been checked, all the way back to the root, before it is kept or passed on. Nothing is trusted because of who sent it.
+
+## What's New in 2.5.6
+
+Version 2.5.6 is a new tree format, built for deduplication and for trees of a terabyte and more. It does not read trees made by 2.4.x, and the same folder has a different root than it had there.
+
+- **Deduplication comes first.** A chunk's hash covers its bytes alone and a file's hash covers its chunks alone. Names and chunk numbers moved into the parent. Earlier versions hashed a chunk's number into the chunk and a file's name into the file, so the same bytes had different hashes in different places.
+- **Syncing no longer needs tree-wide leaf numbers.** LeafSync numbered every leaf of a tree. Syncing now asks for a file by its hash and for its chunks by their numbers within that file, which the file's hash covers.
+- **A folder has one place for each name,** so one branch proves that a name is in a folder, or that it is not.
+- **Hardened against forged data.** A made-up leaf, a file that comes back short, a chunk that belongs to another file, and a store that is tricked into handing back other bytes are each refused, and each has a test.
+- **Bounded memory and work.** Every request says how long its answer may be, a tree's record says how much the tree holds, and writing a tree out counts what it would create before it creates anything.
+- **Built for terabytes.** Building and verifying use every core, a file is never held in memory whole, a damaged chunk is named by its hash and fetched again on its own, and any byte range of a file can be read without the rest of it.
+- **Safe on disk.** A link is never followed, in building or in writing out, even when one is swapped in while the work is under way.
+- **A new API.** `create_dag`, `Dag` and the transmission packets of 2.4.x are replaced by `build`, `verify`, `fetch`, `serve` and `Remote`.
+
+# Documentation
+
+## Install
+
+The crate is not published on crates.io. Depend on it by git:
+
+```toml
+[dependencies]
+scionic-merkletree = { git = "https://github.com/HORNET-Storage/Scionic-MerkleTree-Rust", branch = "main" }
+```
+
+For a build that can be repeated, pin a commit with `rev = "..."` in place of the branch.
+
+| Requirement | |
+| --- | --- |
+| Rust | 1.85 or newer |
+| Systems | Linux, macOS and Windows, each tested on every push |
+| Dependencies | `sha2`, and on Unix `rustix` |
+| `unsafe` code | none: the crate is `#![forbid(unsafe_code)]` |
+
+## Quick Start
+
+Turn a folder into a Scionic Merkle Tree, verify it, read a file out of it, and write the tree back to disk:
+
+```rust,no_run
+use scionic_merkletree::{
+    build, lookup, read_file_to_vec, verify, write_to_disk, BuildOptions, MemoryStore,
+};
+
+fn main() -> scionic_merkletree::Result<()> {
+    // A store keeps chunks and lists by their hashes. This one is in memory.
+    let store = MemoryStore::new();
+
+    // Build a tree from a folder. The root depends on the folder's contents
+    // alone: not on where the folder is, what it is called, or how many
+    // threads built it.
+    let root = build(&store, "models/my-model", &BuildOptions::new())?;
+    println!("{root}"); // bafkrei...
+
+    // Verify everything the store holds for that root: every list, every chunk.
+    let summary = verify(&store, &root)?;
+    println!("{} files, {} bytes", summary.files, summary.record.top().size);
+
+    // Read one file by its path in the tree.
+    if let Some(entry) = lookup(&store, &root, "config.json")? {
+        let bytes = read_file_to_vec(&store, &entry.target())?;
+        println!("config.json holds {} bytes", bytes.len());
+    }
+
+    // Write the whole tree back out, to a path that does not exist yet.
+    write_to_disk(&store, &root, "restored")?;
+    Ok(())
 }
 ```
 
-`export` and `import` carry a whole tree as one stream, for a file or a pipe. `diff` lists what changed between two trees. `Intake` is the piece under all of them, for a caller that brings its own transport: give it frames, and it says what to ask for next.
+A root is written as a CID that begins `bafkrei`. `Root` implements `Display` and `FromStr`, and only that one spelling of a root is read.
 
-`examples/roundtrip.rs` takes a folder the whole way round with a store on disk: it builds the tree, checks it, fetches it into a second store, reads a stretch from the middle of its largest file, writes it out again, and holds the copy to the same root. It prints how long each step took. Its store keeps each thing as a file named by its hash, and shows what a store has to do.
+## Syncing Between Two Stores
+
+Anything that answers requests is a peer: a connection to another machine, or a store in the same process. This example runs as it stands.
+
+```rust
+use scionic_merkletree::{
+    fetch, Builder, Cutting, Entry, ExtraData, MemoryStore, Remote, Responder,
+};
+
+fn main() -> scionic_merkletree::Result<()> {
+    // A publisher builds a tree. Here it is built from bytes in memory.
+    let publisher = MemoryStore::new();
+    let mut builder = Builder::new(&publisher, Cutting::FastCdcV1);
+    let readme = builder.file_from_bytes(b"# My model\n")?;
+    let weights = builder.file_from_bytes(&vec![7_u8; 3 << 20])?;
+    let top = builder.folder(vec![
+        Entry::new("README.md", readme, ExtraData::new())?,
+        Entry::new("weights.bin", weights, ExtraData::new())?,
+    ])?;
+    let root = builder.finish(top, ExtraData::new())?;
+
+    let mut peer = Responder::new(&publisher);
+
+    // Read a part of the tree and keep nothing: find one file by its name,
+    // then take 16 bytes from the middle of it. Only the chunk that holds
+    // those bytes is sent, and it is verified against the root.
+    let mut remote = Remote::open(&mut peer, &root)?;
+    let entry = remote.lookup("weights.bin")?.expect("the tree has the file");
+    let mut bytes = Vec::new();
+    remote.read(&entry.target(), 1 << 20, 16, &mut bytes)?;
+    assert_eq!(bytes, [7_u8; 16]);
+
+    // Or fetch the whole tree into another store. Each part is verified
+    // before it is kept, and what the store already holds is skipped.
+    let mirror = MemoryStore::new();
+    let summary = fetch(&mirror, &root, &mut peer)?;
+    assert_eq!(summary.files, 2);
+    Ok(())
+}
+```
+
+## Syncing Over a Connection
+
+Syncing runs over anything that reads and writes bytes: a TCP or QUIC stream, a WebSocket, a pipe. One side serves and the other asks.
+
+```rust,no_run
+use scionic_merkletree::{fetch, serve, MemoryStore, Root, StreamPeer};
+use std::io::{BufReader, BufWriter};
+use std::net::{TcpListener, TcpStream};
+
+/// The side that holds the tree answers requests until the peer hangs up.
+fn serve_one_peer(store: &MemoryStore) -> Result<(), Box<dyn std::error::Error>> {
+    let (stream, _) = TcpListener::bind("0.0.0.0:4040")?.accept()?;
+    let mut input = BufReader::new(stream.try_clone()?);
+    let mut output = BufWriter::new(stream);
+    serve(store, &mut input, &mut output)?;
+    Ok(())
+}
+
+/// The side that wants the tree fetches it. A fetch that was cut off goes on
+/// from what the store holds when it is run again.
+fn fetch_tree(
+    address: &str,
+    root: &Root,
+    store: &MemoryStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = TcpStream::connect(address)?;
+    let input = BufReader::new(stream.try_clone()?);
+    let mut peer = StreamPeer::new(input, BufWriter::new(stream));
+    fetch(store, root, &mut peer)?;
+    Ok(())
+}
+```
+
+The library verifies everything against the root, so a connection does not have to be trusted for the data to be right. It does not encrypt or authenticate the connection: use TLS or Noise where a transfer should be private.
+
+## What Else It Does
+
+| To do this | Use |
+| --- | --- |
+| Build a tree from a folder or a file on disk | `build`, `build_with`, `BuildOptions` |
+| Build a tree from bytes or streams, entry by entry | `Builder` |
+| Verify a tree that a store holds, and mend damage | `verify`, `verify_with`, `VerifyOptions` |
+| Find a path, read a file, read a range of its bytes | `lookup`, `read_file`, `read_range`, `read_open` |
+| Write a tree out to disk | `write_to_disk`, `write_to_disk_with`, `WriteOptions` |
+| Serve a store to peers | `serve`, `Responder` |
+| Fetch a whole tree from a peer | `fetch` |
+| Read parts of a peer's tree and keep nothing | `Remote` |
+| Carry a whole tree as one file or stream | `export`, `import` |
+| List what changed between two trees | `diff`, `Change` |
+| Bring your own transport | `Intake`, `Request`, `Frame`, the `Peer` trait |
+| Bring your own storage | the `Store` trait |
+
+**Building.** Building uses every core unless `BuildOptions::workers` says otherwise. Several files are chunked at once, and the chunks of one long file are hashed several at once. A file is never held in memory whole: a builder holds up to 16 MiB of it, or up to 64 MiB while other threads help it. `BuildOptions::timestamp` writes the time into the tree's record, and `build_with` attaches extra data to each entry, such as a file mode or a media type. A link or a special file in the folder is refused, or left out with `Links::Skip`. It is never followed.
+
+**Verifying and mending.** `verify` checks every list and every chunk that a store holds for a root, on every core. When bytes were harmed where they are kept, the error says which thing it is: `Error::Corrupt` carries its hash. With `VerifyOptions::new().discard_damaged(true)` the damaged parts are removed, and the next `fetch` brings back exactly those. `VerifyOptions::recut` also chunks every file again, and refuses a file that was not chunked the standard way.
+
+**Bundles and changes.** A whole tree can travel as one stream, and two trees in one store can be compared:
+
+```rust,no_run
+use scionic_merkletree::{build, diff, export, import, BuildOptions, MemoryStore};
+use std::fs::File;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = MemoryStore::new();
+    let old = build(&store, "release-1", &BuildOptions::new())?;
+    let new = build(&store, "release-2", &BuildOptions::new())?;
+
+    // What changed, by path. The chunks that both releases share are held once.
+    for change in diff(&store, &old, &new)? {
+        println!("{}", change.path());
+    }
+
+    // The new release as one file: the record, then every list and every
+    // chunk once. Reading it back runs the same checks as a fetch from a peer.
+    export(&store, &new, &mut File::create("release-2.bundle")?)?;
+    let elsewhere = MemoryStore::new();
+    import(&elsewhere, &new, &mut File::open("release-2.bundle")?)?;
+    Ok(())
+}
+```
+
+**Three examples come with the crate.** [`examples/roundtrip.rs`](examples/roundtrip.rs) takes a folder the whole way round with a store on disk: it builds the tree, verifies it, fetches it into a second store, reads a range from the middle of its largest file, writes it out again, and holds the copy to the same root, timing each step. [`examples/speed.rs`](examples/speed.rs) measures chunking, hashing, building and verifying into a store in memory, and builds a folder of your own when it is given one. [`examples/proof_sizes.rs`](examples/proof_sizes.rs) prints the branch sizes in the tables above.
 
 ```sh
 cargo run --release --example roundtrip -- <folder> <work-dir>
+cargo run --release --example speed -- <MiB> [folder]
+cargo run --release --example proof_sizes
 ```
 
-`examples/speed.rs` measures cutting, hashing, building and checking on one file held in memory, so that no disk is in the way:
+## Stores
 
-```sh
-cargo run --release --example speed -- <MiB>
+A store keeps bytes under hashes, and that is all the library asks of one. `MemoryStore` is a store in memory, for tests and small trees. A database, a folder on disk or an object store implements the `Store` trait:
+
+```rust,ignore
+pub trait Store: Send + Sync {
+    /// Keeps `bytes` under `hash`. Keeping what is kept already changes nothing.
+    fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()>;
+
+    /// What is kept under `hash`, if anything.
+    fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>>;
+
+    /// Forgets what is kept under `hash`.
+    fn remove(&self, kind: Stored, hash: &Hash) -> Result<()>;
+
+    // `has` and `size` have default implementations, which a store that can
+    // answer them without reading the bytes should replace.
+}
 ```
 
-## What it guards against
+`Stored` says which of four kinds of thing it is: a chunk, a file's chunk list, a folder's listing, or a tree's record. A store never has to understand what it holds: every byte it hands back is checked again before it is used. `examples/roundtrip.rs` has a complete store that keeps each thing as a file named by its hash.
 
-The tests under `tests/` hold the library to these, with forged bytes made by a second copy of the format's rules (`tests/support/oracle.rs`):
+## Words Used in the API
 
-- A made-up child under a folder or a file, a real child's proof with another child, a file taken for a folder, a list taken for a piece, and a file given another file's pieces are all refused.
-- A file never comes back short. If a piece is missing, reading is an error.
-- A folder cannot show one name at two places, even if it was put together out of order on purpose.
-- A frame that nothing names is refused and not kept. A list that is named and then fails a check is not kept either, and that intake takes nothing more.
-- A peer cannot make a receiver set aside more memory than the tree it trusts calls for: every request says how long its answer may be.
-- A tree's record says how much the tree holds, and taking it in stops as soon as it holds more.
-- A small tree that stands for an endless one, by holding one folder under many names, is counted before it is written out, and refused.
-- Bytes that were harmed in a store are found when the tree is checked, and named by their hash. They can be removed and fetched again.
-- Nothing a peer sends makes a store remove bytes that are sound. A list that names a held piece with a wrong length is refused, and the piece stays.
-- A link is never followed when a tree is built. That holds for a link that is in the folder, and for one that takes a file's or a folder's place while the folder is being read: each folder is held open while it is read, and what is in it is opened from the folder itself, never by a path that is looked up again.
-- A tree is written only to a new place, and only with names the system can hold as they are. The new folders are held open while they are filled, so a link that takes the place of one is not written through.
-- On Windows a file is read under the name its folder lists it by, and under no other. Windows drops a dot or a space from the end of a name when it looks a path up, and takes `NUL` for a device wherever it stands, so a file `model.` beside a file `model` would be read as `model`. Everything below the place a caller names is opened by a path that Windows takes letter for letter.
-- Malformed input is an error, and never a crash or a loop.
+The API and the specification use short, plain words. This is how they line up with the words above:
 
-## What it does not do well yet
+| Here | In the API and in `spec/FORMAT.md` |
+| --- | --- |
+| chunk | piece: `PieceRef`, `Stored::Piece` |
+| a file's chunk list | file list: `FileList` |
+| a folder's listing | folder list: `FolderList`, made of entries: `Entry` |
+| Merkle branch, Merkle proof | run: `FileRun`, `FolderRun` |
+| chunking | cutting: `Cutting::FastCdcV1` |
+| root | `Root`, the hash of the tree's record: `Record` |
 
-- One file is cut on one processor core, because where a piece ends decides where the next begins. On the desktop it was measured on, that is about 5 GB a second. Hashing the pieces, which is the greater part of the work, uses every core.
-- Fetching a tree and writing a tree out use one core each. On the disks they were tried on, the disk was the slower part.
-- Checking or fetching a whole tree keeps about a hundred bytes in memory for every different piece, so that each piece is counted once: about 50 MB for a terabyte.
-- A list is taken in whole. A file's list is about 19 MB for each terabyte of the file, and a folder's list has to fit in memory.
-- A responder that tells a peer which pieces of a file it holds looks into its store for each of them. `Responder::have(false)` switches that off for one that serves strangers.
-- A tree is built from a folder as the folder is while it is read. If another program changes files in it meanwhile, the tree can hold a mix of old and new. It cannot be led outside the folder.
-- On Windows, opening a file so that it cannot be led astray costs about 16 millionths of a second for each file. With every core at work it does not show: a folder of 20,000 files of 4 KiB builds in 0.14 seconds, as it did before. On one thread it takes 1.0 second where it took 0.7. On Linux it costs nothing. While a folder is being read on Windows, other programs cannot rename or delete it. On systems that are neither Unix nor Windows, a folder is not held open, and a link that is swapped in while a folder is read can be followed.
+| Module | What it holds |
+| --- | --- |
+| `format` | The bytes of a chunk, a file, a folder, an entry and the record, and the branches that show a part of a list. Reading is strict. |
+| `tree` | The Classic Merkle Tree of a list: building it, showing a part of it, and checking a part. |
+| `fastcdc` | Content-defined chunking (`fastcdc-v1`), in memory and as a stream. |
+| `build` | Building a tree from a folder on disk or from bytes. |
+| `intake` | The one set of checks for a tree that comes from a peer, comes in a bundle, or sits in a store. |
+| `read` | Finding a path, reading a file or a range of one, and writing a tree out to disk. |
+| `diff` | What changed between two trees. |
+| `wire` | The requests, and the frames that answer them. |
+| `sync` | Serving a store, fetching a tree, reading parts of a peer's tree, and bundles. |
+| `store` | The `Store` trait, and a store in memory. |
 
-## Checking a change
+## Performance
+
+Measured on a Windows 11 laptop with Rust 1.100, built with `--release`. The two examples named in the tables print the same figures on any machine.
+
+| Into a store in memory (`examples/speed.rs`) | |
+| --- | ---: |
+| Content-defined chunking, one core | 6.0 GiB/s |
+| SHA-256 of the chunks, one core | 4.1 GiB/s |
+| Building a tree from one file of 1 GiB, every core | 4.7 GiB/s |
+| Building a tree from ten files of 256 MiB on disk, every core | 7.5 GiB/s |
+| Building a tree from 20,000 files of 4 KiB on disk, every core | 0.14 s |
+| Verifying every byte of a tree of 1 GiB, every core | 64 GiB/s |
+
+| With a store on disk, a folder of 3.5 GiB (`examples/roundtrip.rs`) | |
+| --- | ---: |
+| Building the tree into the store | 1.8 s |
+| Verifying every byte from the store | 0.3 s |
+| Fetching the tree into a second store | 5.1 s |
+| Reading 4 KiB from the middle of a file of 1.5 GiB, through a peer | 4 ms |
+| Writing the tree back out as files | 4.6 s |
+
+That folder holds one file of 1 GiB twice. The tree stores it once: 3.5 GiB of files are kept as 2.5 GiB of chunks and 59 KB of lists.
+
+## Security
+
+A receiver trusts one thing: the root. The peer that sends a tree, the network in between, and the bytes that sit in a store are all treated as untrusted. The tests under [`tests/`](tests) hold the library to the guarantees below with forged bytes, which are made by a second, independent copy of the format's rules ([`tests/support/oracle.rs`](tests/support/oracle.rs)).
+
+**What is verified**
+
+- **No forged content.** A made-up child under a folder or a file, a real child's branch offered with another child, a file offered as a folder, a list offered as a chunk, and a file given another file's chunks are all refused.
+- **No short files.** A file never comes back shorter than it is. If a chunk is missing, reading is an error.
+- **One name, one place.** A folder cannot show one name at two places, even if it was put together out of order on purpose.
+- **Nothing is kept before it is verified.** A frame that nothing asked for is refused and not kept. A list that fails a check is not kept either, and that transfer takes nothing more.
+
+**What is bounded**
+
+- **Memory.** A peer cannot make a receiver set aside more memory than the tree it trusts calls for: every request says how long its answer may be.
+- **Size.** A tree's record says how much the tree holds, and taking it in stops as soon as it would hold more.
+- **Expansion.** A small tree that stands for an endless one, by holding one folder under many names, is counted before it is written out, and refused.
+- **Malformed input** is an error, and never a crash or a loop.
+
+**What a store can count on**
+
+- **Damage is found and named.** Bytes that were harmed in a store are found when the tree is verified, and named by their hash. They can be removed and fetched again on their own.
+- **A peer cannot delete your data.** Nothing a peer sends makes a store remove bytes that are sound. A list that names a held chunk with a wrong length is refused, and the chunk stays.
+
+**What happens on disk**
+
+- **A link is never followed when a tree is built.** That holds for a link that is in the folder, and for one that takes a file's or a folder's place while the folder is being read. Each folder is held open while it is read, and what is in it is opened from the folder itself, never by a path that is looked up again.
+- **Nothing is written outside the destination.** A tree is written only to a new place, and only with names the system can hold as they are. The new folders are held open while they are filled, so a link that takes the place of one is not written through.
+- **A file is read under its own name.** Windows drops a dot or a space from the end of a name when it looks a path up, and takes `NUL` for a device wherever it stands, so a file `model.` beside a file `model` would be read as `model`. Everything below the folder a caller names is opened by a path that Windows takes letter for letter.
+- **No `unsafe` code.** The crate forbids it.
+
+The exact rules are in [`spec/FORMAT.md`](spec/FORMAT.md), under "What a receiver checks", "Limits", "Building a tree" and "Writing a tree out".
+
+## Known Limitations
+
+- **One file is chunked on one core,** because where a chunk ends decides where the next begins. That is about 6 GiB a second on the machine above. Hashing the chunks, which is the greater part of the work, uses every core.
+- **Fetching a tree and writing a tree out use one core each.** On the disks they were tried on, the disk was the slower part.
+- **Verifying or fetching a whole tree keeps about a hundred bytes in memory for every different chunk,** so that each chunk is counted once: about 50 MB for a terabyte.
+- **A list is taken in whole.** A file's chunk list is 36 bytes a chunk, about 18 MB for each terabyte of the file, and a folder's listing has to fit in memory.
+- **A tree is built from a folder as the folder is while it is read.** If another program changes files in it meanwhile, the tree can hold a mix of old and new. It cannot be led outside the folder.
+- **Links, special files and file permissions are not stored.** An entry's extra data has room for a caller to record a mode.
+- **A responder that tells a peer which chunks of a file it holds looks into its store for each of them.** `Responder::have(false)` switches that off for one that serves strangers.
+- **On Windows, opening a file so that it cannot be led astray costs about 16 millionths of a second for each file.** With every core at work it does not show. On one thread, 20,000 files of 4 KiB take 1.0 second to build where a plain open would take 0.7. While a folder is being read on Windows, other programs cannot rename or delete it.
+- **On systems that are neither Unix nor Windows, a folder is not held open,** and a link that is swapped in while a folder is read can be followed.
+
+## Specification and Test Vectors
+
+- [`spec/FORMAT.md`](spec/FORMAT.md) is the format: what every hash covers, what a receiver checks, the bytes of every request and answer, and the limits.
+- [`spec/vectors/manifest.json`](spec/vectors/manifest.json) holds the shared vectors, which this crate makes and every implementation is held to, byte for byte: 7 whole trees with every one of their bytes, 9 branches of them, 8 lookups of a name, 12 requests with their answers, 3 exchanges on a connection, and 74 forged inputs that must be refused. [`spec/vectors/README.md`](spec/vectors/README.md) says how another library reads the file.
+- [`spec/fastcdc-vectors/manifest.json`](spec/fastcdc-vectors/manifest.json) pins where 11 files are chunked, and what each file hashes to.
+
+## Other Implementations
+
+| Implementation | Version | |
+| --- | --- | --- |
+| Rust, this repository | 2.5.6 | The reference for the format. |
+| [Go](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) | 2.4.3 | Being brought to 2.5.6. |
+| [Swift](https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift) | 2.4.3 | Being brought to 2.5.6. |
+
+The three libraries are kept in step: one format, one set of vectors and one version number. Until Go and Swift reach 2.5.6 they write the 2.4.x layout, which this version does not read.
+
+## Development
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --locked --offline -- -D warnings
-cargo test --locked --offline
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo test --locked --release
 ```
 
-`AGENTS.md` holds the rules for contributors.
+CI runs these on Linux, macOS and Windows on every push, and runs the tests once more on Rust 1.85, the oldest version the crate supports. The Rust examples in this file are compiled with the tests, and the one that needs no files is run. [`AGENTS.md`](AGENTS.md) holds the rules for contributors.
+
+## License
+
+Released under the MIT License.
