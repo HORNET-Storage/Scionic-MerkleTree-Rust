@@ -1,260 +1,137 @@
-use crate::{Cid, Dag, DagLeaf, Error, Result};
-use std::collections::{BTreeMap, BTreeSet};
+//! What changed between two trees.
+//!
+//! Two trees are compared folder by folder. Where both have the same hash
+//! under a name, everything below it is the same, and nothing below it is
+//! read.
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DiffType {
-    Added,
-    Removed,
-}
+use crate::format::{Entry, Kind, Target, MAX_FOLDER_DEPTH};
+use crate::hash::Root;
+use crate::read::{folder_of, record_of};
+use crate::store::Store;
+use crate::{Error, Result};
+use std::cmp::Ordering;
 
-impl DiffType {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Added => "added",
-            Self::Removed => "removed",
-        }
-    }
-}
-
+/// One difference between an old tree and a new one.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LeafDiff {
-    diff_type: DiffType,
-    cid: Cid,
-    leaf: DagLeaf,
+pub enum Change {
+    /// The new tree has this entry, and the old one has nothing there. A
+    /// folder that was added is one change: what is in it is not listed.
+    Added { path: String, entry: Entry },
+    /// The old tree has this entry, and the new one has nothing there.
+    Removed { path: String, entry: Entry },
+    /// Both trees have an entry here, and it differs: a file's bytes, or an
+    /// entry's extra data. A folder is listed here only for its extra data.
+    /// What differs inside it is listed by its own path.
+    Changed {
+        path: String,
+        old: Entry,
+        new: Entry,
+    },
 }
 
-impl LeafDiff {
-    pub fn diff_type(&self) -> DiffType {
-        self.diff_type
-    }
-
-    pub fn cid(&self) -> &Cid {
-        &self.cid
-    }
-
-    pub fn leaf(&self) -> &DagLeaf {
-        &self.leaf
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DiffSummary {
-    added: usize,
-    removed: usize,
-    total: usize,
-}
-
-impl DiffSummary {
-    pub fn added(self) -> usize {
-        self.added
-    }
-
-    pub fn removed(self) -> usize {
-        self.removed
-    }
-
-    pub fn total(self) -> usize {
-        self.total
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DagDiff {
-    diffs: BTreeMap<Cid, LeafDiff>,
-    summary: DiffSummary,
-}
-
-impl DagDiff {
-    pub fn diffs(&self) -> &BTreeMap<Cid, LeafDiff> {
-        &self.diffs
-    }
-
-    pub fn summary(&self) -> DiffSummary {
-        self.summary
-    }
-
-    pub fn get_added_leaves(&self) -> BTreeMap<Cid, DagLeaf> {
-        self.leaves_of_type(DiffType::Added)
-    }
-
-    pub fn get_removed_leaves(&self) -> BTreeMap<Cid, DagLeaf> {
-        self.leaves_of_type(DiffType::Removed)
-    }
-
-    pub fn apply_to_dag(&self, old_dag: &Dag) -> Result<Dag> {
-        let added = self.get_added_leaves();
-        if added.is_empty() {
-            return Ok(old_dag.clone());
-        }
-
-        let mut pool = old_dag.leaves().clone();
-        pool.extend(added.clone());
-        let children: BTreeSet<Cid> = pool
-            .values()
-            .flat_map(|leaf| leaf.links().iter().cloned())
-            .collect();
-        let candidates: Vec<Cid> = added
-            .iter()
-            .filter(|(cid, leaf)| leaf.is_root_shape() && !children.contains(*cid))
-            .map(|(cid, _)| cid.clone())
-            .collect();
-        let root = match candidates.as_slice() {
-            [] => return Err(Error::NoDiffRoot),
-            [root] => root.clone(),
-            _ => return Err(Error::AmbiguousDiffRoot),
-        };
-
-        let mut state = BTreeMap::new();
-        let mut leaves = BTreeMap::new();
-        collect_reachable(&root, &pool, &mut state, &mut leaves)?;
-        let dag = Dag::from_parts(root, leaves)?;
-        dag.verify()?;
-        Ok(dag)
-    }
-
-    pub fn create_partial_dag(&self, full_new_dag: &Dag) -> Result<Dag> {
-        let added: Vec<Cid> = self.get_added_leaves().into_keys().collect();
-        if added.is_empty() {
-            return Err(Error::NoAddedLeaves);
-        }
-        full_new_dag.get_partial(&added, false)
-    }
-
-    fn leaves_of_type(&self, diff_type: DiffType) -> BTreeMap<Cid, DagLeaf> {
-        self.diffs
-            .iter()
-            .filter(|(_, record)| record.diff_type == diff_type)
-            .map(|(cid, record)| (cid.clone(), record.leaf.clone()))
-            .collect()
-    }
-
-    fn from_records(diffs: BTreeMap<Cid, LeafDiff>) -> Self {
-        let added = diffs
-            .values()
-            .filter(|record| record.diff_type == DiffType::Added)
-            .count();
-        let removed = diffs.len() - added;
-        Self {
-            summary: DiffSummary {
-                added,
-                removed,
-                total: diffs.len(),
-            },
-            diffs,
+impl Change {
+    /// Where in the tree the change is: names with `/` between them.
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Added { path, .. } | Self::Removed { path, .. } | Self::Changed { path, .. } => {
+                path
+            }
         }
     }
 }
 
-pub fn diff(old_dag: &Dag, new_dag: &Dag) -> Result<DagDiff> {
-    let mut records = BTreeMap::new();
-    for (cid, leaf) in new_dag.leaves() {
-        if !old_dag.leaves().contains_key(cid) {
-            records.insert(
-                cid.clone(),
-                LeafDiff {
-                    diff_type: DiffType::Added,
-                    cid: cid.clone(),
-                    leaf: leaf.clone(),
-                },
-            );
-        }
+/// The differences between two trees that a store holds, sorted by path.
+/// Both trees must have a folder on top, or be the same tree.
+pub fn diff(store: &dyn Store, old: &Root, new: &Root) -> Result<Vec<Change>> {
+    let old_top = record_of(store, old)?.top();
+    let new_top = record_of(store, new)?.top();
+    if old_top == new_top {
+        return Ok(Vec::new());
     }
-    for (cid, leaf) in old_dag.leaves() {
-        if !new_dag.leaves().contains_key(cid) {
-            records.insert(
-                cid.clone(),
-                LeafDiff {
-                    diff_type: DiffType::Removed,
-                    cid: cid.clone(),
-                    leaf: leaf.clone(),
-                },
-            );
-        }
+    if old_top.kind != Kind::Folder || new_top.kind != Kind::Folder {
+        return Err(Error::InvalidData {
+            detail: "a tree with a file on top has no entries to compare".to_owned(),
+        });
     }
-    Ok(DagDiff::from_records(records))
-}
-
-pub fn diff_from_new_leaves(
-    original_dag: &Dag,
-    new_leaves: &BTreeMap<Cid, DagLeaf>,
-) -> Result<DagDiff> {
-    for (key, leaf) in new_leaves {
-        if key != leaf.cid() {
-            return Err(Error::CidKeyMismatch {
-                key: key.to_string(),
-                cid: leaf.cid().to_string(),
+    let mut changes = Vec::new();
+    let mut pending: Vec<(Target, Target, String, usize)> =
+        vec![(old_top, new_top, String::new(), 1)];
+    while let Some((old_folder, new_folder, prefix, depth)) = pending.pop() {
+        if depth > MAX_FOLDER_DEPTH {
+            return Err(Error::TooDeep {
+                limit: MAX_FOLDER_DEPTH,
             });
         }
-    }
-
-    let root = new_leaves
-        .iter()
-        .filter(|(_, leaf)| leaf.is_root_shape())
-        .max_by(|(left_cid, left), (right_cid, right)| {
-            left.leaf_count()
-                .cmp(&right.leaf_count())
-                .then_with(|| right_cid.cmp(left_cid))
-        })
-        .map(|(cid, _)| cid.clone())
-        .ok_or(Error::MissingNewRoot)?;
-
-    let mut pool = original_dag.leaves().clone();
-    pool.extend(new_leaves.clone());
-    let mut state = BTreeMap::new();
-    let mut reachable = BTreeMap::new();
-    collect_reachable(&root, &pool, &mut state, &mut reachable)?;
-
-    let mut records = BTreeMap::new();
-    for (cid, leaf) in new_leaves {
-        if !original_dag.leaves().contains_key(cid) {
-            records.insert(
-                cid.clone(),
-                LeafDiff {
-                    diff_type: DiffType::Added,
-                    cid: cid.clone(),
-                    leaf: leaf.clone(),
-                },
-            );
+        let old_list = folder_of(store, &old_folder)?;
+        let new_list = folder_of(store, &new_folder)?;
+        let (olds, news) = (old_list.entries(), new_list.entries());
+        let (mut left, mut right) = (0, 0);
+        let at = |name: &str| format!("{prefix}{name}");
+        loop {
+            let order = match (olds.get(left), news.get(right)) {
+                (Some(old), Some(new)) => old.name().as_bytes().cmp(new.name().as_bytes()),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => break,
+            };
+            match order {
+                Ordering::Less => {
+                    changes.push(Change::Removed {
+                        path: at(olds[left].name()),
+                        entry: olds[left].clone(),
+                    });
+                    left += 1;
+                }
+                Ordering::Greater => {
+                    changes.push(Change::Added {
+                        path: at(news[right].name()),
+                        entry: news[right].clone(),
+                    });
+                    right += 1;
+                }
+                Ordering::Equal => {
+                    let (old, new) = (&olds[left], &news[right]);
+                    let path = at(old.name());
+                    if old.kind() != new.kind() {
+                        changes.push(Change::Removed {
+                            path: path.clone(),
+                            entry: old.clone(),
+                        });
+                        changes.push(Change::Added {
+                            path,
+                            entry: new.clone(),
+                        });
+                    } else if old.kind() == Kind::File {
+                        if old != new {
+                            changes.push(Change::Changed {
+                                path,
+                                old: old.clone(),
+                                new: new.clone(),
+                            });
+                        }
+                    } else {
+                        if old.hash() != new.hash() {
+                            pending.push((
+                                old.target(),
+                                new.target(),
+                                format!("{path}/"),
+                                depth + 1,
+                            ));
+                        }
+                        if old.extra() != new.extra() {
+                            changes.push(Change::Changed {
+                                path,
+                                old: old.clone(),
+                                new: new.clone(),
+                            });
+                        }
+                    }
+                    left += 1;
+                    right += 1;
+                }
+            }
         }
     }
-    for (cid, leaf) in original_dag.leaves() {
-        if !reachable.contains_key(cid) {
-            records.insert(
-                cid.clone(),
-                LeafDiff {
-                    diff_type: DiffType::Removed,
-                    cid: cid.clone(),
-                    leaf: leaf.clone(),
-                },
-            );
-        }
-    }
-    Ok(DagDiff::from_records(records))
-}
-
-fn collect_reachable(
-    cid: &Cid,
-    pool: &BTreeMap<Cid, DagLeaf>,
-    state: &mut BTreeMap<Cid, u8>,
-    output: &mut BTreeMap<Cid, DagLeaf>,
-) -> Result<()> {
-    match state.get(cid) {
-        Some(1) => {
-            return Err(Error::CycleDetected {
-                cid: cid.to_string(),
-            });
-        }
-        Some(2) => return Ok(()),
-        _ => {}
-    }
-    let leaf = pool.get(cid).ok_or_else(|| Error::MissingPoolLeaf {
-        cid: cid.to_string(),
-    })?;
-    state.insert(cid.clone(), 1);
-    output.insert(cid.clone(), leaf.clone());
-    for child in leaf.links() {
-        collect_reachable(child, pool, state, output)?;
-    }
-    state.insert(cid.clone(), 2);
-    Ok(())
+    changes.sort_by(|left, right| left.path().cmp(right.path()));
+    Ok(changes)
 }

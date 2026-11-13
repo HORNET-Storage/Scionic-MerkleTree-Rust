@@ -1,1023 +1,1123 @@
-//! Forgeries: input that no honest sender could have produced for the root in
-//! question, and that a verifier therefore has to refuse.
+//! What a forger can try, and that each try is refused.
 //!
-//! Each one is built the way a hostile peer builds it. Honest wire bytes are
-//! read as plain JSON, edited, and handed back to the public decoders; nothing
-//! here reaches inside the crate. Every test first checks that the honest form
-//! of the same input is accepted, so a refusal cannot come from an unrelated
-//! fault in the setup, and every test reports each forged input that got
-//! through, not only the first.
+//! The forger here is a peer that answers a receiver, a bundle that a
+//! receiver reads, or whoever wrote into a receiver's store. Each test makes
+//! the forgery out of bytes, as a forger would, and holds the receiver to
+//! two things: it says no, and it has kept nothing that is not a true part
+//! of the tree it asked for.
 
 mod support;
 
 use scionic_merkletree::{
-    create_dag, create_dag_with_options, BatchedDagReceiver, BatchedTransmissionPacket, Cid, Dag,
-    DagBuildOptions, DagLeaf, DagStore, Error, TransmissionPacket, TransmissionReceiver,
+    export, fetch, file_of, folder_of, import, lookup, read_file, verify, Builder, Entry, Error,
+    ExtraData, FileList, FileRun, FolderList, FolderRun, Frame, Hash, Intake, Kind, MemoryStore,
+    Record, Remote, Request, Responder, Result, Root, Store, Stored, Summary, Target, Totals,
+    FRAME_FILE_LIST, FRAME_FILE_RUN, FRAME_FOLDER_LIST, FRAME_FOLDER_RUN, FRAME_PIECE,
+    FRAME_RECORD,
 };
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
-use support::json::Json;
-use support::{write, TempDir};
+use std::cell::Cell;
+use support::oracle;
+use support::{bytes, contents, sample_tree, small_pieces, ScriptedPeer, TestPeer};
 
-/// Every forged input that a test saw accepted.
-#[derive(Default)]
-struct Accepted(Vec<String>);
-
-impl Accepted {
-    fn unless_refused<T>(&mut self, outcome: Result<T, Error>, what: &str) {
-        self.when(outcome.is_ok(), what);
-    }
-
-    fn when(&mut self, accepted: bool, what: &str) {
-        if accepted {
-            self.0.push(what.to_owned());
-        }
-    }
-
-    fn finish(self) {
-        assert!(
-            self.0.is_empty(),
-            "accepted:\n  - {}",
-            self.0.join("\n  - ")
-        );
-    }
+fn target_at(store: &MemoryStore, root: &Root, path: &str) -> Target {
+    lookup(store, root, path).unwrap().unwrap().target()
 }
 
-/// A directory of `count` one-byte files as a DAG: a root with `count` children.
-fn flat_dag(temp: &TempDir, name: &str, count: usize) -> Dag {
-    let dir = temp.path().join(name);
-    for index in 0..count {
-        write(dir.join(format!("f{index}.txt")), &[b'a' + index as u8]).unwrap();
-    }
-    create_dag(&dir).unwrap()
+fn kept(store: &MemoryStore, kind: Stored, hash: &Hash) -> Vec<u8> {
+    store.get(kind, hash).unwrap().unwrap().to_vec()
 }
 
-/// A directory of files cut into 16-byte chunks, as a DAG.
-fn chunked_dag(temp: &TempDir, name: &str, files: &[(&str, &[u8])]) -> Dag {
-    let dir = temp.path().join(name);
-    for (file, body) in files {
-        write(dir.join(file), body).unwrap();
-    }
-    let options = DagBuildOptions::default().with_chunk_size(16).unwrap();
-    create_dag_with_options(&dir, &options).unwrap()
+fn entry(name: &str, target: Target) -> Entry {
+    Entry::new(name, target, ExtraData::new()).unwrap()
 }
 
-/// Three 16-byte chunks, each one letter repeated.
-fn three_chunks(letters: [u8; 3]) -> Vec<u8> {
-    letters.iter().flat_map(|letter| [*letter; 16]).collect()
-}
-
-fn wire_of(dag: &Dag) -> Json {
-    Json::parse(&dag.to_json().unwrap())
-}
-
-fn text(value: &str) -> Json {
-    Json::Text(value.to_owned())
-}
-
-fn links(cids: &[&str]) -> Json {
-    Json::Array(cids.iter().copied().map(text).collect())
-}
-
-fn readable(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// One leaf of a DAG on the wire.
-fn leaf_mut<'a>(dag: &'a mut Json, cid: &str) -> &'a mut Json {
-    dag.get_mut("Leafs").get_mut(cid)
-}
-
-/// The leaf named `name` in a DAG: its CID, and its wire form.
-fn leaf_named(dag: &Dag, name: &str) -> (String, Json) {
-    wire_of(dag)
-        .get("Leafs")
-        .members()
-        .iter()
-        .find(|(_, leaf)| leaf.get("ItemName").text() == name)
-        .unwrap_or_else(|| panic!("no leaf named {name}"))
-        .clone()
-}
-
-/// A self-consistent leaf that belongs to no victim DAG: the file leaf of an
-/// unrelated one-file directory. A leaf's hash covers only the leaf's own
-/// fields, so the leaf is valid wherever it is placed.
-fn forged_leaf(temp: &TempDir, name: &str) -> (String, Json) {
-    let dir = temp.path().join(format!("attacker-{name}"));
-    write(dir.join(name), b"echo forged").unwrap();
-    leaf_named(&create_dag(&dir).unwrap(), name)
-}
-
-/// What a receiver does with DAG bytes: decode them, then verify. `Ok` means
-/// that the bytes were taken as a valid DAG. CBOR carries the same structure,
-/// and has to get the same verdict.
-fn decode_and_verify(wire: &Json) -> Result<Dag, Error> {
-    let dag = Dag::from_json(&wire.to_bytes())?;
-    let verdict = dag.verify();
-    let through_cbor = Dag::from_cbor(&dag.to_cbor().unwrap()).and_then(|dag| dag.verify());
-    assert_eq!(
-        verdict.is_ok(),
-        through_cbor.is_ok(),
-        "JSON and CBOR disagree: {verdict:?} against {through_cbor:?}"
-    );
-    verdict.map(|()| dag)
-}
-
-/// A store filled from DAG bytes that were decoded and not yet verified.
-fn store_of(wire: &Json) -> DagStore {
-    let dag = Dag::from_json(&wire.to_bytes())
-        .expect("decoding checks the shape of the bytes, not what they claim");
-    DagStore::from_dag(&dag).unwrap()
-}
-
-/// A single-leaf packet that hands `leaf` to a receiver as a child of
-/// `parent`, with no proof.
-fn packet_for(leaf: &Json, parent: &str) -> TransmissionPacket {
-    let wire = Json::Object(vec![
-        ("Leaf".to_owned(), leaf.clone()),
-        ("ParentHash".to_owned(), text(parent)),
-    ]);
-    TransmissionPacket::from_json(&wire.to_bytes())
-        .expect("the forged packet is well formed, which is the point")
-}
-
-/// The one batch a small DAG travels in, on the wire.
-fn batch_of(dag: &Dag) -> Json {
-    let batches = dag.batched_leaf_sequence().unwrap();
-    assert_eq!(batches.len(), 1, "a small DAG travels in one batch");
-    Json::parse(&batches[0].to_json().unwrap())
-}
-
-/// One batch that carries the given leaves, each beside its parent. The root's
-/// parent is the empty string.
-fn batch_from(leaves: &[(&Json, &str)]) -> Json {
-    Json::Object(vec![
-        (
-            "Leaves".to_owned(),
-            Json::Array(leaves.iter().map(|(leaf, _)| (*leaf).clone()).collect()),
-        ),
-        (
-            "Relationships".to_owned(),
-            Json::Object(
-                leaves
-                    .iter()
-                    .map(|(leaf, parent)| (leaf.get("Hash").text().to_owned(), text(parent)))
-                    .collect(),
-            ),
-        ),
-        ("PacketIndex".to_owned(), Json::Number("0".to_owned())),
-        ("TotalPackets".to_owned(), Json::Number("1".to_owned())),
-    ])
-}
-
-fn batch_leaf_mut<'a>(batch: &'a mut Json, cid: &str) -> &'a mut Json {
-    batch
-        .get_mut("Leaves")
-        .items_mut()
-        .iter_mut()
-        .find(|leaf| leaf.get("Hash").text() == cid)
-        .unwrap_or_else(|| panic!("no leaf {cid} in the batch"))
-}
-
-/// Adds a leaf to a batch, as a child of `parent`.
-fn add_to_batch(batch: &mut Json, cid: &str, leaf: &Json, parent: &str) {
-    batch.get_mut("Leaves").push(leaf.clone());
-    batch.get_mut("Relationships").set(cid, text(parent));
-}
-
-fn decode_batch(wire: &Json) -> Result<BatchedTransmissionPacket, Error> {
-    BatchedTransmissionPacket::from_json(&wire.to_bytes())
-}
-
-/// What a fresh receiver makes of a batch: decode it, then verify it.
-fn verify_batch(wire: &Json) -> Result<(), Error> {
-    BatchedDagReceiver::new().verify_packet(&decode_batch(wire)?)
-}
-
-/// Whether a fresh streaming receiver hands the forged leaf's bytes to its sink.
-fn streams_forged_bytes(packet: &BatchedTransmissionPacket, forged: &Cid) -> bool {
-    let mut delivered = false;
-    let _ = BatchedDagReceiver::new().apply_and_verify_streaming::<Error>(
-        packet,
-        &mut |leaf: &DagLeaf, _bytes: &[u8]| {
-            delivered |= leaf.cid() == forged;
-            Ok(())
-        },
-    );
-    delivered
-}
-
-/// Records a forged batch that a fresh receiver accepts, and whether a
-/// streaming receiver passes the forged leaf's bytes on.
-fn judge_batch(accepted: &mut Accepted, what: &str, wire: &Json, forged: &Cid) {
-    let Ok(packet) = decode_batch(wire) else {
-        return; // refused while decoding
-    };
-    if BatchedDagReceiver::new().verify_packet(&packet).is_ok() {
-        let sink = if streams_forged_bytes(&packet, forged) {
-            ", and a streaming receiver hands its bytes to the sink"
-        } else {
-            ""
-        };
-        accepted.0.push(format!("{what}{sink}"));
-    }
-}
-
-/// An extra child appended to a parent of a full DAG has no proof at all.
-#[test]
-fn full_dag_refuses_an_extra_child() {
-    let temp = TempDir::new("forgery-full-extra-child").unwrap();
-    let dag = flat_dag(&temp, "victim", 3);
-    let mut forged = wire_of(&dag);
-    decode_and_verify(&forged).expect("the honest DAG verifies");
-
-    let (cid, leaf) = forged_leaf(&temp, "install.sh");
-    forged.get_mut("Leafs").set(&cid, leaf);
-    leaf_mut(&mut forged, dag.root().as_str())
-        .get_mut("Links")
-        .push(text(&cid));
-
-    let mut accepted = Accepted::default();
-    accepted.unless_refused(
-        decode_and_verify(&forged),
-        "a full DAG with an extra child under its root",
-    );
-    accepted.finish();
-}
-
-/// A forged child of a pruned parent: with no proof, with a real sibling's
-/// proof filed under its hash, and with that proof renamed to it.
-#[test]
-fn partial_refuses_a_forged_child_carrying_a_siblings_proof() {
-    let temp = TempDir::new("forgery-partial-sibling-proof").unwrap();
-    let dag = flat_dag(&temp, "victim", 3);
-    let root = dag.root().as_str();
-    let real = dag.root_leaf().links()[0].clone();
-    let partial = dag.get_partial(std::slice::from_ref(&real), true).unwrap();
-    let honest = wire_of(&partial);
-    decode_and_verify(&honest).expect("the honest partial verifies");
-    let real_branch = honest
-        .get("Leafs")
-        .get(root)
-        .get("stored_proofs")
-        .get(real.as_str())
-        .clone();
-
-    let (cid, leaf) = forged_leaf(&temp, "install.sh");
-    let mut unproven = honest.clone();
-    unproven.get_mut("Leafs").set(&cid, leaf);
-    leaf_mut(&mut unproven, root)
-        .get_mut("Links")
-        .push(text(&cid));
-
-    let mut filed = unproven.clone();
-    leaf_mut(&mut filed, root)
-        .get_mut("stored_proofs")
-        .set(&cid, real_branch.clone());
-
-    let mut renamed = unproven.clone();
-    let mut branch = real_branch;
-    branch.set("Leaf", text(&cid));
-    leaf_mut(&mut renamed, root)
-        .get_mut("stored_proofs")
-        .set(&cid, branch);
-
-    let mut accepted = Accepted::default();
-    accepted.unless_refused(
-        decode_and_verify(&unproven),
-        "a forged child of a pruned parent, with no proof",
-    );
-    accepted.unless_refused(
-        decode_and_verify(&filed),
-        "the same child, with a real sibling's proof filed under its hash",
-    );
-    accepted.unless_refused(
-        decode_and_verify(&renamed),
-        "the same child, with that proof renamed to it",
-    );
-    accepted.finish();
-}
-
-/// A leaf sent on its own as the child of a parent that never committed to it.
-#[test]
-fn transmission_refuses_a_child_its_parent_never_committed_to() {
-    let temp = TempDir::new("forgery-transmission-child").unwrap();
-    let (_, forged) = forged_leaf(&temp, "install.sh");
-    let mut accepted = Accepted::default();
-
-    // A pruned parent that commits to three children.
-    let dag = flat_dag(&temp, "three", 3);
-    let real = dag.root_leaf().links()[0].clone();
-    let partial = dag.get_partial(std::slice::from_ref(&real), true).unwrap();
-    let packets = partial.get_leaf_sequence().unwrap();
-    let mut receiver = TransmissionReceiver::new();
-    receiver
-        .apply_and_verify_transmission_packet(packets[0].clone())
-        .expect("the root packet verifies");
-    receiver
-        .verify_transmission_packet(&packets[1])
-        .expect("the real child's packet verifies");
-    let bad = packet_for(&forged, dag.root().as_str());
-    accepted.unless_refused(
-        receiver.verify_transmission_packet(&bad),
-        "receiver: an unproven child of a pruned parent that commits to three children",
-    );
-    accepted.unless_refused(
-        partial.verify_transmission_packet(&bad),
-        "DAG: an unproven child of a pruned parent that commits to three children",
-    );
-
-    // A parent that commits to one child, and has it.
-    let dag = flat_dag(&temp, "one", 1);
-    let mut receiver = TransmissionReceiver::new();
-    for packet in dag.get_leaf_sequence().unwrap() {
-        receiver
-            .apply_and_verify_transmission_packet(packet)
-            .expect("an honest packet verifies");
-    }
-    let bad = packet_for(&forged, dag.root().as_str());
-    accepted.unless_refused(
-        receiver.verify_transmission_packet(&bad),
-        "receiver: a second child of a parent that commits to one child",
-    );
-    accepted.unless_refused(
-        dag.verify_transmission_packet(&bad),
-        "DAG: a second child of a parent that commits to one child",
-    );
-
-    // A file that commits to no children.
-    let dag = flat_dag(&temp, "none", 3);
-    let file = dag.root_leaf().links()[0].as_str();
-    let mut receiver = TransmissionReceiver::new();
-    for packet in dag.get_leaf_sequence().unwrap() {
-        receiver
-            .apply_and_verify_transmission_packet(packet)
-            .expect("an honest packet verifies");
-    }
-    let bad = packet_for(&forged, file);
-    accepted.unless_refused(
-        receiver.verify_transmission_packet(&bad),
-        "receiver: a child of a file that commits to no children",
-    );
-    accepted.unless_refused(
-        dag.verify_transmission_packet(&bad),
-        "DAG: a child of a file that commits to no children",
-    );
-
-    accepted.finish();
-}
-
-/// A leaf sent in a batch as the child of a parent that never committed to it.
-#[test]
-fn batch_refuses_a_child_its_parent_never_committed_to() {
-    let temp = TempDir::new("forgery-batch-child").unwrap();
-    let (cid, forged) = forged_leaf(&temp, "install.sh");
-    let forged_cid: Cid = cid.parse().unwrap();
-    let mut accepted = Accepted::default();
-
-    // A complete parent that commits to three children.
-    let dag = flat_dag(&temp, "three", 3);
-    let root = dag.root().as_str();
-    let honest = batch_of(&dag);
-    verify_batch(&honest).expect("the honest batch verifies");
-    let mut named = honest.clone();
-    add_to_batch(&mut named, &cid, &forged, root);
-    judge_batch(
-        &mut accepted,
-        "a forged leaf that names a three-child root as its parent",
-        &named,
-        &forged_cid,
-    );
-    let mut listed = named.clone();
-    batch_leaf_mut(&mut listed, root)
-        .get_mut("Links")
-        .push(text(&cid));
-    judge_batch(
-        &mut accepted,
-        "the same leaf, added to that root's links as well",
-        &listed,
-        &forged_cid,
-    );
-
-    // A parent that commits to one child.
-    let dag = flat_dag(&temp, "one", 1);
-    let root = dag.root().as_str();
-    let mut second = batch_of(&dag);
-    verify_batch(&second).expect("the honest batch verifies");
-    add_to_batch(&mut second, &cid, &forged, root);
-    batch_leaf_mut(&mut second, root)
-        .get_mut("Links")
-        .push(text(&cid));
-    judge_batch(
-        &mut accepted,
-        "a second child of a root that commits to one child",
-        &second,
-        &forged_cid,
-    );
-
-    // A file that commits to no children.
-    let dag = flat_dag(&temp, "none", 3);
-    let file = dag.root_leaf().links()[0].as_str();
-    let mut under_file = batch_of(&dag);
-    add_to_batch(&mut under_file, &cid, &forged, file);
-    batch_leaf_mut(&mut under_file, file).set("Links", links(&[cid.as_str()]));
-    judge_batch(
-        &mut accepted,
-        "a child of a file that commits to no children",
-        &under_file,
-        &forged_cid,
-    );
-
-    // A pruned parent that carries a proof for another child.
-    let dag = flat_dag(&temp, "pruned", 3);
-    let root = dag.root().as_str();
-    let real = dag.root_leaf().links()[0].clone();
-    let partial = wire_of(&dag.get_partial(std::slice::from_ref(&real), true).unwrap());
-    let mut root_leaf = partial.get("Leafs").get(root).clone();
-    let real_leaf = partial.get("Leafs").get(real.as_str()).clone();
-    verify_batch(&batch_from(&[(&root_leaf, ""), (&real_leaf, root)]))
-        .expect("the honest batch of a partial verifies");
-    root_leaf.get_mut("Links").push(text(&cid));
-    judge_batch(
-        &mut accepted,
-        "an unproven child of a pruned root that carries a proof for another child",
-        &batch_from(&[(&root_leaf, ""), (&real_leaf, root), (&forged, root)]),
-        &forged_cid,
-    );
-
-    accepted.finish();
-}
-
-/// A forged leaf under a file that commits to no children.
-#[test]
-fn decoded_dag_refuses_a_child_under_a_file() {
-    let temp = TempDir::new("forgery-child-under-file").unwrap();
-    let dag = flat_dag(&temp, "victim", 3);
-    let file = dag.root_leaf().links()[0].as_str();
-    let mut forged = wire_of(&dag);
-    decode_and_verify(&forged).expect("the honest DAG verifies");
-
-    let (cid, leaf) = forged_leaf(&temp, "install.sh");
-    forged.get_mut("Leafs").set(&cid, leaf);
-    leaf_mut(&mut forged, file).set("Links", links(&[cid.as_str()]));
-
-    let mut accepted = Accepted::default();
-    accepted.unless_refused(
-        decode_and_verify(&forged),
-        "a forged leaf under a file that commits to no children",
-    );
-    accepted.finish();
-}
-
-/// No forged leaf, and the leaf count is unchanged: a real file that commits
-/// to no children is given a link to another real file.
-#[test]
-fn full_dag_refuses_a_link_under_a_leaf_with_no_children() {
-    let temp = TempDir::new("forgery-full-childless-link").unwrap();
-    let mut accepted = Accepted::default();
-    // The root's children are walked in order, so one of the two files is
-    // reached first: both directions are tried.
-    for (from, to) in [(1, 0), (0, 1)] {
-        let dag = flat_dag(&temp, &format!("victim-{from}-{to}"), 3);
-        let children = dag.root_leaf().links();
-        let mut forged = wire_of(&dag);
-        // A leaf may travel without its content, which turns the size checks off.
-        leaf_mut(&mut forged, children[2].as_str()).set("Content", Json::Null);
-        decode_and_verify(&forged).expect("an honest DAG with one content-less leaf verifies");
-
-        leaf_mut(&mut forged, children[from].as_str())
-            .set("Links", links(&[children[to].as_str()]));
-        accepted.unless_refused(
-            decode_and_verify(&forged),
-            &format!("a link from child {from} of the root to child {to}, in a full DAG"),
-        );
-    }
-    accepted.finish();
-}
-
-/// The same edit in a partial DAG. Eight leaves are edited in turn, so the
-/// edit lands on leaves whose hash is above and below the root's.
-#[test]
-fn partial_refuses_a_link_under_a_leaf_with_no_children() {
-    let temp = TempDir::new("forgery-partial-childless-link").unwrap();
-    let dag = flat_dag(&temp, "victim", 9);
-    let kept = dag.root_leaf().links()[..8].to_vec();
-    let honest = wire_of(&dag.get_partial(&kept, true).unwrap());
-    decode_and_verify(&honest).expect("the honest partial verifies");
-
-    let mut accepted = Accepted::default();
-    for (index, leaf) in kept.iter().enumerate() {
-        let target = &kept[(index + 1) % kept.len()];
-        let mut forged = honest.clone();
-        leaf_mut(&mut forged, leaf.as_str()).set("Links", links(&[target.as_str()]));
-        accepted.unless_refused(
-            decode_and_verify(&forged),
-            &format!("a link from {leaf}, which commits to no children, in a partial DAG"),
-        );
-    }
-    accepted.finish();
-}
-
-/// A forged leaf filed under a real child's hash, while saying that it is the
-/// root.
-#[test]
-fn decoded_dag_refuses_a_leaf_filed_under_another_hash() {
-    let temp = TempDir::new("forgery-filed-under-another-hash").unwrap();
-    let dag = flat_dag(&temp, "victim", 3);
-    let real = dag.root_leaf().links()[0].clone();
-    let partial = dag.get_partial(std::slice::from_ref(&real), true).unwrap();
-    let mut forged = wire_of(&partial);
-    decode_and_verify(&forged).expect("the honest partial verifies");
-
-    let leaf = leaf_mut(&mut forged, real.as_str());
-    leaf.set("Hash", text(dag.root().as_str()));
-    leaf.set("Content", text("Zm9yZ2Vk")); // "forged"
-
-    let mut accepted = Accepted::default();
-    accepted.unless_refused(
-        decode_and_verify(&forged),
-        "a leaf whose hash differs from the key it is filed under",
-    );
-    accepted.finish();
-}
-
-/// A later packet that claims to be the root.
-#[test]
-fn transmission_refuses_a_root_packet_for_another_root() {
-    let temp = TempDir::new("forgery-foreign-root").unwrap();
-    let dag = flat_dag(&temp, "victim", 3);
-    let packets = dag.get_leaf_sequence().unwrap();
-    // The root packet of a different, valid DAG.
-    let foreign = flat_dag(&temp, "foreign", 2)
-        .get_leaf_sequence()
-        .unwrap()
-        .remove(0);
-    let mut accepted = Accepted::default();
-
-    let mut receiver = TransmissionReceiver::new();
-    receiver
-        .apply_and_verify_transmission_packet(packets[0].clone())
-        .expect("the root packet verifies");
-    accepted.unless_refused(
-        receiver.verify_transmission_packet(&foreign),
-        "receiver that holds a root: a root packet for another root",
-    );
-
-    let pinned = TransmissionReceiver::with_root(dag.root().clone());
-    accepted.unless_refused(
-        pinned.verify_transmission_packet(&foreign),
-        "receiver pinned to a root: a root packet for another root",
-    );
-
-    accepted.unless_refused(
-        dag.verify_transmission_packet(&foreign),
-        "DAG: a root packet for a root other than its own",
-    );
-
-    let mut store = DagStore::in_memory();
-    store
-        .add_transmission_packet(&packets[0])
-        .expect("the root packet is stored");
-    accepted.unless_refused(
-        store.add_transmission_packet(&foreign),
-        "store that holds a root: a root packet for another root",
-    );
-    accepted.when(
-        store.root() != Some(dag.root()),
-        "store: a later root packet replaced its root",
-    );
-
-    accepted.finish();
-}
-
-/// A store's own verification, given what DAG verification refuses.
-#[test]
-fn store_verification_refuses_forged_children() {
-    let temp = TempDir::new("forgery-store-verify").unwrap();
-    let mut accepted = Accepted::default();
-
-    // An extra child under the root.
-    let dag = flat_dag(&temp, "extra", 3);
-    DagStore::from_dag(&dag)
-        .unwrap()
-        .verify_streaming()
-        .expect("the honest store verifies");
-    let (cid, leaf) = forged_leaf(&temp, "install.sh");
-    let mut forged = wire_of(&dag);
-    forged.get_mut("Leafs").set(&cid, leaf);
-    leaf_mut(&mut forged, dag.root().as_str())
-        .get_mut("Links")
-        .push(text(&cid));
-    let store = store_of(&forged);
-    accepted.unless_refused(
-        store.verify_streaming(),
-        "streaming verification: an extra child under the root",
-    );
-    accepted.unless_refused(
-        store.verify(),
-        "materializing verification: an extra child under the root",
-    );
-
-    // A link under a file that commits to no children.
-    let dag = flat_dag(&temp, "link", 3);
-    let from = dag.root_leaf().links()[0].clone();
-    let to = dag.root_leaf().links()[1].clone();
-    let mut forged = wire_of(&dag);
-    leaf_mut(&mut forged, from.as_str()).set("Links", links(&[to.as_str()]));
-    let store = store_of(&forged);
-    if store.verify_streaming().is_ok() {
-        accepted.0.push(format!(
-            "streaming verification: a link under a file that commits to no children; \
-             the store then returns {:?} for a file that holds {:?}",
-            store
-                .get_content_from_leaf_streaming(&from)
-                .map(|bytes| readable(&bytes)),
-            readable(dag.get(&from).unwrap().content().unwrap()),
-        ));
-    }
-    accepted.unless_refused(
-        store.verify(),
-        "materializing verification: a link under a file that commits to no children",
-    );
-
-    accepted.finish();
-}
-
-/// A store taking in a leaf that its parent never committed to.
-#[test]
-fn store_intake_refuses_a_leaf_its_parent_never_committed_to() {
-    let temp = TempDir::new("forgery-store-intake").unwrap();
-    let (cid, forged) = forged_leaf(&temp, "install.sh");
-    let forged_cid: Cid = cid.parse().unwrap();
-    let dag = flat_dag(&temp, "victim", 3);
-    let root = dag.root().as_str();
-    let file = dag.root_leaf().links()[0].as_str();
-    let packets = dag.get_leaf_sequence().unwrap();
-    let mut accepted = Accepted::default();
-
-    // In a batch.
-    let honest = batch_of(&dag);
-    DagStore::in_memory()
-        .add_batched_transmission_packet(&decode_batch(&honest).unwrap())
-        .expect("the honest batch is stored");
-    let mut named = honest.clone();
-    add_to_batch(&mut named, &cid, &forged, root);
-    let mut listed = named.clone();
-    batch_leaf_mut(&mut listed, root)
-        .get_mut("Links")
-        .push(text(&cid));
-    for (what, wire) in [
-        (
-            "batch: a forged leaf that names the root as its parent",
-            &named,
-        ),
-        (
-            "batch: the same leaf, added to the root's links as well",
-            &listed,
-        ),
-    ] {
-        let mut store = DagStore::in_memory();
-        if let Ok(packet) = decode_batch(wire) {
-            let _ = store.add_batched_transmission_packet(&packet);
-        }
-        accepted.when(store.has_leaf(&forged_cid).unwrap(), what);
-    }
-
-    // Leaf by leaf: a parent the store has never seen.
-    let mut store = DagStore::in_memory();
-    store
-        .add_transmission_packet(&packets[0])
-        .expect("the root packet is stored");
-    let stranger = flat_dag(&temp, "stranger", 2);
-    let _ = store.add_transmission_packet(&packet_for(&forged, stranger.root().as_str()));
-    accepted.when(
-        store.has_leaf(&forged_cid).unwrap(),
-        "leaf by leaf: a leaf that names a parent the store has never seen",
-    );
-
-    // Leaf by leaf: a stored file that commits to no children.
-    let mut store = DagStore::in_memory();
-    for packet in &packets {
-        store
-            .add_transmission_packet(packet)
-            .expect("an honest packet is stored");
-    }
-    let _ = store.add_transmission_packet(&packet_for(&forged, file));
-    accepted.when(
-        store.has_leaf(&forged_cid).unwrap(),
-        "leaf by leaf: a child of a stored file that commits to no children",
-    );
-
-    // Leaf by leaf: the same file, whose own packet arrived listing the forged leaf.
-    let mut store = DagStore::in_memory();
-    for packet in &packets {
-        let mut wire = Json::parse(&packet.to_json().unwrap());
-        if wire.get("Leaf").get("Hash").text() == file {
-            wire.get_mut("Leaf").set("Links", links(&[cid.as_str()]));
-        }
-        if let Ok(packet) = TransmissionPacket::from_json(&wire.to_bytes()) {
-            let _ = store.add_transmission_packet(&packet);
-        }
-    }
-    let _ = store.add_transmission_packet(&packet_for(&forged, file));
-    accepted.when(
-        store.has_leaf(&forged_cid).unwrap(),
-        "leaf by leaf: a child of a file whose own packet arrived listing it",
-    );
-
-    accepted.finish();
-}
-
-/// A file must not come back short with no error.
-#[test]
-fn content_refuses_an_incomplete_file() {
-    let temp = TempDir::new("forgery-incomplete-file").unwrap();
-    let body = three_chunks(*b"ABC");
-    let dag = chunked_dag(
-        &temp,
-        "victim",
-        &[("big.bin", &body[..]), ("other.txt", &b"x"[..])],
-    );
-    let file = dag
-        .leaves()
-        .values()
-        .find(|leaf| leaf.item_name() == "big.bin")
-        .expect("the chunked file");
-    assert_eq!(file.links().len(), 3, "big.bin is cut into three chunks");
-    let chunk = |name: &str| {
-        file.links()
-            .iter()
-            .find(|cid| dag.get(cid).unwrap().item_name() == name)
-            .unwrap()
-            .clone()
-    };
-    let (first, middle, last) = (chunk("0"), chunk("1"), chunk("2"));
-    let partial = dag.get_partial(file.links(), true).unwrap();
-    let honest = wire_of(&partial);
-    let whole = decode_and_verify(&honest).expect("the honest partial verifies");
-    let content_of = |dag: &Dag| dag.get_content_from_leaf(dag.get(file.cid()).unwrap());
-    assert_eq!(
-        content_of(&whole).unwrap(),
-        body,
-        "a complete file comes back whole"
-    );
-
-    // The middle chunk dropped the way a sender can drop it: its leaf, its link
-    // and its proof.
-    let mut shortened = honest.clone();
-    shortened.get_mut("Leafs").remove(middle.as_str());
-    let leaf = leaf_mut(&mut shortened, file.cid().as_str());
-    leaf.set("Links", links(&[first.as_str(), last.as_str()]));
-    leaf.get_mut("stored_proofs").remove(middle.as_str());
-    let shortened = decode_and_verify(&shortened)
-        .expect("a partial with two of three chunks is still a valid partial");
-
-    // The middle chunk present, without its content.
-    let mut hollow = honest.clone();
-    leaf_mut(&mut hollow, middle.as_str()).set("Content", Json::Null);
-    let hollow = decode_and_verify(&hollow).expect("a leaf may travel without its content");
-
-    let mut accepted = Accepted::default();
-    for (how, forged) in [
-        ("its middle chunk absent", &shortened),
-        ("its middle chunk without content", &hollow),
-    ] {
-        if let Ok(bytes) = content_of(forged) {
-            accepted.0.push(format!(
-                "DAG: {} bytes returned, with no error, for a {}-byte file with {how}",
-                bytes.len(),
-                body.len()
-            ));
-        }
-        let store = DagStore::from_dag(forged).unwrap();
-        if let Ok(bytes) = store.get_content_from_leaf_streaming(file.cid()) {
-            accepted.0.push(format!(
-                "store: {} bytes returned, with no error, for a {}-byte file with {how}",
-                bytes.len(),
-                body.len()
-            ));
-        }
-    }
-    accepted.finish();
-}
-
-/// Runs `attempt` on a thread of its own and says what went wrong, if anything
-/// did: the input was accepted, the call panicked, or it never came back.
-fn fault_of(attempt: impl FnOnce() -> Result<(), Error> + Send + 'static) -> Option<&'static str> {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(attempt().is_ok());
-    });
-    match receiver.recv_timeout(Duration::from_secs(10)) {
-        Ok(false) => None,
-        Ok(true) => Some("was accepted"),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Some("made the library panic"),
-        Err(mpsc::RecvTimeoutError::Timeout) => Some("never returned"),
-    }
-}
-
-/// Malformed input must come back as an error: no panic, and no hang.
-#[test]
-fn malformed_input_returns_an_error() {
-    let temp = TempDir::new("forgery-malformed").unwrap();
-    let dag = flat_dag(&temp, "victim", 5);
-    let root = dag.root().as_str();
-    let real = dag.root_leaf().links()[0].clone();
-    let partial = wire_of(&dag.get_partial(std::slice::from_ref(&real), true).unwrap());
-    let mut cases = Vec::new();
-
-    let mut no_root = partial.clone();
-    no_root.get_mut("Leafs").remove(root);
-    cases.push(("a DAG without its root leaf", no_root));
-
-    let mut null_leaf = partial.clone();
-    null_leaf.get_mut("Leafs").set(real.as_str(), Json::Null);
-    cases.push(("a null leaf", null_leaf));
-
-    let mut null_proof = partial.clone();
-    leaf_mut(&mut null_proof, root)
-        .get_mut("stored_proofs")
-        .set(real.as_str(), Json::Null);
-    cases.push(("a null proof", null_proof));
-
-    // Two leaves that commit to no children, and list each other.
-    let (x, mut x_leaf) = forged_leaf(&temp, "x");
-    let (y, mut y_leaf) = forged_leaf(&temp, "y");
-    x_leaf.set("Links", links(&[y.as_str()]));
-    y_leaf.set("Links", links(&[x.as_str()]));
-    let mut ring = partial.clone();
-    ring.get_mut("Leafs").set(&x, x_leaf);
-    ring.get_mut("Leafs").set(&y, y_leaf);
-    cases.push(("two childless leaves that list each other", ring));
-
-    // Two leaves that commit to three children each, so that a list of one
-    // reads as pruned, and that list each other.
-    let attacker = chunked_dag(
-        &temp,
-        "attacker-ring",
-        &[
-            ("x.bin", &three_chunks(*b"XYZ")[..]),
-            ("y.bin", &three_chunks(*b"UVW")[..]),
-        ],
-    );
-    let (x, mut x_leaf) = leaf_named(&attacker, "x.bin");
-    let (y, mut y_leaf) = leaf_named(&attacker, "y.bin");
-    x_leaf.set("Links", links(&[y.as_str()]));
-    y_leaf.set("Links", links(&[x.as_str()]));
-    let mut pruned_ring = partial.clone();
-    pruned_ring.get_mut("Leafs").set(&x, x_leaf);
-    pruned_ring.get_mut("Leafs").set(&y, y_leaf);
-    cases.push((
-        "two pruned-looking leaves that list each other",
-        pruned_ring,
-    ));
-
-    let mut accepted = Accepted::default();
-    for (what, wire) in cases {
-        let bytes = wire.to_bytes();
-        let attempt = move || Dag::from_json(&bytes).and_then(|dag| dag.verify());
-        if let Some(fault) = fault_of(attempt) {
-            accepted.0.push(format!("{what} {fault}"));
-        }
-    }
-    accepted.finish();
-}
-
-/// In a partial DAG a chunk is walked up to the root through one parent only.
-/// A second file that lists the same chunk among its own is never asked for a
-/// proof.
-#[test]
-fn partial_refuses_a_link_through_a_second_parent() {
-    let temp = TempDir::new("forgery-second-parent").unwrap();
-    let dag = chunked_dag(
-        &temp,
-        "victim",
-        &[
-            ("a.bin", &three_chunks(*b"abc")[..]),
-            ("b.bin", &three_chunks(*b"xyz")[..]),
-        ],
-    );
-    let file = |name: &str| {
-        dag.leaves()
-            .values()
-            .find(|leaf| leaf.item_name() == name)
-            .unwrap()
-    };
-    let chunk = |file: &DagLeaf, name: &str| {
-        file.links()
-            .iter()
-            .find(|cid| dag.get(cid).unwrap().item_name() == name)
-            .unwrap()
-            .clone()
-    };
-    let (a, b) = (file("a.bin"), file("b.bin"));
-    let (a0, b1) = (chunk(a, "0"), chunk(b, "1"));
-    let partial = dag.get_partial(&[a0.clone(), b1.clone()], true).unwrap();
-    let honest = wire_of(&partial);
-    decode_and_verify(&honest).expect("the honest partial verifies");
-
-    // The walk takes a chunk's lowest parent. So the forged link goes into
-    // whichever file has the higher hash: the chunk's real parent, the lower
-    // one, then vouches for it, and the forged link is never looked at.
-    let (host, guest, home) = if a.cid() > b.cid() {
-        (a, &b1, b)
-    } else {
-        (b, &a0, a)
-    };
-    let mut forged = honest.clone();
-    leaf_mut(&mut forged, host.cid().as_str())
-        .get_mut("Links")
-        .push(text(guest.as_str()));
-
-    let mut accepted = Accepted::default();
-    if let Ok(taken) = decode_and_verify(&forged) {
-        accepted.0.push(format!(
-            "DAG: {} lists a chunk of {} among its own, and returns {:?}",
-            host.item_name(),
-            home.item_name(),
-            taken
-                .get_content_from_leaf(taken.get(host.cid()).unwrap())
-                .map(|bytes| readable(&bytes)),
-        ));
-    }
-    if let Ok(taken) = Dag::from_json(&forged.to_bytes()) {
-        let store = DagStore::from_dag(&taken).unwrap();
-        accepted.unless_refused(
-            store.verify_streaming(),
-            "store, streaming verification: the same partial",
-        );
-        accepted.unless_refused(
-            store.verify(),
-            "store, materializing verification: the same partial",
-        );
-    }
-    accepted.finish();
-}
-
-/// From a hostile sender to a wrong file: a store takes the transfer in, its
-/// streaming verification passes, and a real file reads back as forged bytes.
-#[test]
-fn a_verified_store_never_serves_forged_bytes_for_a_real_file() {
-    let temp = TempDir::new("forgery-store-forged-bytes").unwrap();
-    let dag = flat_dag(&temp, "victim", 3);
-    let file = dag.root_leaf().links()[0].clone();
-    let honest_bytes = dag.get(&file).unwrap().content().unwrap().to_vec();
-    let (cid, forged) = forged_leaf(&temp, "install.sh");
-
-    let mut honest = DagStore::in_memory();
-    for packet in dag.get_leaf_sequence().unwrap() {
-        honest
-            .add_transmission_packet(&packet)
-            .expect("an honest packet is stored");
-    }
-    honest
-        .verify_streaming()
-        .expect("the honest store verifies");
-    assert_eq!(
-        honest.get_content_from_leaf_streaming(&file).unwrap(),
-        honest_bytes,
-        "the honest store returns the file"
-    );
-
-    let mut accepted = Accepted::default();
-    let mut judge = |how: &str, store: &DagStore| {
-        let verified = store.verify_streaming().is_ok();
-        if let (true, Ok(bytes)) = (verified, store.get_content_from_leaf_streaming(&file)) {
-            if bytes != honest_bytes {
-                accepted.0.push(format!(
-                    "{how}: the store verifies, and returns {:?} for a file that holds {:?}",
-                    readable(&bytes),
-                    readable(&honest_bytes)
-                ));
+/// Everything a store holds has to be what its hash says it is.
+fn assert_clean(store: &MemoryStore) {
+    for (kind, hash, bytes) in contents(store) {
+        match kind {
+            Stored::Piece => assert_eq!(Hash::of(&bytes), hash),
+            Stored::FileList => assert_eq!(*FileList::decode(&bytes).unwrap().hash(), hash),
+            Stored::FolderList => assert_eq!(*FolderList::decode(&bytes).unwrap().hash(), hash),
+            Stored::Record => {
+                assert_eq!(*Root::of_record(&bytes).as_hash(), hash);
+                Record::decode(&bytes).unwrap();
             }
         }
+    }
+}
+
+/// Everything `dest` holds has to be a part of what `source` holds.
+fn assert_only_from(dest: &MemoryStore, source: &MemoryStore) {
+    assert_clean(dest);
+    let honest = contents(source);
+    for thing in contents(dest) {
+        assert!(
+            honest.contains(&thing),
+            "{:?} {} was kept",
+            thing.0,
+            thing.1
+        );
+    }
+}
+
+/// Fetches a tree from a peer that changes its answers on the way.
+fn fetch_tampered<'s>(
+    source: &'s MemoryStore,
+    root: &Root,
+    tamper: impl FnMut(&[u8], Vec<Vec<u8>>) -> Vec<Vec<u8>> + 's,
+) -> (Result<Summary>, MemoryStore) {
+    let dest = MemoryStore::new();
+    let result = {
+        let mut peer = TestPeer::tampering(source, tamper);
+        fetch(&dest, root, &mut peer)
+    };
+    assert_only_from(&dest, source);
+    (result, dest)
+}
+
+fn frame_with(tag: u8, body: &[u8]) -> Vec<u8> {
+    oracle::frame(tag, body)
+}
+
+#[test]
+fn any_changed_byte_of_any_frame_is_refused() {
+    let (_temp, source, root) = sample_tree("forge-any-byte");
+    for target in 0..88_usize {
+        for place in 0..3 {
+            let mut seen = 0_usize;
+            let (result, dest) = fetch_tampered(&source, &root, move |_, mut frames| {
+                for frame in &mut frames {
+                    if seen == target {
+                        let at = [0, frame.len() / 2, frame.len() - 1][place];
+                        frame[at] ^= 1;
+                    }
+                    seen += 1;
+                }
+                frames
+            });
+            assert!(result.is_err(), "frame {target}, place {place}");
+            assert!(verify(&dest, &root).is_err());
+        }
+    }
+}
+
+#[test]
+fn a_made_up_child_under_a_folder_or_a_file_is_refused() {
+    let (_temp, source, root) = sample_tree("forge-child");
+    let weights = target_at(&source, &root, "weights");
+    let model = target_at(&source, &root, "weights/model.bin");
+    let made_up = oracle::Entry::file("zz-made-up", oracle::sha(&[b"made up"]), 7);
+    let made_up_item = oracle::Item::of(b"a made-up piece");
+
+    // One more entry at the end of a folder's list, one more item at the
+    // end of a file's list, and one less of each.
+    type Forge = Box<dyn Fn(&[u8]) -> Option<Vec<u8>>>;
+    let more_entries = made_up.bytes();
+    let more_items = made_up_item.bytes();
+    let forges: Vec<(&str, Forge)> = vec![
+        (
+            "an entry more",
+            Box::new(move |frame| {
+                (frame[0] == FRAME_FOLDER_LIST).then(|| [frame, &more_entries[..]].concat())
+            }),
+        ),
+        (
+            "an item more",
+            Box::new(move |frame| {
+                (frame[0] == FRAME_FILE_LIST && frame.len() > 1)
+                    .then(|| [frame, &more_items[..]].concat())
+            }),
+        ),
+        (
+            "an entry less",
+            Box::new(|frame| {
+                let list = FolderList::decode(&frame[1..]).ok()?;
+                let (_, rest) = list.entries().split_last()?;
+                let shorter = FolderList::new(rest.to_vec()).unwrap().encode();
+                (frame[0] == FRAME_FOLDER_LIST).then(|| frame_with(FRAME_FOLDER_LIST, &shorter))
+            }),
+        ),
+        (
+            "an item less",
+            Box::new(|frame| {
+                (frame[0] == FRAME_FILE_LIST && frame.len() > 37)
+                    .then(|| frame[..frame.len() - 36].to_vec())
+            }),
+        ),
+    ];
+    for (what, forge) in forges {
+        let mut done = false;
+        let (result, _dest) = fetch_tampered(&source, &root, move |_, frames| {
+            frames
+                .into_iter()
+                .map(|frame| match forge(&frame) {
+                    Some(forged) if !done => {
+                        done = true;
+                        forged
+                    }
+                    _ => frame,
+                })
+                .collect()
+        });
+        // It is refused as something nothing names, or sooner, by its
+        // length: a file's list may be no longer than the file's size allows.
+        assert!(
+            matches!(
+                result,
+                Err(Error::NotWanted { .. } | Error::LimitExceeded { .. })
+            ),
+            "{what}: {result:?}"
+        );
+    }
+
+    // A part of the folder, from a peer that has made up a folder of four
+    // entries which holds the three real ones. It is whole and well formed.
+    // It is another folder, and the receiver asked about this one.
+    let real = folder_of(&source, &weights).unwrap();
+    let mut four: Vec<oracle::Entry> = real
+        .entries()
+        .iter()
+        .map(|entry| oracle::Entry {
+            kind: if entry.kind() == Kind::File { 1 } else { 2 },
+            size: entry.size(),
+            hash: *entry.hash().as_bytes(),
+            name: entry.name().as_bytes().to_vec(),
+            extra: Vec::new(),
+        })
+        .collect();
+    four.push(made_up.clone());
+    for (start, end) in [(0, 4), (3, 4), (0, 1)] {
+        let forged = oracle::folder_run_frame(&four, start, end);
+        let Frame::FolderRun(run) = Frame::decode(&forged).unwrap() else {
+            panic!("no run");
+        };
+        assert!(run.check(&weights).is_err(), "{start}..{end}");
+        assert!(run.check_name(&weights, "zz-made-up").is_err());
+    }
+    let mut peer = TestPeer::tampering(&source, move |request, frames| {
+        if request[0] == 0x33 {
+            vec![oracle::folder_run_frame(&four, 3, 4)]
+        } else {
+            frames
+        }
+    });
+    let mut remote = Remote::open(&mut peer, &root).unwrap();
+    assert!(remote.entry(&weights, "zz-made-up").is_err());
+    assert!(remote.lookup("weights/zz-made-up").is_err());
+
+    // The same for a file: a made-up list of 64 pieces that holds the real
+    // 63 is another file.
+    let real = file_of(&source, &model).unwrap();
+    let mut longer: Vec<oracle::Item> = real
+        .items()
+        .iter()
+        .map(|item| oracle::Item {
+            hash: *item.hash.as_bytes(),
+            length: item.length,
+        })
+        .collect();
+    longer.push(made_up_item);
+    for (start, end) in [(0, 64), (63, 64), (5, 6)] {
+        let forged = oracle::file_run_frame(&longer, start, end);
+        let run = FileRun::decode(&forged[1..]).unwrap();
+        assert!(run.check(&model, None).is_err(), "{start}..{end}");
+    }
+}
+
+#[test]
+fn a_real_childs_opening_does_not_carry_another_child() {
+    let (_temp, source, root) = sample_tree("forge-opening");
+    let weights = target_at(&source, &root, "weights");
+    let model = target_at(&source, &root, "weights/model.bin");
+    let list = folder_of(&source, &weights).unwrap();
+    let model_place = list.place_of("model.bin").unwrap();
+    let honest = list.open_name("model.bin").unwrap();
+    assert_eq!(
+        honest
+            .check_name(&weights, "model.bin")
+            .unwrap()
+            .unwrap()
+            .name(),
+        "model.bin"
+    );
+    let honest = honest.encode();
+
+    // The entry that is shown starts 20 bytes into the run: its kind, its
+    // size, its hash, and then its name.
+    let with = |at: usize, value: u8| {
+        let mut forged = honest.clone();
+        forged[at] = value;
+        FolderRun::decode(&forged).and_then(|run| run.check_name(&weights, "model.bin").map(|_| ()))
+    };
+    assert!(with(20, 2).is_err(), "the file shown as a folder");
+    assert!(with(28, honest[28] ^ 1).is_err(), "another size");
+    assert!(with(29, honest[29] ^ 1).is_err(), "another hash");
+    assert!(with(60, honest[60] ^ 1).is_err(), "another hash");
+    assert!(with(63, b'n').is_err(), "another name");
+    assert!(with(15, honest[15] ^ 1).is_err(), "another place");
+    assert!(with(7, honest[7] + 1).is_err(), "another count");
+
+    // The neighbour's opening, with the neighbour passed off under the name
+    // that was asked for, and the opening of the wrong place as proof that
+    // the name is not there.
+    let asked = Cell::new("");
+    let entries: Vec<oracle::Entry> = list
+        .entries()
+        .iter()
+        .map(|entry| oracle::Entry {
+            kind: if entry.kind() == Kind::File { 1 } else { 2 },
+            size: entry.size(),
+            hash: *entry.hash().as_bytes(),
+            name: entry.name().as_bytes().to_vec(),
+            extra: Vec::new(),
+        })
+        .collect();
+    let leaves = oracle::folder_leaves(&entries);
+    for place in 0..3_usize {
+        for name in [
+            "model.bin",
+            "copy-of-model.bin",
+            "shards",
+            "absent",
+            "a",
+            "zz",
+        ] {
+            asked.set(name);
+            // As the place really is: right only when it is the name's place.
+            let plain = oracle::folder_run_frame(&entries, place, place + 1);
+            // With the entry renamed to what was asked for.
+            let mut renamed = entries[place].clone();
+            renamed.name = name.as_bytes().to_vec();
+            let passed_off = oracle::folder_run_frame_as(
+                3,
+                place as u64,
+                &[renamed],
+                &leaves.carried(place, place + 1),
+            );
+            let truth = list.get(name).cloned();
+            for (forged, is_plain) in [(plain, true), (passed_off, false)] {
+                let mut peer = ScriptedPeer {
+                    script: |request: &[u8]| {
+                        if request[0] == 0x30 {
+                            vec![kept(&source, Stored::Record, root.as_hash())]
+                        } else {
+                            vec![forged.clone()]
+                        }
+                    },
+                };
+                let mut remote = Remote::open(&mut peer, &root).unwrap();
+                let answer = remote.entry(&weights, name);
+                let honest_answer = is_plain && list.place_of(name) == Some(place as u64);
+                let unchanged = !is_plain && entries[place].name == name.as_bytes();
+                if honest_answer || (unchanged && list.place_of(name) == Some(place as u64)) {
+                    assert_eq!(answer.unwrap(), truth, "{name} at {place}");
+                } else {
+                    assert!(answer.is_err(), "{name} at {place}, plain: {is_plain}");
+                }
+            }
+        }
+    }
+    assert_eq!(model_place, 1);
+
+    // A file's run with one item changed, and the run of other pieces than
+    // those that hold the bytes asked for.
+    let file_list = file_of(&source, &model).unwrap();
+    let run = file_list.open(6, 9).unwrap().encode();
+    assert_eq!(
+        FileRun::decode(&run).unwrap().check(&model, None).unwrap(),
+        96
+    );
+    for at in [20, 51, 52, 55] {
+        let mut forged = run.clone();
+        forged[at] ^= 1;
+        let checked = FileRun::decode(&forged).and_then(|run| run.check(&model, None));
+        assert!(checked.is_err(), "byte {at}");
+    }
+    let elsewhere = frame_with(FRAME_FILE_RUN, &file_list.open(0, 3).unwrap().encode());
+    let mut peer = TestPeer::tampering(&source, move |request, frames| {
+        if request[0] == 0x36 {
+            vec![elsewhere.clone()]
+        } else {
+            frames
+        }
+    });
+    let mut remote = Remote::open(&mut peer, &root).unwrap();
+    let mut out = Vec::new();
+    assert!(matches!(
+        remote.read(&model, 100, 40, &mut out),
+        Err(Error::NotWanted { .. })
+    ));
+    assert!(out.is_empty());
+}
+
+#[test]
+fn a_file_is_never_taken_for_a_folder_nor_a_list_for_a_piece() {
+    let (_temp, source, root) = sample_tree("forge-kinds");
+    let weights = target_at(&source, &root, "weights");
+    let model = target_at(&source, &root, "weights/model.bin");
+    let file_frame = frame_with(
+        FRAME_FILE_LIST,
+        &kept(&source, Stored::FileList, &model.hash),
+    );
+    let folder_frame = frame_with(
+        FRAME_FOLDER_LIST,
+        &kept(&source, Stored::FolderList, &weights.hash),
+    );
+    let piece_frame = frame_with(FRAME_PIECE, &bytes("model", 16));
+
+    // Each kind of question, answered with a true part of the tree that is
+    // of another kind.
+    for (asked, answers) in [
+        (0x31, [&file_frame, &piece_frame]),
+        (0x34, [&folder_frame, &piece_frame]),
+        (0x37, [&file_frame, &folder_frame]),
+    ] {
+        for answer in answers {
+            let answer = answer.clone();
+            let mut done = false;
+            let (result, _dest) = fetch_tampered(&source, &root, move |request, frames| {
+                if request[0] == asked && !done {
+                    done = true;
+                    vec![answer.clone()]
+                } else {
+                    frames
+                }
+            });
+            assert!(result.is_err(), "{asked:#x}");
+        }
+    }
+
+    // A file's entry, shown as a folder's: the kind is part of the entry.
+    let top = scionic_merkletree::record_of(&source, &root).unwrap().top();
+    let mut flipped = kept(&source, Stored::FolderList, &top.hash);
+    let list = folder_of(&source, &top).unwrap();
+    let before: usize = list.entries()[..1].iter().map(Entry::encoded_len).sum();
+    assert_eq!(list.entries()[1].name(), "empty.bin");
+    assert_eq!(flipped[before], 1);
+    flipped[before] = 2;
+    assert!(FolderList::decode(&flipped).is_ok());
+    let flipped = frame_with(FRAME_FOLDER_LIST, &flipped);
+    let (result, _dest) = fetch_tampered(&source, &root, move |request, frames| {
+        if request[0] == 0x31 {
+            vec![flipped.clone()]
+        } else {
+            frames
+        }
+    });
+    assert!(matches!(result, Err(Error::NotWanted { .. })));
+
+    // A file whose bytes are another file's list, to the letter. It is kept
+    // as a piece, under the plain hash of its bytes, and never as a list.
+    let list_bytes = kept(&source, Stored::FileList, &model.hash);
+    let store = MemoryStore::new();
+    let mut builder = Builder::new(&store, scionic_merkletree::Cutting::fixed(4096).unwrap());
+    let odd = builder.file_from_bytes(&list_bytes).unwrap();
+    let odd_root = builder.finish(odd, ExtraData::new()).unwrap();
+    let dest = MemoryStore::new();
+    fetch(&dest, &odd_root, &mut TestPeer::new(&store)).unwrap();
+    let plain = Hash::of(&list_bytes);
+    assert!(dest.has(Stored::Piece, &plain).unwrap());
+    assert!(!dest.has(Stored::FileList, &plain).unwrap());
+    assert!(!dest.has(Stored::FileList, &model.hash).unwrap());
+    assert_ne!(plain, model.hash);
+}
+
+#[test]
+fn a_file_is_not_given_another_files_pieces() {
+    let (_temp, source, root) = sample_tree("forge-pieces");
+    let model = target_at(&source, &root, "weights/model.bin");
+    let shard = target_at(&source, &root, "weights/shards/a.bin");
+    let shard_pieces: Vec<Vec<u8>> = file_of(&source, &shard)
+        .unwrap()
+        .items()
+        .iter()
+        .map(|item| frame_with(FRAME_PIECE, &kept(&source, Stored::Piece, &item.hash)))
+        .collect();
+
+    // A whole fetch: the pieces of one file, sent when another file's were
+    // asked for. They are true pieces of the tree, and they are not what
+    // was asked for.
+    let pieces = shard_pieces.clone();
+    let (result, _dest) =
+        fetch_tampered(
+            &source,
+            &root,
+            move |request, frames| match Request::decode(request).unwrap() {
+                Request::Pieces { file, .. } if file == model.hash => pieces.clone(),
+                _ => frames,
+            },
+        );
+    assert!(matches!(result, Err(Error::NotWanted { .. })));
+
+    // A stretch of one file, answered with another file's pieces, and with
+    // the file's own pieces in another order.
+    for swap in [false, true] {
+        let pieces = shard_pieces.clone();
+        let mut peer = TestPeer::tampering(&source, move |request, mut frames| {
+            if request[0] != 0x37 {
+                return frames;
+            }
+            if swap {
+                frames.swap(0, 1);
+                frames
+            } else {
+                pieces.clone()
+            }
+        });
+        let mut remote = Remote::open(&mut peer, &root).unwrap();
+        let mut out = Vec::new();
+        assert!(
+            remote.read(&model, 0, 64, &mut out).is_err(),
+            "swap: {swap}"
+        );
+        assert!(out.is_empty(), "no byte of another piece is handed out");
+    }
+
+    // A stretch of one file, answered with the run of another file's list.
+    let other_run = frame_with(
+        FRAME_FILE_RUN,
+        &file_of(&source, &shard)
+            .unwrap()
+            .open(0, 4)
+            .unwrap()
+            .encode(),
+    );
+    let mut peer = TestPeer::tampering(&source, move |request, frames| {
+        if request[0] == 0x36 {
+            vec![other_run.clone()]
+        } else {
+            frames
+        }
+    });
+    let mut remote = Remote::open(&mut peer, &root).unwrap();
+    let mut out = Vec::new();
+    assert!(remote.read(&model, 0, 64, &mut out).is_err());
+    assert!(out.is_empty());
+}
+
+#[test]
+fn a_record_for_another_root_is_refused() {
+    let (_temp, source, root) = sample_tree("forge-record");
+    let mut builder = Builder::new(&source, small_pieces());
+    let other_file = builder.file_from_bytes(b"another tree").unwrap();
+    let other = builder.finish(other_file, ExtraData::new()).unwrap();
+    let other_record = kept(&source, Stored::Record, other.as_hash());
+
+    let forged = other_record.clone();
+    let (result, dest) = fetch_tampered(&source, &root, move |request, frames| {
+        if request[0] == 0x30 {
+            vec![forged.clone()]
+        } else {
+            frames
+        }
+    });
+    assert!(matches!(result, Err(Error::HashMismatch { .. })));
+    assert_eq!(contents(&dest), Vec::new(), "nothing is kept");
+
+    let forged = other_record.clone();
+    let mut peer = TestPeer::tampering(&source, move |_, _| vec![forged.clone()]);
+    assert!(matches!(
+        Remote::open(&mut peer, &root),
+        Err(Error::HashMismatch { .. })
+    ));
+    // The record that was asked for, with one of its totals changed.
+    let mut changed = kept(&source, Stored::Record, root.as_hash());
+    changed[45] ^= 1;
+    let mut peer = TestPeer::tampering(&source, move |_, _| vec![changed.clone()]);
+    assert!(Remote::open(&mut peer, &root).is_err());
+}
+
+#[test]
+fn nothing_is_kept_before_it_is_tied_to_the_root() {
+    let (_temp, source, root) = sample_tree("forge-order");
+    let top = scionic_merkletree::record_of(&source, &root).unwrap().top();
+    let readme = target_at(&source, &root, "readme.txt");
+    let shard = target_at(&source, &root, "weights/shards/a.bin");
+    let record = kept(&source, Stored::Record, root.as_hash());
+    let top_list = frame_with(
+        FRAME_FOLDER_LIST,
+        &kept(&source, Stored::FolderList, &top.hash),
+    );
+    let readme_list = frame_with(
+        FRAME_FILE_LIST,
+        &kept(&source, Stored::FileList, &readme.hash),
+    );
+    let readme_piece = frame_with(FRAME_PIECE, b"a small file");
+    let deep_list = frame_with(
+        FRAME_FILE_LIST,
+        &kept(&source, Stored::FileList, &shard.hash),
+    );
+    let made_up_piece = frame_with(FRAME_PIECE, b"no part of this tree");
+
+    let dest = MemoryStore::new();
+    let refused = |frame: &[u8], what: &str| {
+        let before = contents(&dest);
+        let mut intake = Intake::new(&dest, root).unwrap();
+        let verdict = intake.accept(frame);
+        assert!(
+            matches!(verdict, Err(Error::NotWanted { .. })),
+            "{what}: {verdict:?}"
+        );
+        assert_eq!(contents(&dest), before, "{what}: something was kept");
+    };
+    let taken = |frame: &[u8], what: &str| {
+        let mut intake = Intake::new(&dest, root).unwrap();
+        assert!(intake.accept(frame).unwrap().kept, "{what}");
+        // The same thing again is passed over, and not kept twice.
+        let before = contents(&dest);
+        assert!(!intake.accept(frame).unwrap().kept, "{what}, again");
+        assert_eq!(contents(&dest), before);
     };
 
-    // Leaf by leaf: the file's own packet lists the forged leaf as its child,
-    // and the forged leaf follows.
-    let mut store = DagStore::in_memory();
-    for packet in dag.get_leaf_sequence().unwrap() {
-        let mut wire = Json::parse(&packet.to_json().unwrap());
-        if wire.get("Leaf").get("Hash").text() == file.as_str() {
-            wire.get_mut("Leaf").set("Links", links(&[cid.as_str()]));
+    // Before the record, nothing is tied to anything.
+    for (frame, what) in [
+        (&top_list, "the top folder"),
+        (&readme_list, "a file's list"),
+        (&readme_piece, "a piece"),
+    ] {
+        refused(frame, what);
+    }
+    assert!(Intake::new(&dest, root).unwrap().record().is_none());
+    taken(&record, "the record");
+    // The record's totals are there to be looked at before anything more is
+    // taken.
+    let intake = Intake::new(&dest, root).unwrap();
+    assert_eq!(intake.record().unwrap().totals().pieces, 76);
+    assert_eq!(intake.outstanding(), 1, "the top folder");
+
+    // After the record, only the top folder is named.
+    refused(&readme_list, "a file's list before its folder");
+    refused(&readme_piece, "a piece before its file's list");
+    refused(&deep_list, "a list from further down");
+    taken(&top_list, "the top folder");
+    // Now the top folder's files are named, and their pieces are not yet.
+    refused(&readme_piece, "a piece before its file's list");
+    refused(&deep_list, "a list from further down");
+    refused(&made_up_piece, "a made-up piece");
+    taken(&readme_list, "a file's list");
+    refused(&made_up_piece, "a made-up piece");
+    taken(&readme_piece, "a piece");
+
+    assert_only_from(&dest, &source);
+    assert!(matches!(
+        Intake::new(&dest, root).unwrap().finish(),
+        Err(Error::Missing { .. })
+    ));
+
+    // A bundle with a made-up piece in it is refused where the piece comes,
+    // be the piece as long as a piece of this tree or longer.
+    let mut bundle = Vec::new();
+    export(&source, &root, &mut bundle).unwrap();
+    let short_piece = frame_with(FRAME_PIECE, b"not of this tree");
+    for piece in [&short_piece, &made_up_piece] {
+        let mut extra = bundle.clone();
+        extra.extend_from_slice(&(piece.len() as u32).to_be_bytes());
+        extra.extend_from_slice(piece);
+        let fresh = MemoryStore::new();
+        assert!(matches!(
+            import(&fresh, &root, &mut extra.as_slice()),
+            Err(Error::NotWanted { .. })
+        ));
+        assert_only_from(&fresh, &source);
+    }
+    // And one whose first list comes before its record.
+    let mut early = bundle[..8].to_vec();
+    early.extend_from_slice(&(top_list.len() as u32).to_be_bytes());
+    early.extend_from_slice(&top_list);
+    early.extend_from_slice(&bundle[8..]);
+    let fresh = MemoryStore::new();
+    assert!(import(&fresh, &root, &mut early.as_slice()).is_err());
+    assert_eq!(contents(&fresh), Vec::new());
+}
+
+#[test]
+fn a_peer_whose_own_store_is_wrong_is_found_out() {
+    let (_temp, source, root) = sample_tree("forge-store");
+    let model = target_at(&source, &root, "weights/model.bin");
+    let shard = target_at(&source, &root, "weights/shards/a.bin");
+    let weights = target_at(&source, &root, "weights");
+    let data = target_at(&source, &root, "data");
+    let piece = file_of(&source, &model).unwrap().items()[9];
+    let cases = [
+        (Stored::Piece, piece.hash, bytes("wrong", 16)),
+        (
+            Stored::FileList,
+            model.hash,
+            kept(&source, Stored::FileList, &shard.hash),
+        ),
+        (
+            Stored::FolderList,
+            weights.hash,
+            kept(&source, Stored::FolderList, &data.hash),
+        ),
+    ];
+    for (kind, hash, wrong) in cases {
+        let honest = kept(&source, kind, &hash);
+        source.remove(kind, &hash).unwrap();
+        source.put(kind, &hash, &wrong).unwrap();
+        // One set of checks: the same forgery is refused in the store that
+        // holds it, and by whoever fetches from that store.
+        assert!(verify(&source, &root).is_err(), "{kind:?}");
+        let dest = MemoryStore::new();
+        assert!(
+            fetch(&dest, &root, &mut TestPeer::new(&source)).is_err(),
+            "{kind:?}"
+        );
+        assert_clean(&dest);
+        assert!(
+            !dest.has(kind, &hash).unwrap(),
+            "{kind:?}: the forged part was kept"
+        );
+        source.remove(kind, &hash).unwrap();
+        source.put(kind, &hash, &honest).unwrap();
+    }
+    verify(&source, &root).unwrap();
+}
+
+#[test]
+fn a_file_never_comes_back_short() {
+    let (_temp, source, root) = sample_tree("forge-short");
+    let model = target_at(&source, &root, "weights/model.bin");
+    let list = file_of(&source, &model).unwrap();
+    let last = *list.items().last().unwrap();
+
+    // A peer that never sends the file's last piece.
+    let (result, dest) = fetch_tampered(&source, &root, move |_, frames| {
+        frames
+            .into_iter()
+            .filter(|frame| frame[0] != FRAME_PIECE || Hash::of(&frame[1..]) != last.hash)
+            .collect()
+    });
+    assert!(matches!(result, Err(Error::Peer { .. })));
+    let mut out = Vec::new();
+    assert!(matches!(
+        read_file(&dest, &model, &mut out),
+        Err(Error::Missing { .. })
+    ));
+    assert!(out.is_empty(), "an error, and never a shorter file");
+    assert!(verify(&dest, &root).is_err());
+
+    // The last piece, one byte short.
+    let (result, _dest) = fetch_tampered(&source, &root, move |_, frames| {
+        frames
+            .into_iter()
+            .map(|mut frame| {
+                if frame[0] == FRAME_PIECE && Hash::of(&frame[1..]) == last.hash {
+                    frame.pop();
+                }
+                frame
+            })
+            .collect()
+    });
+    assert!(result.is_err());
+
+    // A made-up file that is the real one without its last piece. It is
+    // whole and well formed, it is shorter, and it is another file.
+    let shorter: Vec<oracle::Item> = list.items()[..62]
+        .iter()
+        .map(|item| oracle::Item {
+            hash: *item.hash.as_bytes(),
+            length: item.length,
+        })
+        .collect();
+    let shorter_list = frame_with(FRAME_FILE_LIST, &oracle::file_list_bytes(&shorter));
+    let (result, _dest) =
+        fetch_tampered(
+            &source,
+            &root,
+            move |request, frames| match Request::decode(request).unwrap() {
+                Request::File(file) if file == model.hash => vec![shorter_list.clone()],
+                _ => frames,
+            },
+        );
+    assert!(matches!(result, Err(Error::NotWanted { .. })));
+    let shorter_run = oracle::file_run_frame(&shorter, 0, 62);
+    let mut peer = TestPeer::tampering(&source, move |request, frames| {
+        if request[0] == 0x36 {
+            vec![shorter_run.clone()]
+        } else {
+            frames
         }
-        if let Ok(packet) = TransmissionPacket::from_json(&wire.to_bytes()) {
-            let _ = store.add_transmission_packet(&packet);
+    });
+    let mut remote = Remote::open(&mut peer, &root).unwrap();
+    let mut out = Vec::new();
+    assert!(remote.read(&model, 0, 1_000, &mut out).is_err());
+    assert!(out.is_empty());
+
+    // A peer that sends fewer pieces than a stretch needs, and then none.
+    let mut sent = 0;
+    let mut peer = TestPeer::tampering(&source, move |request, frames| {
+        if request[0] != 0x37 {
+            return frames;
+        }
+        let keep = frames.len().min(3 - sent);
+        sent += keep;
+        frames.into_iter().take(keep).collect()
+    });
+    let mut remote = Remote::open(&mut peer, &root).unwrap();
+    let mut out = Vec::new();
+    assert!(matches!(
+        remote.read(&model, 0, 1_000, &mut out),
+        Err(Error::Peer { .. })
+    ));
+}
+
+#[test]
+fn one_name_has_one_place_in_a_folder() {
+    // A folder made by an author who put its entries out of order on
+    // purpose, with one name twice. The library makes no such folder, so it
+    // is hashed here by hand, to the letter of the format.
+    let hash = |seed: &str| oracle::sha(&[seed.as_bytes()]);
+    for names in [
+        vec!["b", "a", "b", "c"],
+        vec!["a", "b", "b", "c"],
+        vec!["c", "b", "a"],
+        vec!["b", "b"],
+        vec!["a", "c", "b", "d", "a", "e", "b"],
+    ] {
+        let entries: Vec<oracle::Entry> = names
+            .iter()
+            .enumerate()
+            .map(|(place, name)| oracle::Entry::file(name, hash(&format!("{name}{place}")), 1))
+            .collect();
+        let (folder_hash, size) = oracle::folder_hash(&entries);
+        let folder = Target {
+            kind: Kind::Folder,
+            hash: Hash::from_bytes(folder_hash),
+            size,
+        };
+        let record = oracle::record_bytes(
+            2,
+            size,
+            &folder_hash,
+            (0, 0, oracle::folder_list_bytes(&entries).len() as u64),
+            &oracle::cut_tag("fixed-16"),
+        );
+        let root = Root::of_record(&record);
+
+        // Whole, the list is refused as soon as it is read.
+        let whole = frame_with(FRAME_FOLDER_LIST, &oracle::folder_list_bytes(&entries));
+        let dest = MemoryStore::new();
+        let mut intake = Intake::new(&dest, root).unwrap();
+        intake.accept(&record).unwrap();
+        assert!(matches!(
+            intake.accept(&whole),
+            Err(Error::InvalidData { .. })
+        ));
+        assert_eq!(dest.count(Stored::FolderList), 0);
+
+        // In part, the author shows whichever place suits him. For each
+        // name at most one place is ever accepted, so two entries under one
+        // name are never both shown.
+        let place = Cell::new(0_usize);
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            let mut accepted = Vec::new();
+            for shown in 0..entries.len() {
+                place.set(shown);
+                let mut peer = ScriptedPeer {
+                    script: |request: &[u8]| {
+                        if request[0] == 0x30 {
+                            vec![record.clone()]
+                        } else {
+                            vec![oracle::folder_run_frame(
+                                &entries,
+                                place.get(),
+                                place.get() + 1,
+                            )]
+                        }
+                    },
+                };
+                let mut remote = Remote::open(&mut peer, &root).unwrap();
+                if let Ok(answer) = remote.entry(&folder, name) {
+                    accepted.push((shown, answer.map(|entry| *entry.hash())));
+                }
+            }
+            assert!(
+                accepted.len() <= 1,
+                "{names:?}: {name} answered at {accepted:?}"
+            );
+        }
+
+        // A run of several entries is accepted only where each of them is
+        // at its name's one place: never a run that shows a name twice.
+        for start in 0..entries.len() {
+            for end in start + 1..=entries.len() {
+                let frame = oracle::folder_run_frame(&entries, start, end);
+                let Ok(Frame::FolderRun(run)) = Frame::decode(&frame) else {
+                    continue;
+                };
+                if run.check(&folder).is_ok() {
+                    let shown: Vec<&str> = run.entries().iter().map(Entry::name).collect();
+                    let mut unique = shown.clone();
+                    unique.dedup();
+                    assert_eq!(shown, unique);
+                    assert!(shown.windows(2).all(|pair| pair[0] < pair[1]));
+                }
+            }
         }
     }
-    let _ = store.add_transmission_packet(&packet_for(&forged, file.as_str()));
-    judge("leaf by leaf", &store);
+}
 
-    // One batch that does the same.
-    let mut wire = batch_of(&dag);
-    add_to_batch(&mut wire, &cid, &forged, file.as_str());
-    batch_leaf_mut(&mut wire, file.as_str()).set("Links", links(&[cid.as_str()]));
-    let mut store = DagStore::in_memory();
-    if let Ok(packet) = decode_batch(&wire) {
-        let _ = store.add_batched_transmission_packet(&packet);
+#[test]
+fn no_place_exists_beyond_the_count_and_a_fork_is_no_leaf() {
+    let pieces: Vec<Vec<u8>> = (0..5)
+        .map(|index| bytes(&format!("p{index}"), 16))
+        .collect();
+    let items: Vec<oracle::Item> = pieces.iter().map(|piece| oracle::Item::of(piece)).collect();
+    let (hash, size) = oracle::file_hash(&items);
+    let file = Target {
+        kind: Kind::File,
+        hash: Hash::from_bytes(hash),
+        size,
+    };
+    let check = |frame: &[u8]| FileRun::decode(&frame[1..]).and_then(|run| run.check(&file, None));
+    assert_eq!(check(&oracle::file_run_frame(&items, 4, 5)).unwrap(), 64);
+
+    // The last piece, shown again at the place after the last. A tree that
+    // fills up a level by repeating its last leaf would take this.
+    let carried = oracle::file_leaves(&items).carried(4, 5);
+    for (count, start) in [(5, 5), (6, 5), (6, 4), (4, 4), (8, 7)] {
+        let forged = oracle::file_run_frame_as(count, start, &items[4..], &carried);
+        assert!(check(&forged).is_err(), "as {count} pieces, at {start}");
     }
-    judge("in one batch", &store);
+    // A file of six pieces whose sixth is the fifth again is another file.
+    let mut six = items.clone();
+    six.push(items[4].clone());
+    assert_ne!(oracle::file_hash(&six).0, hash);
+    assert_ne!(
+        oracle::file_leaves(&six).top().0,
+        oracle::file_leaves(&items).top().0
+    );
+    for (start, end) in [(0, 6), (5, 6), (4, 5)] {
+        assert!(check(&oracle::file_run_frame(&six, start, end)).is_err());
+    }
 
-    accepted.finish();
+    // A fork passed off as a piece: a file of two "pieces" that are the
+    // two forks under the top of a file of four.
+    let four = &items[..4];
+    let leaves = oracle::file_leaves(four);
+    let (four_hash, four_size) = oracle::file_hash(four);
+    let four_file = Target {
+        kind: Kind::File,
+        hash: Hash::from_bytes(four_hash),
+        size: four_size,
+    };
+    let forks: Vec<oracle::Item> = [leaves.node(0, 2), leaves.node(2, 2)]
+        .iter()
+        .map(|(hash, size)| oracle::Item {
+            hash: *hash,
+            length: *size as u32,
+        })
+        .collect();
+    let as_two = oracle::file_run_frame(&forks, 0, 2);
+    let run = FileRun::decode(&as_two[1..]).unwrap();
+    assert!(run.check(&four_file, None).is_err());
+    assert_ne!(oracle::file_hash(&forks).0, four_hash);
+    // And a leaf passed off as a fork: the top of a file of one piece is
+    // never the top of a file of two.
+    let one = &items[..1];
+    assert_ne!(
+        oracle::file_leaves(one).top().0,
+        oracle::file_leaves(&items[..2]).top().0
+    );
+}
+
+#[test]
+fn a_tree_that_holds_more_than_its_record_says_is_stopped() {
+    let (_temp, source, root) = sample_tree("forge-totals");
+    let record = scionic_merkletree::record_of(&source, &root).unwrap();
+    let right = record.totals();
+    for (field, totals) in [
+        (
+            "pieces",
+            Totals {
+                pieces: right.pieces - 1,
+                ..right
+            },
+        ),
+        (
+            "piece bytes",
+            Totals {
+                piece_bytes: right.piece_bytes - 16,
+                ..right
+            },
+        ),
+        (
+            "list bytes",
+            Totals {
+                list_bytes: right.list_bytes - 1,
+                ..right
+            },
+        ),
+    ] {
+        let forged = Record::new(record.top(), totals, record.cutting(), ExtraData::new()).unwrap();
+        let forged_root = forged.root();
+        source
+            .put(Stored::Record, forged_root.as_hash(), &forged.encode())
+            .unwrap();
+        let dest = MemoryStore::new();
+        match fetch(&dest, &forged_root, &mut TestPeer::new(&source)) {
+            Err(Error::TotalsMismatch { field: named, .. }) => assert_eq!(named, field),
+            other => panic!("{totals:?}: {other:?}"),
+        }
+        assert_clean(&dest);
+    }
+}
+
+#[test]
+fn a_tree_that_is_too_deep_is_refused_however_it_arrives() {
+    let source = MemoryStore::new();
+    let mut builder = Builder::new(&source, small_pieces());
+    let file = builder.file_from_bytes(b"at the bottom").unwrap();
+    let mut inner = builder.folder(vec![entry("file", file)]).unwrap();
+    for _ in 1..128 {
+        inner = builder.folder(vec![entry("d", inner)]).unwrap();
+    }
+    let deepest_allowed = builder.finish(inner, ExtraData::new()).unwrap();
+    let totals = verify(&source, &deepest_allowed).unwrap().record.totals();
+
+    // One folder more, and a record for it written without the builder.
+    let over = FolderList::new(vec![entry("d", inner)]).unwrap();
+    source
+        .put(Stored::FolderList, over.hash(), &over.encode())
+        .unwrap();
+    let forged = Record::new(
+        over.target(),
+        Totals {
+            list_bytes: totals.list_bytes + over.encoded_len(),
+            ..totals
+        },
+        small_pieces(),
+        ExtraData::new(),
+    )
+    .unwrap();
+    let forged_root = forged.root();
+    source
+        .put(Stored::Record, forged_root.as_hash(), &forged.encode())
+        .unwrap();
+
+    assert!(matches!(
+        verify(&source, &forged_root),
+        Err(Error::TooDeep { limit: 128 })
+    ));
+    let dest = MemoryStore::new();
+    assert!(matches!(
+        fetch(&dest, &forged_root, &mut TestPeer::new(&source)),
+        Err(Error::TooDeep { limit: 128 })
+    ));
+    let mut bundle = Vec::new();
+    assert!(matches!(export(&source, &forged_root, &mut bundle), Ok(())));
+    let dest = MemoryStore::new();
+    assert!(matches!(
+        import(&dest, &forged_root, &mut bundle.as_slice()),
+        Err(Error::TooDeep { limit: 128 })
+    ));
+    assert!(scionic_merkletree::write_to_disk(
+        &source,
+        &forged_root,
+        std::env::temp_dir().join("scionic-never-written")
+    )
+    .is_err());
+    assert!(lookup(&source, &forged_root, &["d"; 130].join("/")).is_err());
+}
+
+#[test]
+fn malformed_input_is_an_error_and_never_a_crash() {
+    let (_temp, source, root) = sample_tree("forge-malformed");
+    let top = scionic_merkletree::record_of(&source, &root).unwrap().top();
+    let model = target_at(&source, &root, "weights/model.bin");
+    let weights = target_at(&source, &root, "weights");
+    let record = kept(&source, Stored::Record, root.as_hash());
+    let honest: Vec<Vec<u8>> = vec![
+        record.clone(),
+        frame_with(
+            FRAME_FOLDER_LIST,
+            &kept(&source, Stored::FolderList, &top.hash),
+        ),
+        frame_with(
+            FRAME_FILE_LIST,
+            &kept(&source, Stored::FileList, &model.hash),
+        ),
+        frame_with(FRAME_PIECE, b"a small file"),
+        frame_with(
+            FRAME_FILE_RUN,
+            &file_of(&source, &model)
+                .unwrap()
+                .open(3, 9)
+                .unwrap()
+                .encode(),
+        ),
+        frame_with(
+            FRAME_FOLDER_RUN,
+            &folder_of(&source, &weights)
+                .unwrap()
+                .open(1, 2)
+                .unwrap()
+                .encode(),
+        ),
+        frame_with(0x26, &[0, 0, 0, 0, 0, 0, 0, 9, 0xff, 0x80]),
+        vec![0x27, 1],
+    ];
+    assert_eq!(honest[0][0], FRAME_RECORD);
+
+    // Every way of cutting a frame short, and every single byte of it
+    // changed in three ways.
+    let mut forged: Vec<Vec<u8>> = Vec::new();
+    for frame in &honest {
+        let step = (frame.len() / 400).max(1);
+        for cut in (0..frame.len()).step_by(step) {
+            forged.push(frame[..cut].to_vec());
+        }
+        for at in (0..frame.len()).step_by(step) {
+            for change in [1_u8, 0x80, 0xff] {
+                let mut changed = frame.clone();
+                changed[at] ^= change;
+                forged.push(changed);
+            }
+        }
+        forged.push([frame.clone(), vec![0]].concat());
+    }
+    // And bytes that are nothing at all.
+    for length in [1, 2, 20, 36, 37, 45, 66, 100, 500] {
+        for seed in 0..8 {
+            for tag in [
+                0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x30, 0x33, 0x36, 0xff,
+            ] {
+                let mut noise = bytes(&format!("noise-{seed}"), length);
+                noise[0] = tag;
+                forged.push(noise);
+            }
+        }
+    }
+
+    let responder = Responder::new(&source);
+    let dest = MemoryStore::new();
+    Intake::new(&dest, root).unwrap().accept(&record).unwrap();
+    for frame in &forged {
+        let _ = Frame::decode(frame);
+        let _ = Request::decode(frame);
+        let _ = Record::decode(frame);
+        let _ = FileList::decode(frame);
+        let _ = FolderList::decode(frame);
+        let _ = FileRun::decode(frame).map(|run| run.check(&model, None));
+        let _ = FolderRun::decode(frame).map(|run| {
+            let _ = run.check(&weights);
+            run.check_name(&weights, "model.bin").map(|_| ())
+        });
+        let _ = Root::parse(&String::from_utf8_lossy(frame));
+        let _ = responder.answer(frame, &mut |_| Ok(()));
+        let _ = Intake::new(&dest, root).unwrap().accept(frame);
+        let mut bundle = scionic_merkletree::BUNDLE_MAGIC.to_vec();
+        bundle.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        bundle.extend_from_slice(frame);
+        let _ = import(&MemoryStore::new(), &root, &mut bundle.as_slice());
+        let _ = import(&MemoryStore::new(), &root, &mut frame.as_slice());
+    }
+    assert!(forged.len() > 5_000);
+    // Whatever got through was a true part of the tree.
+    assert_only_from(&dest, &source);
+    let _ = (
+        kept(&source, Stored::Record, root.as_hash()),
+        verify(&source, &root).unwrap(),
+    );
 }

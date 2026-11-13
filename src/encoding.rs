@@ -1,653 +1,18 @@
+//! SHA-256, and the two ways a hash is written as text: base32 for a root,
+//! and hex.
+
 use crate::{Error, Result};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeSet;
-use std::sync::Arc;
-
-#[cfg(test)]
-mod wire_map_ordering_tests {
-    use super::{cbor_encode, sorted_wire_map, CborValue, KeyOrder};
-
-    /// Pin the canonical CBOR wire-map comparator with mixed-length keys.
-    ///
-    /// The main spec vectors use uniform-length CID keys, where length-first and
-    /// bytewise ordering coincide. `AdditionalData` accepts arbitrary key lengths,
-    /// so this vector makes the distinction observable: `mm`, `zz`, `aaaaaa`.
-    const EXPECTED: &str = "a3626d6d6132627a7a6131666161616161616133";
-
-    #[test]
-    fn wire_maps_sort_length_first_then_bytewise() {
-        let encoded = cbor_encode(&sorted_wire_map(
-            vec![
-                ("zz".to_owned(), CborValue::Text("1".to_owned())),
-                ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
-                ("mm".to_owned(), CborValue::Text("2".to_owned())),
-            ],
-            KeyOrder::Cbor,
-        ));
-        let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            hex, EXPECTED,
-            "wire map ordering drifted from the canonical bytes"
-        );
-    }
-
-    #[test]
-    fn wire_map_ordering_is_independent_of_insertion_order() {
-        let forward = cbor_encode(&sorted_wire_map(
-            vec![
-                ("mm".to_owned(), CborValue::Text("2".to_owned())),
-                ("zz".to_owned(), CborValue::Text("1".to_owned())),
-                ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
-            ],
-            KeyOrder::Cbor,
-        ));
-        let reverse = cbor_encode(&sorted_wire_map(
-            vec![
-                ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
-                ("zz".to_owned(), CborValue::Text("1".to_owned())),
-                ("mm".to_owned(), CborValue::Text("2".to_owned())),
-            ],
-            KeyOrder::Cbor,
-        ));
-        assert_eq!(forward, reverse);
-    }
-
-    /// Pin the JSON comparator, which deliberately differs from CBOR.
-    ///
-    /// JSON dynamic-map keys use plain bytewise order, while canonical CBOR uses
-    /// encoded-key order. Mixed-length keys expose the difference:
-    ///
-    /// ```text
-    /// CBOR (length-first): mm, zz, aaaaaa
-    /// JSON (bytewise):     aaaaaa, mm, zz
-    /// ```
-    ///
-    /// Keeping this independent test prevents either output format from silently
-    /// inheriting the other format's comparator.
-    #[test]
-    fn json_wire_maps_sort_bytewise_and_cbor_maps_do_not() {
-        fn keys(order: KeyOrder) -> Vec<String> {
-            let CborValue::Map(pairs) = sorted_wire_map(
-                vec![
-                    ("zz".to_owned(), CborValue::Text("1".to_owned())),
-                    ("aaaaaa".to_owned(), CborValue::Text("3".to_owned())),
-                    ("mm".to_owned(), CborValue::Text("2".to_owned())),
-                ],
-                order,
-            ) else {
-                panic!("sorted_wire_map must produce a map");
-            };
-            pairs.into_iter().map(|(key, _)| key).collect()
-        }
-
-        assert_eq!(keys(KeyOrder::Cbor), ["mm", "zz", "aaaaaa"]);
-        assert_eq!(keys(KeyOrder::Json), ["aaaaaa", "mm", "zz"]);
-    }
-}
 
 const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-const MAX_CBOR_INPUT_BYTES: usize = 64 * 1024 * 1024;
-const MAX_CBOR_DEPTH: usize = 32;
-const MAX_CBOR_COLLECTION_ITEMS: u64 = 65_536;
-const MAX_CBOR_NODES: usize = 131_072;
+const HEX_ALPHABET: &[u8; 16] = b"0123456789abcdef";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CborNegative {
-    argument: u64,
+pub(crate) fn sha256(input: &[u8]) -> [u8; 32] {
+    Sha256::digest(input).into()
 }
 
-impl CborNegative {
-    pub const fn argument(self) -> u64 {
-        self.argument
-    }
-}
-
-impl TryFrom<i64> for CborNegative {
-    type Error = Error;
-
-    fn try_from(value: i64) -> Result<Self> {
-        if value >= 0 {
-            return Err(Error::InvalidCborNegative { value });
-        }
-        Ok(Self {
-            argument: (-1_i128 - i128::from(value)) as u64,
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-// Adding a variant to a public enum silently breaks every downstream exhaustive
-// `match` -- which is exactly what `SharedBytes` did before this attribute was
-// here. Callers now carry a wildcard arm, so the next representation change is
-// theirs to ignore rather than theirs to recompile.
-#[non_exhaustive]
-pub enum CborValue {
-    Unsigned(u64),
-    Negative(CborNegative),
-    Bytes(Vec<u8>),
-    /// Bytes the encoder reads from a shared owner instead of copying.
-    ///
-    /// Encoded byte-for-byte identically to [`CborValue::Bytes`]: this is a
-    /// representation choice, never a wire choice. It exists because leaf
-    /// content already lives behind an `Arc`, and wrapping it in `Bytes` meant
-    /// copying the whole payload into the value tree and then copying it again
-    /// into the output buffer. The shared representation keeps this to one pass.
-    ///
-    /// The decoder produces this variant too, for the mirror-image reason: it
-    /// allocates each byte string once while reading, and handing that same
-    /// allocation to the leaf avoids a second copy on the way in.
-    ///
-    /// `Bytes` and `SharedBytes` are the same CBOR value and compare equal, so
-    /// which one a tree happens to hold is not observable through `==`.
-    SharedBytes(Arc<Vec<u8>>),
-    Text(String),
-    Array(Vec<CborValue>),
-    Map(Vec<(String, CborValue)>),
-    Null,
-    Bool(bool),
-}
-
-/// Equality is by CBOR value, not by representation.
-///
-/// `Bytes` and `SharedBytes` encode to identical wire bytes, so treating them as
-/// different would make `cbor_decode(cbor_encode(x)) == x` fail purely because
-/// ownership changed. Comparing the bytes keeps `Eq` honest -- it stays
-/// reflexive, symmetric and transitive, because it reduces to comparing `[u8]`.
-impl PartialEq for CborValue {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Unsigned(left), Self::Unsigned(right)) => left == right,
-            (Self::Negative(left), Self::Negative(right)) => left == right,
-            (Self::Bytes(left), Self::Bytes(right)) => left == right,
-            (Self::SharedBytes(left), Self::SharedBytes(right)) => left == right,
-            (Self::Bytes(owned), Self::SharedBytes(shared))
-            | (Self::SharedBytes(shared), Self::Bytes(owned)) => owned == shared.as_ref(),
-            (Self::Text(left), Self::Text(right)) => left == right,
-            (Self::Array(left), Self::Array(right)) => left == right,
-            (Self::Map(left), Self::Map(right)) => left == right,
-            (Self::Null, Self::Null) => true,
-            (Self::Bool(left), Self::Bool(right)) => left == right,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for CborValue {}
-
-impl CborValue {
-    pub fn negative(value: i64) -> Result<Self> {
-        CborNegative::try_from(value).map(Self::Negative)
-    }
-}
-
-/// Encodes into a buffer the caller owns, appending after whatever it holds.
-///
-/// This exists because the encoder is not what costs anything. Measured on the
-/// 18.25 MiB benchmark corpus, encoding the whole DAG runs at the floor set by
-/// allocating the output buffer and copying the bytes into it -- 4.8ms against a
-/// 4.7ms alloc-plus-memcpy control that does no CBOR work at all. The tree walk,
-/// the key sorting and the CBOR framing together are lost in the noise.
-///
-/// What does cost something is the buffer. A control that only allocates 19 MB
-/// and memcpies into it costs 4.4ms; the same copy into a buffer that already
-/// exists costs 0.8ms. So roughly three quarters of every `cbor_encode` is the
-/// operating system handing back fresh zeroed pages and the faults taken on
-/// first touch. A caller that encodes repeatedly -- a relay serving DAGs, a
-/// store rewriting them -- can hold one buffer and pay that once instead of per
-/// call: measured end to end, 4.9ms becomes 2.0ms for byte-identical output.
-///
-/// The remaining 2.0ms is real work -- building the value tree and writing the
-/// bytes -- rather than allocation, and 0.8ms of it is the copy itself.
-///
-/// It also explains why this crate's `to_cbor` timing drifts between recordings
-/// with no code change: allocation cost tracks the machine's free-page state,
-/// not the encoder.
-pub fn cbor_encode_into(value: &CborValue, output: &mut Vec<u8>) {
-    // Size the buffer before writing. Growing a `Vec` to hold a multi-megabyte
-    // DAG costs roughly two dozen reallocations, and every one of them copies
-    // everything written so far -- more memory traffic than the encode performs.
-    let expected = encoded_len(value);
-    output.reserve(expected);
-    let before = output.len();
-    encode_value(value, output);
-    debug_assert_eq!(
-        output.len() - before,
-        expected,
-        "encoded_len must predict the encoder exactly; a drift here silently\
-         reintroduces reallocation"
-    );
-}
-
-pub fn cbor_encode(value: &CborValue) -> Vec<u8> {
-    // Starting empty rather than with_capacity keeps `cbor_encode_into` as the
-    // single implementation: its `reserve` on an empty Vec allocates exactly the
-    // encoded length, so this still performs one correctly sized allocation and
-    // does not walk the tree twice to work out how big it should be.
-    let mut output = Vec::new();
-    cbor_encode_into(value, &mut output);
-    output
-}
-
-/// Select the canonical comparator for a dynamic wire map.
-///
-/// CBOR and JSON use different deterministic rules:
-///
-/// * `Cbor` follows RFC 8949 encoded-key ordering, which for text keys reduces
-///   exactly to length-first and then bytewise.
-/// * `Json` uses plain bytewise key ordering with no length term.
-///
-/// Equal-length keys hide this distinction, so mixed-length vectors pin both paths.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum KeyOrder {
-    Cbor,
-    Json,
-}
-
-/// Build a dynamic wire map whose keys follow the selected output comparator.
-///
-/// Sorting is applied only to genuine dynamic maps: `Leafs`, `AdditionalData`,
-/// `stored_proofs`, `proofs`, and `Relationships`. Struct-shaped field maps keep
-/// their canonical declaration order. Applying a blanket sort would change packet
-/// field order and therefore the wire bytes.
-///
-/// RFC 8949 compares encoded map keys bytewise. For text keys, the encoded head
-/// grows monotonically with length, so `(length, UTF-8 bytes)` is exactly the same
-/// ordering without allocating temporary encoded keys.
-pub(crate) fn sorted_wire_map(mut pairs: Vec<(String, CborValue)>, order: KeyOrder) -> CborValue {
-    match order {
-        KeyOrder::Cbor => {
-            pairs.sort_by(|(left, _), (right, _)| {
-                left.len()
-                    .cmp(&right.len())
-                    .then_with(|| left.as_bytes().cmp(right.as_bytes()))
-            });
-        }
-        KeyOrder::Json => {
-            pairs.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
-        }
-    }
-    CborValue::Map(pairs)
-}
-
-/// Byte width of one CBOR head, mirroring [`encode_argument`] exactly.
-const fn argument_len(value: u64) -> usize {
-    match value {
-        0..=23 => 1,
-        24..=255 => 2,
-        256..=65_535 => 3,
-        65_536..=4_294_967_295 => 5,
-        _ => 9,
-    }
-}
-
-/// Exact encoded size of `value`, used to preallocate the output buffer.
-///
-/// This walks the tree without allocating, so it is cheap next to the copying it
-/// avoids. It must agree with [`encode_value`] byte for byte; the `debug_assert`
-/// in [`cbor_encode`] enforces that on every debug run rather than trusting it.
-fn encoded_len(value: &CborValue) -> usize {
-    match value {
-        CborValue::Unsigned(value) => argument_len(*value),
-        CborValue::Negative(value) => argument_len(value.argument()),
-        CborValue::Bytes(bytes) => argument_len(bytes.len() as u64) + bytes.len(),
-        CborValue::SharedBytes(bytes) => argument_len(bytes.len() as u64) + bytes.len(),
-        CborValue::Text(text) => argument_len(text.len() as u64) + text.len(),
-        CborValue::Array(values) => {
-            argument_len(values.len() as u64) + values.iter().map(encoded_len).sum::<usize>()
-        }
-        CborValue::Map(pairs) => {
-            argument_len(pairs.len() as u64)
-                + pairs
-                    .iter()
-                    .map(|(key, value)| {
-                        argument_len(key.len() as u64) + key.len() + encoded_len(value)
-                    })
-                    .sum::<usize>()
-        }
-        CborValue::Null | CborValue::Bool(_) => 1,
-    }
-}
-
-/// Decodes the strict CBOR subset used by this crate.
-///
-/// Maps must have unique text keys, nesting is bounded, unsupported simple and
-/// floating-point values are rejected, and the entire input must be consumed.
-///
-/// Byte strings come back as [`CborValue::Bytes`]. The reader itself produces
-/// [`CborValue::SharedBytes`] so leaf decoding can adopt that allocation instead
-/// of copying it, but that is an internal representation choice: letting it out
-/// through the public entry point would change the variant every downstream
-/// `match` has always seen, in exchange for a copy only the crate's own decode
-/// path is positioned to skip.
-pub fn cbor_decode(input: &[u8]) -> Result<CborValue> {
-    Ok(own_shared_bytes(cbor_decode_shared(input)?))
-}
-
-/// [`cbor_decode`], keeping the reader's shared byte strings.
-///
-/// Crate-internal on purpose: the only callers are the ones that hand the
-/// allocation straight to a leaf, which is the entire reason it exists.
-pub(crate) fn cbor_decode_shared(input: &[u8]) -> Result<CborValue> {
-    if input.len() > MAX_CBOR_INPUT_BYTES {
-        return Err(Error::InMemoryLimitExceeded {
-            resource: "CBOR input",
-            requested: input.len() as u64,
-            limit: MAX_CBOR_INPUT_BYTES as u64,
-        });
-    }
-    let mut reader = CborReader {
-        input,
-        cursor: 0,
-        remaining_nodes: MAX_CBOR_NODES,
-    };
-    let value = reader.read_value(0)?;
-    if reader.cursor != input.len() {
-        return Err(Error::InvalidCbor {
-            detail: "trailing bytes after the top-level value",
-        });
-    }
-    Ok(value)
-}
-
-/// Rewrites a freshly decoded tree so every byte string is owned.
-///
-/// This copies nothing for its intended caller: the tree was built by the line
-/// directly above, so every `Arc` is uniquely owned and `try_unwrap` moves the
-/// `Vec` out rather than duplicating it. The clone arm is unreachable from
-/// there and exists only so the function is total.
-fn own_shared_bytes(value: CborValue) -> CborValue {
-    match value {
-        CborValue::SharedBytes(bytes) => CborValue::Bytes(match Arc::try_unwrap(bytes) {
-            Ok(owned) => owned,
-            Err(shared) => shared.as_ref().clone(),
-        }),
-        CborValue::Array(values) => {
-            CborValue::Array(values.into_iter().map(own_shared_bytes).collect())
-        }
-        CborValue::Map(pairs) => CborValue::Map(
-            pairs
-                .into_iter()
-                .map(|(key, value)| (key, own_shared_bytes(value)))
-                .collect(),
-        ),
-        other => other,
-    }
-}
-
-struct CborReader<'a> {
-    input: &'a [u8],
-    cursor: usize,
-    remaining_nodes: usize,
-}
-
-impl CborReader<'_> {
-    fn read_value(&mut self, depth: usize) -> Result<CborValue> {
-        if depth > MAX_CBOR_DEPTH {
-            return Err(Error::InvalidCbor {
-                detail: "maximum nesting depth exceeded",
-            });
-        }
-        self.remaining_nodes = self
-            .remaining_nodes
-            .checked_sub(1)
-            .ok_or(Error::InvalidCbor {
-                detail: "maximum decoded node count exceeded",
-            })?;
-        let initial = self.read_byte()?;
-        let major = initial >> 5;
-        let additional = initial & 0x1f;
-        match major {
-            0 => Ok(CborValue::Unsigned(self.read_argument(additional)?)),
-            1 => Ok(CborValue::Negative(CborNegative {
-                argument: self.read_argument(additional)?,
-            })),
-            2 => {
-                let length = self.read_length(additional)?;
-                Ok(CborValue::SharedBytes(Arc::new(
-                    self.read_exact(length)?.to_vec(),
-                )))
-            }
-            3 => {
-                let length = self.read_length(additional)?;
-                let bytes = self.read_exact(length)?;
-                let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidCbor {
-                    detail: "text string is not valid UTF-8",
-                })?;
-                Ok(CborValue::Text(text.to_owned()))
-            }
-            4 => {
-                let length = self.read_collection_length(additional)?;
-                let mut values = Vec::new();
-                values
-                    .try_reserve(length.min(16))
-                    .map_err(|_| Error::AllocationFailed {
-                        resource: "CBOR array",
-                        requested: length as u64,
-                    })?;
-                for _ in 0..length {
-                    values.push(self.read_value(depth + 1)?);
-                }
-                Ok(CborValue::Array(values))
-            }
-            5 => {
-                let length = self.read_collection_length(additional)?;
-                let mut pairs = Vec::new();
-                pairs
-                    .try_reserve(length.min(16))
-                    .map_err(|_| Error::AllocationFailed {
-                        resource: "CBOR map",
-                        requested: length as u64,
-                    })?;
-                let mut keys = BTreeSet::new();
-                for _ in 0..length {
-                    let key = match self.read_value(depth + 1)? {
-                        CborValue::Text(key) => key,
-                        _ => {
-                            return Err(Error::InvalidCbor {
-                                detail: "map key is not a text string",
-                            });
-                        }
-                    };
-                    if !keys.insert(key.clone()) {
-                        return Err(Error::DuplicateKey { key });
-                    }
-                    let value = self.read_value(depth + 1)?;
-                    pairs.push((key, value));
-                }
-                Ok(CborValue::Map(pairs))
-            }
-            7 => match additional {
-                20 => Ok(CborValue::Bool(false)),
-                21 => Ok(CborValue::Bool(true)),
-                22 => Ok(CborValue::Null),
-                _ => Err(Error::InvalidCbor {
-                    detail: "unsupported simple or floating-point value",
-                }),
-            },
-            _ => Err(Error::InvalidCbor {
-                detail: "unsupported CBOR major type",
-            }),
-        }
-    }
-
-    fn read_argument(&mut self, additional: u8) -> Result<u64> {
-        let value = match additional {
-            0..=23 => return Ok(u64::from(additional)),
-            24 => u64::from(self.read_byte()?),
-            25 => {
-                let mut bytes = [0_u8; 2];
-                bytes.copy_from_slice(self.read_exact(2)?);
-                u64::from(u16::from_be_bytes(bytes))
-            }
-            26 => {
-                let mut bytes = [0_u8; 4];
-                bytes.copy_from_slice(self.read_exact(4)?);
-                u64::from(u32::from_be_bytes(bytes))
-            }
-            27 => {
-                let mut bytes = [0_u8; 8];
-                bytes.copy_from_slice(self.read_exact(8)?);
-                u64::from_be_bytes(bytes)
-            }
-            _ => {
-                return Err(Error::InvalidCbor {
-                    detail: "indefinite or reserved argument encoding",
-                })
-            }
-        };
-        let minimum = match additional {
-            24 => 24,
-            25 => 1 << 8,
-            26 => 1 << 16,
-            27 => 1 << 32,
-            _ => unreachable!(),
-        };
-        if value < minimum {
-            return Err(Error::InvalidCbor {
-                detail: "non-canonical argument width",
-            });
-        }
-        Ok(value)
-    }
-
-    fn read_length(&mut self, additional: u8) -> Result<usize> {
-        let length = self.read_argument(additional)?;
-        usize::try_from(length).map_err(|_| Error::InvalidCbor {
-            detail: "byte string length exceeds usize",
-        })
-    }
-
-    fn read_collection_length(&mut self, additional: u8) -> Result<usize> {
-        let length = self.read_argument(additional)?;
-        if length > MAX_CBOR_COLLECTION_ITEMS {
-            return Err(Error::InvalidCbor {
-                detail: "maximum collection item count exceeded",
-            });
-        }
-        usize::try_from(length).map_err(|_| Error::InvalidCbor {
-            detail: "collection length exceeds usize",
-        })
-    }
-
-    fn read_byte(&mut self) -> Result<u8> {
-        let byte = self
-            .input
-            .get(self.cursor)
-            .copied()
-            .ok_or(Error::InvalidCbor {
-                detail: "truncated input",
-            })?;
-        self.cursor += 1;
-        Ok(byte)
-    }
-
-    fn read_exact(&mut self, length: usize) -> Result<&[u8]> {
-        let end = self.cursor.checked_add(length).ok_or(Error::InvalidCbor {
-            detail: "length overflow",
-        })?;
-        let bytes = self.input.get(self.cursor..end).ok_or(Error::InvalidCbor {
-            detail: "declared length exceeds input",
-        })?;
-        self.cursor = end;
-        Ok(bytes)
-    }
-}
-
-#[cfg(test)]
-mod cbor_decoder_bound_tests {
-    use super::*;
-
-    #[test]
-    fn decoder_rejects_oversized_collections_and_noncanonical_arguments() {
-        let oversized_array = [0x9a, 0x00, 0x01, 0x00, 0x01];
-        assert!(cbor_decode(&oversized_array).is_err());
-        assert!(cbor_decode(&[0x18, 0x17]).is_err());
-    }
-
-    #[test]
-    fn decoder_rejects_excessive_depth_and_aggregate_nodes() {
-        let mut nested = vec![0x81; MAX_CBOR_DEPTH + 1];
-        nested.push(0xf6);
-        assert!(cbor_decode(&nested).is_err());
-
-        let mut nodes = vec![0x82, 0x9a, 0x00, 0x01, 0x00, 0x00];
-        nodes.extend(std::iter::repeat_n(0xf6, 65_536));
-        nodes.extend_from_slice(&[0x9a, 0x00, 0x01, 0x00, 0x00]);
-        nodes.extend(std::iter::repeat_n(0xf6, 65_536));
-        assert!(cbor_decode(&nodes).is_err());
-    }
-}
-
-fn encode_value(value: &CborValue, output: &mut Vec<u8>) {
-    match value {
-        CborValue::Unsigned(value) => encode_argument(0, *value, output),
-        CborValue::Negative(value) => encode_argument(1, value.argument(), output),
-        CborValue::Bytes(bytes) => {
-            encode_argument(2, bytes.len() as u64, output);
-            output.extend_from_slice(bytes);
-        }
-        // Same major type and same bytes as `Bytes`; only the ownership of the
-        // source differs, so the wire output is identical either way.
-        CborValue::SharedBytes(bytes) => {
-            encode_argument(2, bytes.len() as u64, output);
-            output.extend_from_slice(bytes);
-        }
-        CborValue::Text(text) => {
-            encode_argument(3, text.len() as u64, output);
-            output.extend_from_slice(text.as_bytes());
-        }
-        CborValue::Array(values) => {
-            encode_argument(4, values.len() as u64, output);
-            for value in values {
-                encode_value(value, output);
-            }
-        }
-        CborValue::Map(pairs) => {
-            encode_argument(5, pairs.len() as u64, output);
-            for (key, value) in pairs {
-                // Written in place on purpose. Wrapping the key in a temporary
-                // `CborValue::Text` clones the String once per key, per map, per
-                // encode -- thousands of pointless allocations for bytes that are
-                // already sitting right here.
-                encode_argument(3, key.len() as u64, output);
-                output.extend_from_slice(key.as_bytes());
-                encode_value(value, output);
-            }
-        }
-        CborValue::Null => output.push(0xf6),
-        CborValue::Bool(false) => output.push(0xf4),
-        CborValue::Bool(true) => output.push(0xf5),
-    }
-}
-
-fn encode_argument(major: u8, value: u64, output: &mut Vec<u8>) {
-    let prefix = major << 5;
-    match value {
-        0..=23 => output.push(prefix | value as u8),
-        24..=255 => {
-            output.push(prefix | 24);
-            output.push(value as u8);
-        }
-        256..=65_535 => {
-            output.push(prefix | 25);
-            output.extend_from_slice(&(value as u16).to_be_bytes());
-        }
-        65_536..=4_294_967_295 => {
-            output.push(prefix | 26);
-            output.extend_from_slice(&(value as u32).to_be_bytes());
-        }
-        _ => {
-            output.push(prefix | 27);
-            output.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-}
-
-pub fn base32_lower(input: &[u8]) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
+/// Lowercase base32 with no padding.
+pub(crate) fn base32_lower(input: &[u8]) -> String {
     let mut output = String::with_capacity((input.len() * 8).div_ceil(5));
     let mut accumulator = 0_u32;
     let mut bits = 0_u8;
@@ -667,6 +32,8 @@ pub fn base32_lower(input: &[u8]) -> String {
     output
 }
 
+/// Reads lowercase base32 with no padding. A letter outside the alphabet is an
+/// error, and so are bits left over that are not zero.
 pub(crate) fn base32_lower_decode(input: &str) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(input.len() * 5 / 8);
     let mut accumulator = 0_u32;
@@ -691,149 +58,75 @@ pub(crate) fn base32_lower_decode(input: &str) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-pub(crate) fn base64_standard(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let first = chunk[0];
-        let second = chunk.get(1).copied().unwrap_or(0);
-        let third = chunk.get(2).copied().unwrap_or(0);
-        output.push(ALPHABET[(first >> 2) as usize] as char);
-        output.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            output.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
-        } else {
-            output.push('=');
-        }
-        if chunk.len() > 2 {
-            output.push(ALPHABET[(third & 0x3f) as usize] as char);
-        } else {
-            output.push('=');
-        }
+pub(crate) fn hex_lower(input: &[u8]) -> String {
+    let mut output = String::with_capacity(input.len() * 2);
+    for &byte in input {
+        output.push(HEX_ALPHABET[usize::from(byte >> 4)] as char);
+        output.push(HEX_ALPHABET[usize::from(byte & 0x0f)] as char);
     }
     output
 }
 
-pub(crate) fn base64_standard_decode(input: &str) -> Result<Vec<u8>> {
-    if input.len() % 4 != 0 {
-        return Err(Error::InvalidBase64);
+/// Reads lowercase hex into `output`, which it must fill exactly.
+pub(crate) fn hex_lower_decode(input: &str, output: &mut [u8]) -> Result<()> {
+    let input = input.as_bytes();
+    if input.len() != output.len() * 2 {
+        return Err(Error::InvalidHex);
     }
-    let mut output = Vec::with_capacity(input.len() / 4 * 3);
-    let bytes = input.as_bytes();
-    for (quartet_index, quartet) in bytes.chunks_exact(4).enumerate() {
-        let last = quartet_index + 1 == bytes.len() / 4;
-        let a = base64_value(quartet[0])?;
-        let b = base64_value(quartet[1])?;
-        let c = if quartet[2] == b'=' {
-            64
-        } else {
-            base64_value(quartet[2])?
-        };
-        let d = if quartet[3] == b'=' {
-            64
-        } else {
-            base64_value(quartet[3])?
-        };
-        if a == 64
-            || b == 64
-            || c == 64 && d != 64
-            || d == 64 && !last
-            || c == 64 && b & 0x0f != 0
-            || d == 64 && c != 64 && c & 0x03 != 0
-        {
-            return Err(Error::InvalidBase64);
-        }
-        output.push((a << 2) | (b >> 4));
-        if c != 64 {
-            output.push((b << 4) | (c >> 2));
-        }
-        if d != 64 {
-            output.push((c << 6) | d);
-        }
+    for (slot, pair) in output.iter_mut().zip(input.chunks_exact(2)) {
+        *slot = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }
-    Ok(output)
+    Ok(())
 }
 
-fn base64_value(byte: u8) -> Result<u8> {
+fn hex_value(byte: u8) -> Result<u8> {
     match byte {
-        b'A'..=b'Z' => Ok(byte - b'A'),
-        b'a'..=b'z' => Ok(byte - b'a' + 26),
-        b'0'..=b'9' => Ok(byte - b'0' + 52),
-        b'+' => Ok(62),
-        b'/' => Ok(63),
-        _ => Err(Error::InvalidBase64),
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(Error::InvalidHex),
     }
 }
 
-pub fn base58_btc(input: &[u8]) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
-    let leading_zeroes = input.iter().take_while(|&&byte| byte == 0).count();
-    let mut digits: Vec<u8> = Vec::new();
-    for &byte in &input[leading_zeroes..] {
-        let mut carry = u32::from(byte);
-        for digit in &mut digits {
-            let value = u32::from(*digit) * 256 + carry;
-            *digit = (value % 58) as u8;
-            carry = value / 58;
-        }
-        while carry != 0 {
-            digits.push((carry % 58) as u8);
-            carry /= 58;
-        }
-    }
-    let mut output = String::with_capacity(leading_zeroes + digits.len());
-    output.extend(std::iter::repeat_n('1', leading_zeroes));
-    for digit in digits.iter().rev() {
-        output.push(BASE58_ALPHABET[*digit as usize] as char);
-    }
-    output
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub fn encode_varint(mut value: u64) -> Vec<u8> {
-    let mut output = Vec::with_capacity(10);
-    while value >= 0x80 {
-        output.push((value as u8 & 0x7f) | 0x80);
-        value >>= 7;
+    #[test]
+    fn base32_reads_back_what_it_writes_at_every_length() {
+        let bytes: Vec<u8> = (0_u16..64).map(|value| (value * 37 % 251) as u8).collect();
+        for length in 0..bytes.len() {
+            let text = base32_lower(&bytes[..length]);
+            assert_eq!(base32_lower_decode(&text).unwrap(), &bytes[..length]);
+        }
+        assert_eq!(base32_lower(b"foobar"), "mzxw6ytboi");
     }
-    output.push(value as u8);
-    output
-}
 
-pub fn decode_varint(input: &[u8]) -> Result<(u64, usize)> {
-    let mut value = 0_u64;
-    for (index, &byte) in input.iter().enumerate() {
-        if index == 9 && (byte & 0xfe) != 0 {
-            return Err(Error::VarintOverflow);
+    #[test]
+    fn base32_refuses_other_letters_and_leftover_bits() {
+        for text in ["MZXW6", "mzxw1", "mzxw=", "mz xw", "mzxw6ytbo1"] {
+            assert!(base32_lower_decode(text).is_err(), "{text:?}");
         }
-        let shift = (index * 7) as u32;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok((value, index + 1));
-        }
-        if index == 9 {
-            return Err(Error::VarintOverflow);
+        // "my" is one byte and two bits that are zero; "mz" leaves a bit set.
+        assert_eq!(base32_lower_decode("my").unwrap(), [0x66]);
+        assert_eq!(base32_lower(&[0x66]), "my");
+        assert!(base32_lower_decode("mz").is_err());
+    }
+
+    #[test]
+    fn hex_reads_back_what_it_writes_and_refuses_the_rest() {
+        let bytes = [0x00, 0x01, 0x7f, 0x80, 0xab, 0xff];
+        let text = hex_lower(&bytes);
+        assert_eq!(text, "00017f80abff");
+        let mut back = [0_u8; 6];
+        hex_lower_decode(&text, &mut back).unwrap();
+        assert_eq!(back, bytes);
+        for text in [
+            "00017F80ABFF",
+            "00017f80abf",
+            "00017f80abfff",
+            "00017f80abfg",
+        ] {
+            assert!(hex_lower_decode(text, &mut back).is_err(), "{text:?}");
         }
     }
-    Err(Error::TruncatedVarint)
-}
-
-pub fn sha256(input: &[u8]) -> [u8; 32] {
-    Sha256::digest(input).into()
-}
-
-pub(crate) fn cid_bytes_for_cbor(input: &[u8]) -> [u8; 36] {
-    let digest = sha256(input);
-    let mut bytes = [0_u8; 36];
-    bytes[..4].copy_from_slice(&[0x01, 0x51, 0x12, 0x20]);
-    bytes[4..].copy_from_slice(&digest);
-    bytes
-}
-
-pub(crate) fn cid_text(bytes: &[u8; 36]) -> String {
-    let mut output = String::with_capacity(59);
-    output.push('b');
-    output.push_str(&base32_lower(bytes));
-    output
 }

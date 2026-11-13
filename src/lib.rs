@@ -1,23 +1,58 @@
 #![forbid(unsafe_code)]
-#![doc = "The authoritative Scionic Merkle Tree implementation."]
+//! Scionic Merkle trees.
+//!
+//! A tree holds a folder of files, or one file, under one root hash. A file is
+//! a list of pieces, a folder is a list of names, and the root covers all of
+//! it. Identical pieces, files and folders have identical hashes wherever they
+//! are, so a store keeps each of them once. A sender can show a part of a tree
+//! without the rest: one name in a folder, one piece of a file, or a stretch of
+//! a file's bytes.
+//!
+//! `spec/FORMAT.md` in this repository says exactly what each hash covers.
 
-mod classic;
-mod dag;
-pub mod diff;
-pub mod encoding;
+mod build;
+mod diff;
+mod encoding;
 mod fastcdc;
-mod operations;
-mod serialization;
+mod format;
+mod hash;
+mod intake;
+mod read;
 mod store;
-mod transmission;
+mod sync;
 pub mod tree;
+mod wire;
 
-pub use classic::{ClassicMerkleTree, Digest, MerkleProof};
-pub use dag::*;
-pub use diff::*;
-pub use fastcdc::*;
-pub use store::*;
-pub use transmission::*;
+pub use build::{build, build_with, BuildOptions, Builder, EntryExtra, Links};
+pub use diff::{diff, Change};
+pub use fastcdc::{
+    FASTCDC_GEAR_SEED_PREFIX, FASTCDC_LOOSE_MASK, FASTCDC_MAX_SIZE, FASTCDC_MIN_SIZE,
+    FASTCDC_STRICT_MASK, FASTCDC_TARGET_SIZE,
+};
+pub use format::{
+    check_name, file_hash, folder_hash, Cutting, Entry, ExtraData, FileList, FileRun, FolderList,
+    FolderRun, Kind, OpenFile, OpenFolder, PieceRef, Record, Target, Totals, CUTTING_FASTCDC_V1,
+    CUTTING_KEY, LIST_ITEM_BYTES, MAX_CARRIED_NODES, MAX_ENTRY_BYTES, MAX_EXTRA_BYTES,
+    MAX_EXTRA_NAME_BYTES, MAX_EXTRA_VALUES, MAX_EXTRA_VALUE_BYTES, MAX_FOLDER_DEPTH,
+    MAX_NAME_BYTES, MAX_PIECE_BYTES, MAX_RECORD_BYTES, TIMESTAMP_KEY,
+};
+pub use hash::{Hash, Root};
+pub use intake::{verify, verify_with, Accepted, Arrived, Intake, Summary, VerifyOptions};
+pub use read::{
+    file_of, folder_of, lookup, read_file, read_file_to_vec, read_range, record_of, unwritable,
+    unwritable_on_windows, write_to_disk,
+};
+pub use store::{MemoryStore, Store, Stored};
+pub use sync::{
+    export, fetch, import, serve, Entries, Peer, Remote, Responder, StreamPeer,
+    REQUESTS_AHEAD_BYTES,
+};
+pub use wire::{
+    file_list_frame, file_run_frame, folder_list_frame, folder_run_frame, have_frame, piece_frame,
+    read_frame, refused_frame, write_frame, Frame, HaveMap, Refusal, Request, BUNDLE_MAGIC,
+    FRAME_FILE_LIST, FRAME_FILE_RUN, FRAME_FOLDER_LIST, FRAME_FOLDER_RUN, FRAME_HAVE, FRAME_PIECE,
+    FRAME_RECORD, FRAME_REFUSED, MAX_REQUEST_BYTES,
+};
 
 use std::fmt;
 use std::io;
@@ -28,155 +63,84 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// The file system refused something.
     Io {
         operation: &'static str,
         path: PathBuf,
         source: io::Error,
     },
-    InvalidChunkSize {
-        value: usize,
+    /// Reading from a stream or writing to one failed.
+    Stream {
+        operation: &'static str,
+        source: io::Error,
     },
-    InvalidCborNegative {
-        value: i64,
-    },
-    InvalidCbor {
-        detail: &'static str,
-    },
-    InvalidJson {
-        detail: String,
-    },
-    InvalidBase32,
-    InvalidBase64,
-    InvalidCid {
-        value: String,
-    },
-    InvalidLeafType {
-        value: String,
-    },
+    /// Bytes that are not a well-formed thing of the format.
     InvalidData {
         detail: String,
     },
-    DuplicateKey {
-        key: String,
+    InvalidBase32,
+    InvalidHex,
+    /// Text that is not a root.
+    InvalidRoot {
+        value: String,
     },
-    InvalidMerkleLeafCount {
-        count: usize,
+    /// A name that the format does not allow.
+    InvalidName {
+        name: String,
+        reason: &'static str,
     },
-    MerklePathTooDeep {
-        depth: usize,
+    /// A thing does not hash to what it has to.
+    HashMismatch {
+        what: &'static str,
     },
-    MissingMerkleKey {
-        key: String,
+    /// A thing does not have the size it has to.
+    SizeMismatch {
+        what: &'static str,
+        expected: u64,
+        actual: u64,
     },
-    TruncatedVarint,
-    VarintOverflow,
-    ProofVerificationFailed,
-    MissingFileName {
+    /// A record's totals are not those of its tree.
+    TotalsMismatch {
+        field: &'static str,
+        recorded: u64,
+        counted: u64,
+    },
+    /// An intake was used again after a part of its tree was refused.
+    IntakeFailed,
+    /// Something arrived that is not tied to the root, or was not asked for.
+    NotWanted {
+        what: &'static str,
+    },
+    /// A store does not hold something that the tree needs.
+    Missing {
+        what: &'static str,
+        hash: Hash,
+    },
+    /// Folders sit inside one another more deeply than the format allows.
+    TooDeep {
+        limit: usize,
+    },
+    /// A name that this system cannot hold as it is.
+    UnwritableName {
+        name: String,
+        reason: &'static str,
+    },
+    /// A link or a special file, where only files and folders are stored.
+    UnsupportedEntry {
         path: PathBuf,
+        what: &'static str,
     },
     NonUtf8FileName {
         path: PathBuf,
     },
-    MissingRoot,
-    MissingLeaf {
-        cid: String,
+    /// A peer could not answer, or stopped early.
+    Peer {
+        detail: String,
     },
-    LeafCidMismatch {
-        cid: String,
-    },
-    CidKeyMismatch {
-        key: String,
-        cid: String,
-    },
-    MissingContentHash {
-        cid: String,
-    },
-    ContentHashMismatch {
-        cid: String,
-    },
-    ContentSizeMismatch {
-        stored: u64,
-        calculated: u64,
-    },
-    DagSizeMismatch {
-        stored: u64,
-        calculated: u64,
-    },
-    LinkCountMismatch {
-        cid: String,
-        expected: usize,
-        actual: usize,
-    },
-    ClassicRootMismatch {
-        cid: String,
-    },
-    ParentMissingLink {
-        parent: String,
-        child: String,
-    },
-    UnreachableLeaves {
-        count: usize,
-    },
-    EmptyPartialRequest,
-    MissingRequestedLeaf {
-        cid: String,
-    },
-    BrokenPathToRoot {
-        cid: String,
-    },
-    IncompletePartialDag {
-        cid: String,
-        expected: usize,
-        present: usize,
-    },
-    MissingProof {
-        parent: String,
-        child: String,
-    },
-    MissingTransmissionRelationship {
-        child: String,
-    },
-    UnavailableTransmissionParent {
-        parent: String,
-        child: String,
-    },
-    ConflictingTransmissionRoot {
-        expected: String,
-        received: String,
-    },
-    ProofKeyMismatch {
-        key: String,
-        child: String,
-    },
-    IncompleteProofSource {
-        parent: String,
-        child: String,
-    },
-    CycleDetected {
-        cid: String,
-    },
-    LabelsNotCalculated,
-    InvalidLabelRange {
-        start: usize,
-        end: usize,
-    },
-    LabelNotFound {
-        label: String,
-    },
-    NoAddedLeaves,
-    MissingNewRoot,
-    NoDiffRoot,
-    AmbiguousDiffRoot,
-    MissingPoolLeaf {
-        cid: String,
-    },
-    UnsafeItemName {
-        name: String,
-    },
-    InMemoryLimitExceeded {
-        resource: &'static str,
-        requested: u64,
+    LimitExceeded {
+        what: &'static str,
         limit: u64,
+        requested: u64,
     },
     AllocationFailed {
         resource: &'static str,
@@ -199,125 +163,56 @@ impl fmt::Display for Error {
                 path,
                 source,
             } => write!(f, "failed to {operation} {}: {source}", path.display()),
-            Self::InvalidChunkSize { value } => write!(f, "invalid chunk size {value}"),
-            Self::InvalidCborNegative { value } => {
-                write!(f, "CBOR negative integer must be below zero, got {value}")
+            Self::Stream { operation, source } => write!(f, "failed to {operation}: {source}"),
+            Self::InvalidData { detail } => write!(f, "malformed: {detail}"),
+            Self::InvalidBase32 => f.write_str("not lowercase base32"),
+            Self::InvalidHex => f.write_str("not lowercase hex of the right length"),
+            Self::InvalidRoot { value } => write!(f, "not a root: {value:?}"),
+            Self::InvalidName { name, reason } => {
+                write!(f, "the name {name:?} is not allowed: {reason}")
             }
-            Self::InvalidCbor { detail } => write!(f, "invalid CBOR: {detail}"),
-            Self::InvalidJson { detail } => write!(f, "invalid JSON: {detail}"),
-            Self::InvalidBase32 => f.write_str("invalid base32lower value"),
-            Self::InvalidBase64 => f.write_str("invalid standard padded base64 value"),
-            Self::InvalidCid { value } => write!(f, "invalid Scionic CID: {value:?}"),
-            Self::InvalidLeafType { value } => write!(f, "invalid leaf type: {value:?}"),
-            Self::InvalidData { detail } => write!(f, "invalid DAG data: {detail}"),
-            Self::DuplicateKey { key } => write!(f, "duplicate map key: {key:?}"),
-            Self::InvalidMerkleLeafCount { count } => write!(
+            Self::HashMismatch { what } => write!(f, "{what} does not hash to what it has to"),
+            Self::SizeMismatch {
+                what,
+                expected,
+                actual,
+            } => write!(f, "{what} holds {actual} bytes where {expected} are due"),
+            Self::TotalsMismatch {
+                field,
+                recorded,
+                counted,
+            } => write!(
                 f,
-                "classic Merkle trees require at least two leaves, got {count}"
+                "the record says {recorded} for {field}, and the tree has {counted}"
             ),
-            Self::MerklePathTooDeep { depth } => write!(
-                f,
-                "Merkle proof depth {depth} exceeds the u32 path capacity"
+            Self::IntakeFailed => f.write_str(
+                "an intake is done once a part of its tree was refused: start a new one",
             ),
-            Self::MissingMerkleKey { key } => write!(f, "Merkle key not found: {key}"),
-            Self::TruncatedVarint => f.write_str("truncated unsigned varint"),
-            Self::VarintOverflow => f.write_str("unsigned varint overflows u64"),
-            Self::ProofVerificationFailed => f.write_str("Merkle proof verification failed"),
-            Self::MissingFileName { path } => {
-                write!(f, "path has no file name: {}", path.display())
+            Self::NotWanted { what } => {
+                write!(f, "{what} is not tied to the root, or was not asked for")
             }
+            Self::Missing { what, hash } => write!(f, "{what} {hash} is not held"),
+            Self::TooDeep { limit } => {
+                write!(f, "folders sit inside one another more than {limit} deep")
+            }
+            Self::UnwritableName { name, reason } => write!(
+                f,
+                "the name {name:?} cannot be written on this system: {reason}"
+            ),
+            Self::UnsupportedEntry { path, what } => write!(
+                f,
+                "{} is {what}, and only files and folders are stored",
+                path.display()
+            ),
             Self::NonUtf8FileName { path } => {
                 write!(f, "path has a non-UTF-8 file name: {}", path.display())
             }
-            Self::MissingRoot => f.write_str("DAG root leaf is missing"),
-            Self::MissingLeaf { cid } => write!(f, "DAG is missing linked leaf {cid}"),
-            Self::LeafCidMismatch { cid } => write!(f, "leaf CID does not match its identity: {cid}"),
-            Self::CidKeyMismatch { key, cid } => {
-                write!(f, "leaf map key {key} does not match embedded CID {cid}")
-            }
-            Self::MissingContentHash { cid } => {
-                write!(f, "leaf {cid} has content but no content hash")
-            }
-            Self::ContentHashMismatch { cid } => {
-                write!(f, "leaf {cid} content does not match its content hash")
-            }
-            Self::ContentSizeMismatch { stored, calculated } => write!(
-                f,
-                "content size mismatch: stored {stored}, calculated {calculated}"
-            ),
-            Self::DagSizeMismatch { stored, calculated } => write!(
-                f,
-                "DAG size mismatch: stored {stored}, calculated {calculated}"
-            ),
-            Self::LinkCountMismatch {
-                cid,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "leaf {cid} has {actual} links but declares {expected}"
-            ),
-            Self::ClassicRootMismatch { cid } => {
-                write!(f, "classic Merkle root mismatch for leaf {cid}")
-            }
-            Self::ParentMissingLink { parent, child } => {
-                write!(f, "parent {parent} does not link child {child}")
-            }
-            Self::UnreachableLeaves { count } => {
-                write!(f, "DAG contains {count} unreachable leaves")
-            }
-            Self::EmptyPartialRequest => f.write_str("partial DAG request is empty"),
-            Self::MissingRequestedLeaf { cid } => write!(f, "requested leaf not found: {cid}"),
-            Self::BrokenPathToRoot { cid } => write!(f, "broken path to root for leaf {cid}"),
-            Self::IncompletePartialDag {
-                cid,
-                expected,
-                present,
-            } => write!(
-                f,
-                "leaf {cid} declares {expected} links but only {present} children are stored and it carries no proofs"
-            ),
-            Self::MissingProof { parent, child } => {
-                write!(f, "parent {parent} has no proof for child {child}")
-            }
-            Self::MissingTransmissionRelationship { child } => {
-                write!(f, "transmission packet has no relationship for child {child}")
-            }
-            Self::UnavailableTransmissionParent { parent, child } => write!(
-                f,
-                "transmission parent {parent} is unavailable for child {child}"
-            ),
-            Self::ConflictingTransmissionRoot { expected, received } => write!(
-                f,
-                "transmission root {received} conflicts with expected root {expected}"
-            ),
-            Self::ProofKeyMismatch { key, child } => {
-                write!(f, "stored proof key {key} does not match proof child {child}")
-            }
-            Self::IncompleteProofSource { parent, child } => write!(
-                f,
-                "cannot build proof for child {child} from incomplete parent {parent}"
-            ),
-            Self::CycleDetected { cid } => write!(f, "cycle detected at leaf {cid}"),
-            Self::LabelsNotCalculated => f.write_str("labels have not been calculated"),
-            Self::InvalidLabelRange { start, end } => {
-                write!(f, "invalid inclusive label range {start}..={end}")
-            }
-            Self::LabelNotFound { label } => write!(f, "label not found: {label}"),
-            Self::NoAddedLeaves => f.write_str("diff contains no added leaves"),
-            Self::MissingNewRoot => f.write_str("new leaves contain no root-shaped leaf"),
-            Self::NoDiffRoot => f.write_str("diff contains no new root candidate"),
-            Self::AmbiguousDiffRoot => f.write_str("diff contains several new root candidates"),
-            Self::MissingPoolLeaf { cid } => write!(f, "diff leaf pool is missing {cid}"),
-            Self::UnsafeItemName { name } => write!(f, "unsafe DAG item name: {name:?}"),
-            Self::InMemoryLimitExceeded {
-                resource,
-                requested,
+            Self::Peer { detail } => write!(f, "the peer {detail}"),
+            Self::LimitExceeded {
+                what,
                 limit,
-            } => write!(
-                f,
-                "{resource} requires {requested} bytes, exceeding the {limit}-byte in-memory limit"
-            ),
+                requested,
+            } => write!(f, "{what} needs {requested}, over the limit of {limit}"),
             Self::AllocationFailed {
                 resource,
                 requested,
@@ -334,7 +229,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::Stream { source, .. } => Some(source),
             _ => None,
         }
     }

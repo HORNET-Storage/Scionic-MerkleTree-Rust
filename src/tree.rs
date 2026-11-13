@@ -21,7 +21,7 @@
 //! the count does not exist. Forks are hashed from a mark of their own, so a
 //! fork cannot be shown as a leaf.
 
-use crate::classic::Digest;
+use crate::hash::Hash;
 use crate::{Error, Result};
 use sha2::{Digest as _, Sha256};
 
@@ -43,13 +43,13 @@ pub enum ListKind {
 /// A node of a list's tree: its hash, and the bytes of file content under it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Node {
-    pub hash: Digest,
+    pub hash: Hash,
     pub size: u64,
 }
 
 /// What an empty list has in place of a tree.
 pub const EMPTY_LIST: Node = Node {
-    hash: [0; 32],
+    hash: Hash::ZERO,
     size: 0,
 };
 
@@ -109,17 +109,17 @@ fn fork(
         ListKind::File => FILE_FORK,
         ListKind::Folder => FOLDER_FORK,
     }]);
-    hasher.update(left.hash);
+    hasher.update(left.hash.as_bytes());
     hasher.update(left.size.to_be_bytes());
     hasher.update(left_items.to_be_bytes());
-    hasher.update(right.hash);
+    hasher.update(right.hash.as_bytes());
     hasher.update(right.size.to_be_bytes());
     hasher.update(right_items.to_be_bytes());
     if kind == ListKind::Folder {
         hasher.update(right_first_name);
     }
     Ok(Node {
-        hash: hasher.finalize().into(),
+        hash: Hash::from_bytes(hasher.finalize().into()),
         size,
     })
 }
@@ -184,21 +184,25 @@ fn top_unchecked(kind: ListKind, leaves: &[Leaf<'_>]) -> Result<Node> {
     Ok(top.0)
 }
 
-/// A list's tree kept whole, for showing parts of it.
-pub struct ListTree<'a> {
+/// A list's tree kept whole, for showing parts of it. It keeps its own copy of
+/// the leaves, and of the names in a folder's list.
+#[derive(Clone, Debug)]
+pub struct ListTree {
     kind: ListKind,
-    leaves: &'a [Leaf<'a>],
+    leaves: Vec<Node>,
+    /// A folder's names, in the list's order. Empty for a file's list.
+    names: Vec<Box<[u8]>>,
     /// `levels[j]` holds, in order, the nodes over `2^(j + 1)` items each.
     levels: Vec<Vec<Node>>,
 }
 
-impl<'a> ListTree<'a> {
-    pub fn build(kind: ListKind, leaves: &'a [Leaf<'a>]) -> Result<Self> {
+impl ListTree {
+    pub fn build(kind: ListKind, leaves: &[Leaf<'_>]) -> Result<Self> {
         check_list(kind, leaves)?;
         Self::build_unchecked(kind, leaves)
     }
 
-    fn build_unchecked(kind: ListKind, leaves: &'a [Leaf<'a>]) -> Result<Self> {
+    fn build_unchecked(kind: ListKind, leaves: &[Leaf<'_>]) -> Result<Self> {
         let mut levels: Vec<Vec<Node>> = Vec::new();
         let mut below_width = 1_usize;
         loop {
@@ -221,9 +225,21 @@ impl<'a> ListTree<'a> {
         }
         Ok(Self {
             kind,
-            leaves,
+            leaves: leaves.iter().map(|leaf| leaf.node).collect(),
+            names: match kind {
+                ListKind::File => Vec::new(),
+                ListKind::Folder => leaves.iter().map(|leaf| leaf.name.into()).collect(),
+            },
             levels,
         })
+    }
+
+    /// The name of the entry at `index`. A file's list has none.
+    fn name(&self, index: usize) -> &[u8] {
+        match self.kind {
+            ListKind::File => &[],
+            ListKind::Folder => &self.names[index],
+        }
     }
 
     /// How many items the list holds.
@@ -248,7 +264,7 @@ impl<'a> ListTree<'a> {
             debug_assert_eq!(offset % width, 0);
             let level = width.trailing_zeros() as usize;
             return Ok(if level == 0 {
-                self.leaves[offset].node
+                self.leaves[offset]
             } else {
                 self.levels[level - 1][offset >> level]
             });
@@ -262,7 +278,7 @@ impl<'a> ListTree<'a> {
             left_width as u64,
             right,
             (width - left_width) as u64,
-            self.leaves[offset + left_width].name,
+            self.name(offset + left_width),
         )
     }
 
@@ -296,10 +312,7 @@ impl<'a> ListTree<'a> {
         if after <= start || end <= offset {
             carried.push(Carried {
                 node: self.node(offset, width)?,
-                first_name: match self.kind {
-                    ListKind::File => Vec::new(),
-                    ListKind::Folder => self.leaves[offset].name.to_vec(),
-                },
+                first_name: self.name(offset).to_vec(),
             });
             return Ok(());
         }
@@ -482,14 +495,13 @@ impl<'a> Walk<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoding::sha256;
 
     /// A list for tests: each item's leaf, and its name.
     type Owned = Vec<(Node, Vec<u8>)>;
 
     fn leaf_node(seed: usize) -> Node {
         Node {
-            hash: sha256(&(seed as u64).to_be_bytes()),
+            hash: Hash::of(&(seed as u64).to_be_bytes()),
             size: (seed as u64 % 7) + 1,
         }
     }
@@ -569,15 +581,15 @@ mod tests {
         let left = leaf_node(1);
         let right = leaf_node(2);
         let mut bytes = vec![0x01];
-        bytes.extend_from_slice(&left.hash);
+        bytes.extend_from_slice(left.hash.as_bytes());
         bytes.extend_from_slice(&left.size.to_be_bytes());
         bytes.extend_from_slice(&4_u64.to_be_bytes());
-        bytes.extend_from_slice(&right.hash);
+        bytes.extend_from_slice(right.hash.as_bytes());
         bytes.extend_from_slice(&right.size.to_be_bytes());
         bytes.extend_from_slice(&3_u64.to_be_bytes());
         assert_eq!(bytes.len(), 97);
         let file = fork(ListKind::File, left, 4, right, 3, b"ignored").unwrap();
-        assert_eq!(file.hash, sha256(&bytes));
+        assert_eq!(file.hash, Hash::of(&bytes));
         assert_eq!(file.size, left.size + right.size);
         // The same two halves over another number of items are another fork.
         let other = fork(ListKind::File, left, 4, right, 2, b"ignored").unwrap();
@@ -586,7 +598,7 @@ mod tests {
         bytes[0] = 0x03;
         bytes.extend_from_slice(b"right-half");
         let folder = fork(ListKind::Folder, left, 4, right, 3, b"right-half").unwrap();
-        assert_eq!(folder.hash, sha256(&bytes));
+        assert_eq!(folder.hash, Hash::of(&bytes));
         assert_ne!(folder.hash, file.hash);
     }
 
