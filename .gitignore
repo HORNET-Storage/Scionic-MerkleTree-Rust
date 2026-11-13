@@ -14,18 +14,6 @@
 *.dylib
 *.dll
 
-# Go tool binaries (`go build` output; named after their module dir). The
-# generated vectors under tests/vectors/ ARE committed - they are the oracle.
-/tools/gowirevectors/gowirevectors
-/tools/gowirevectors/gowirevectors.exe
-/tools/gobench/gobench
-/tools/gobench/gobench.exe
-
-# SwiftPM build output for the Swift benchmark harness. Package.resolved IS
-# committed, for the same reason gobench's go.sum is: a benchmark whose
-# dependency versions float is not reproducible.
-/tools/swiftbench/.build/
-
 # Benchmark corpus, if generated in-tree rather than under a temp dir.
 /bench-corpus/
 

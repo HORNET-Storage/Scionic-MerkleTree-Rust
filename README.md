@@ -71,6 +71,12 @@ if let Some(entry) = remote.lookup("weights/model.safetensors")? {
 
 `export` and `import` carry a whole tree as one stream, for a file or a pipe. `diff` lists what changed between two trees. `Intake` is the piece under all of them, for a caller that brings its own transport: give it frames, and it says what to ask for next.
 
+`examples/roundtrip.rs` takes a folder the whole way round with a store on disk: it builds the tree, checks it, fetches it into a second store, reads a stretch from the middle of its largest file, writes it out again, and holds the copy to the same root. It prints how long each step took. Its store keeps each thing as a file named by its hash, and shows what a store has to do.
+
+```sh
+cargo run --release --example roundtrip -- <folder> <work-dir>
+```
+
 ## What it guards against
 
 The tests under `tests/` hold the library to these, with forged bytes made by a second copy of the format's rules (`tests/support/oracle.rs`):
