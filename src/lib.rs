@@ -10,6 +10,7 @@ mod operations;
 mod serialization;
 mod store;
 mod transmission;
+pub mod tree;
 
 pub use classic::{ClassicMerkleTree, Digest, MerkleProof};
 pub use dag::*;
