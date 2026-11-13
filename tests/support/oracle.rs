@@ -169,7 +169,8 @@ impl Leaves {
 
     /// The nodes to carry when items `start` up to `end` are shown: one for
     /// each run that is left out, in the order a checker meets them, each
-    /// with the first name under it.
+    /// with the first name under it. The node that begins the list has no
+    /// name: it is in no right half, so no fork hashes one for it.
     pub fn carried(&self, start: usize, end: usize) -> Vec<(Node, Vec<u8>)> {
         let mut out = Vec::new();
         self.collect(0, self.nodes.len(), start, end, &mut out);
@@ -185,7 +186,12 @@ impl Leaves {
         out: &mut Vec<(Node, Vec<u8>)>,
     ) {
         if offset + width <= start || end <= offset {
-            out.push((self.node(offset, width), self.first_name(offset).to_vec()));
+            let name = if offset == 0 {
+                Vec::new()
+            } else {
+                self.first_name(offset).to_vec()
+            };
+            out.push((self.node(offset, width), name));
         } else if width > 1 {
             let half = left_half(width);
             self.collect(offset, half, start, end, out);

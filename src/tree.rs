@@ -62,7 +62,13 @@ pub struct Leaf<'a> {
 }
 
 /// A node sent in place of the items under it. In a folder's tree it comes
-/// with the first name under it.
+/// with the first name under it, which the fork above it hashes as the first
+/// name of its right half.
+///
+/// One carried node is in no right half: the one that begins with the list's
+/// first item. No hash covers a name for it, so it has none, and a checker
+/// takes none. That way every byte of an opening is covered by the hash it is
+/// held against.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Carried {
     pub node: Node,
@@ -310,9 +316,16 @@ impl ListTree {
     ) -> Result<()> {
         let after = offset + width;
         if after <= start || end <= offset {
+            // The node that begins the list is in no right half, and so has
+            // no name that a fork hashes.
+            let first_name = if offset == 0 {
+                Vec::new()
+            } else {
+                self.name(offset).to_vec()
+            };
             carried.push(Carried {
                 node: self.node(offset, width)?,
-                first_name: self.name(offset).to_vec(),
+                first_name,
             });
             return Ok(());
         }
@@ -432,6 +445,15 @@ impl<'a> Walk<'a> {
                 .carried
                 .next()
                 .ok_or_else(|| invalid("an opening carries fewer nodes than it needs"))?;
+            // In a folder's tree, the node that begins the list has no name,
+            // and every other carried node has one: see `Carried`.
+            if self.kind == ListKind::Folder && (offset == 0) != carried.first_name.is_empty() {
+                return Err(invalid(if offset == 0 {
+                    "the carried node that begins a folder's list has a name"
+                } else {
+                    "a carried node of a folder's tree has no name"
+                }));
+            }
             if after <= self.start {
                 self.before = self
                     .before
@@ -938,5 +960,46 @@ mod tests {
         let mut carried = tree.open(0, 1).unwrap();
         carried[0].first_name = b"x".to_vec();
         assert!(check_opening(ListKind::File, 4, 0, &leaves[..1], &carried).is_err());
+    }
+
+    #[test]
+    fn the_carried_node_that_begins_a_folders_list_has_no_name() {
+        // A fork hashes the first name of its right half. The node that begins
+        // the list is in no right half, so nothing would cover a name for it:
+        // it has none, and one that comes with a name is refused. Every other
+        // carried node has the name its fork hashes, and no other.
+        for count in 2..=20_usize {
+            let owned = sorted_folder(count);
+            let leaves = leaves(&owned);
+            let tree = ListTree::build(ListKind::Folder, &leaves).unwrap();
+            let top = tree.top().unwrap();
+            for start in 0..count {
+                for end in start + 1..=count {
+                    let carried = tree.open(start as u64, end as u64).unwrap();
+                    let rebuilds = |carried: &[Carried]| {
+                        check_opening(
+                            ListKind::Folder,
+                            count as u64,
+                            start as u64,
+                            &leaves[start..end],
+                            carried,
+                        )
+                        .is_ok_and(|shown| shown.top == top)
+                    };
+                    assert!(rebuilds(&carried), "{count}: {start}..{end}");
+                    for (index, node) in carried.iter().enumerate() {
+                        let what = format!("{count}: {start}..{end}, carried node {index}");
+                        let begins_the_list = index == 0 && start > 0;
+                        assert_eq!(node.first_name.is_empty(), begins_the_list, "{what}");
+                        let mut renamed = carried.clone();
+                        renamed[index].first_name = b"name-9999".to_vec();
+                        assert!(!rebuilds(&renamed), "{what}, under another name");
+                        let mut nameless = carried.clone();
+                        nameless[index].first_name.clear();
+                        assert_eq!(rebuilds(&nameless), begins_the_list, "{what}, nameless");
+                    }
+                }
+            }
+        }
     }
 }

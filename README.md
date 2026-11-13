@@ -118,10 +118,10 @@ A folder's entries are sorted by name, and every fork of the folder's Merkle tre
 
 | Entries in the folder | The whole folder listing | A Scionic branch | Smaller by |
 | ---: | ---: | ---: | ---: |
-| 10 | 610 bytes | 316 bytes | **2x** |
-| 1,000 | 61 KB | 664 bytes | **92x** |
-| 10,000 | 610 KB | 896 bytes | **681x** |
-| 1,000,000 | 61 MB | 1,244 bytes | **49,000x** |
+| 10 | 610 bytes | 300 bytes | **2x** |
+| 1,000 | 61 KB | 648 bytes | **94x** |
+| 10,000 | 610 KB | 880 bytes | **693x** |
+| 1,000,000 | 61 MB | 1,228 bytes | **50,000x** |
 
 **One chunk out of a file**, proven by its number:
 
@@ -432,6 +432,7 @@ A receiver trusts one thing: the root. The peer that sends a tree, the network i
 - **No forged content.** A made-up child under a folder or a file, a real child's branch offered with another child, a file offered as a folder, a list offered as a chunk, and a file given another file's chunks are all refused.
 - **No short files.** A file never comes back shorter than it is. If a chunk is missing, reading is an error.
 - **One name, one place.** A folder cannot show one name at two places, even if it was put together out of order on purpose.
+- **Every byte of a branch counts.** A branch that differs in any one byte is refused, so no two branches prove the same thing.
 - **Nothing is kept before it is verified.** A frame that nothing asked for is refused and not kept. A list that fails a check is not kept either, and that transfer takes nothing more.
 
 **What is bounded**
@@ -470,7 +471,7 @@ The exact rules are in [`spec/FORMAT.md`](spec/FORMAT.md), under "What a receive
 ## Specification and Test Vectors
 
 - [`spec/FORMAT.md`](spec/FORMAT.md) is the format: what every hash covers, what a receiver checks, the bytes of every request and answer, and the limits.
-- [`spec/vectors/manifest.json`](spec/vectors/manifest.json) holds the shared vectors, which this crate makes and every implementation is held to, byte for byte: 7 whole trees with every one of their bytes, 9 branches of them, 8 lookups of a name, 12 requests with their answers, 3 exchanges on a connection, and 74 forged inputs that must be refused. [`spec/vectors/README.md`](spec/vectors/README.md) says how another library reads the file.
+- [`spec/vectors/manifest.json`](spec/vectors/manifest.json) holds the shared vectors, which this crate makes and every implementation is held to, byte for byte: 7 whole trees with every one of their bytes, 9 branches of them, 8 lookups of a name, 12 requests with their answers, 3 exchanges on a connection, and 76 forged inputs that must be refused. [`spec/vectors/README.md`](spec/vectors/README.md) says how another library reads the file.
 - [`spec/fastcdc-vectors/manifest.json`](spec/fastcdc-vectors/manifest.json) pins where 11 files are chunked, and what each file hashes to.
 
 ## Other Implementations

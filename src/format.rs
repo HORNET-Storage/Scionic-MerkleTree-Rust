@@ -1230,14 +1230,25 @@ impl FolderRun {
             entries.push(Entry::decode(&mut reader)?);
         }
         let mut carried = Vec::new();
-        for _ in 0..carried_count(&mut reader)? {
+        for index in 0..carried_count(&mut reader)? {
             let node = Node {
                 hash: reader.hash()?,
                 size: reader.u64()?,
             };
             let name_len = usize::from(reader.u16()?);
-            if name_len == 0 || name_len > MAX_NAME_BYTES {
-                return Err(invalid("a carried name is not 1 to 255 bytes"));
+            // The first carried node of a run that does not start the list
+            // is the node that begins the list. No fork hashes a name for
+            // it, so it comes with none. Every other one comes with a name.
+            let begins_the_list = index == 0 && start > 0;
+            if begins_the_list != (name_len == 0) {
+                return Err(invalid(if begins_the_list {
+                    "the carried node that begins a folder's list has a name"
+                } else {
+                    "a carried node of a folder's list has no name"
+                }));
+            }
+            if name_len > MAX_NAME_BYTES {
+                return Err(invalid("a carried name is longer than 255 bytes"));
             }
             carried.push(Carried {
                 node,

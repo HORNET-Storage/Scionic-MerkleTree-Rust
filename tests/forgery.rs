@@ -102,6 +102,60 @@ fn any_changed_byte_of_any_frame_is_refused() {
 }
 
 #[test]
+fn every_byte_of_a_run_is_covered_by_the_hash_it_is_held_against() {
+    // A run shows a part of a list, and carries nodes for the rest. If one of
+    // its bytes could change and the run still pass, two different runs would
+    // show the same thing, and that byte would be nobody's to vouch for. So
+    // every byte of every run of a list of nine is changed here, one at a
+    // time, in its lowest bit and in its highest.
+    let store = MemoryStore::new();
+    let mut builder = Builder::new(&store, small_pieces());
+    let file = builder.file_from_bytes(&bytes("covered", 9 * 16)).unwrap();
+    let entries: Vec<Entry> = (0..9)
+        .map(|index| entry(&format!("n{index:02}"), file))
+        .collect();
+    let folder = builder.folder(entries).unwrap();
+    let file_list = file_of(&store, &file).unwrap();
+    let folder_list = folder_of(&store, &folder).unwrap();
+    assert_eq!((file_list.count(), folder_list.count()), (9, 9));
+    fn each_change(run: &[u8], what: &str, taken: impl Fn(&[u8]) -> bool) {
+        assert!(taken(run), "{what}: as it was made");
+        for at in 0..run.len() {
+            for bit in [0x01, 0x80] {
+                let mut changed = run.to_vec();
+                changed[at] ^= bit;
+                assert!(!taken(&changed), "{what}: byte {at} of {}", run.len());
+            }
+        }
+    }
+    for start in 0..9_u64 {
+        for end in start + 1..=9 {
+            let run = folder_list.open(start, end).unwrap().encode();
+            each_change(&run, &format!("entries {start}..{end}"), |bytes| {
+                FolderRun::decode(bytes)
+                    .and_then(|run| run.check(&folder))
+                    .is_ok()
+            });
+            let run = file_list.open(start, end).unwrap().encode();
+            each_change(&run, &format!("pieces {start}..{end}"), |bytes| {
+                FileRun::decode(bytes)
+                    .and_then(|run| run.check(&file, None))
+                    .is_ok()
+            });
+        }
+    }
+    // The answer to a name is a run too, whether the name is there or not.
+    for name in ["n00", "n04", "n08", "a", "n04x", "z"] {
+        let answer = folder_list.open_name(name).unwrap().encode();
+        each_change(&answer, &format!("the answer for {name:?}"), |bytes| {
+            FolderRun::decode(bytes)
+                .and_then(|run| run.check_name(&folder, name).map(|_| ()))
+                .is_ok()
+        });
+    }
+}
+
+#[test]
 fn a_made_up_child_under_a_folder_or_a_file_is_refused() {
     let (_temp, source, root) = sample_tree("forge-child");
     let weights = target_at(&source, &root, "weights");

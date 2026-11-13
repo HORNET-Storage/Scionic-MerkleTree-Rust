@@ -835,6 +835,36 @@ fn manifest() -> Json {
         &top,
         &[0; 22],
     );
+    // A fork hashes the first name of its right half. The carried node that
+    // begins the list is in no right half: it comes with no name, and every
+    // other carried node comes with one.
+    let first_name_at = 20 + top_list.entries()[2].encoded_len() + 2 + 40;
+    assert_eq!(shown[first_name_at..first_name_at + 2], [0, 0]);
+    let mut named = shown.clone();
+    named.splice(first_name_at..first_name_at + 2, [0, 1, b'a']);
+    refused.folder_run(
+        "a name for the carried node that begins the list",
+        &top,
+        &named,
+    );
+    let from_the_start = top_list.open(0, 1).unwrap().encode();
+    FolderRun::decode(&from_the_start)
+        .unwrap()
+        .check(&top)
+        .unwrap();
+    let name_at = 20 + top_list.entries()[0].encoded_len() + 2 + 40;
+    let name_len = usize::from(u16::from_be_bytes([
+        from_the_start[name_at],
+        from_the_start[name_at + 1],
+    ]));
+    assert!(name_len > 0);
+    let mut nameless = from_the_start.clone();
+    nameless.splice(name_at..name_at + 2 + name_len, [0, 0]);
+    refused.folder_run(
+        "no name for a carried node that is not the one that begins the list",
+        &top,
+        &nameless,
+    );
     let for_readme = top_list.open_name("readme.txt").unwrap().encode();
     refused.folder_name(
         "the entry of one name as the answer for another",
