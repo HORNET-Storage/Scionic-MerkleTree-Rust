@@ -6,6 +6,8 @@
 
 We've designed a [new type of Merkle DAG/Merkle Tree hybrid](https://www.hornet.storage/) known as the Scionic Merkle Tree. Scionic Merkle Trees contain small branches like Classic Merkle Trees, the folder storage support of Merkle DAGs, and numbered file chunks, so anyone can sync a file by its hash and request the range of chunk numbers they are missing. Scionic Sync is the name of the simple protocol used to request a range of a file's chunk numbers in order to retrieve a batch of missing file chunks. Identical chunks, files and folders have identical hashes wherever they appear, so each one is stored once and sent once.
 
+![Comparison of Many Merklized Forms. Numbered chunks and Negentropy symbiosis: Scionic Merkle Trees only. Folder storage support: IPFS Merkle DAGs and Scionic Merkle Trees. Chunked parent leaves: Scionic Merkle Trees and Classic Merkle Trees.](docs/pictures/merklized-forms.png)
+
 This repository is the **Rust implementation**, at **version 2.5.6**. It is the reference for the Scionic tree format, which is specified in [`spec/FORMAT.md`](spec/FORMAT.md). The Go and Swift libraries are held to it by the shared test vectors under [`spec/`](spec).
 
 ```mermaid
@@ -114,6 +116,14 @@ If a user wants to download a specific file chunk within a Scionic Merkle Tree, 
 ### One Place for Every Name
 
 A folder's entries are sorted by name, and every fork of the folder's Merkle tree records the name at which its right half begins. A name can therefore sit in exactly one place. One branch proves that a name is in a folder and what it holds, and the same kind of branch proves that a name is *not* in the folder. A publisher cannot show one file under a name to a reviewer and a different file under the same name to everyone else.
+
+### Scionic Merkle Tree
+
+![Scionic Merkle Tree: the root is the hash of the record, which names the folder on top. Each folder lists its entries by name and each file lists its chunks by number, and a Classic Merkle tree inside each one covers its list.](docs/pictures/scionic-merkle-tree.png)
+
+### Scionic Merkle Branch
+
+![Scionic Merkle Branch: one chunk of a file, proven against the root. Each folder and file on the way shows one item of its list with a few hashes beside it, and the rest of the tree is never sent.](docs/pictures/scionic-merkle-branch.png)
 
 ## Scionic Merkle Branch Statistics
 
