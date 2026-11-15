@@ -1208,9 +1208,9 @@ const CHUNK_BYTES_BY_EACH: usize = 1 << 20;
 /// so that several threads hash and keep them at once. They are held one
 /// after another in one stretch of memory, which serves one batch after
 /// another: memory that is used again costs much less than fresh memory,
-/// which a system has to find and clear first. A batch takes no more memory
-/// than its frames do, whatever the lengths of the frames of the batches
-/// before it.
+/// which a system has to find and clear first. It holds room for one batch
+/// and the frame that ends it, and no more, whatever the lengths of the
+/// frames of the batches before.
 pub(crate) struct ChunkFrames {
     /// The frames that are held, and after them the frame that was read
     /// last, until it is held or taken out.
@@ -1472,7 +1472,7 @@ mod tests {
     use crate::store::MemoryStore;
 
     #[test]
-    fn a_batch_of_chunk_frames_takes_no_more_memory_than_its_frames() {
+    fn chunk_frames_take_no_more_memory_than_one_batch_needs() {
         // In each batch a long frame comes after short ones, at another place
         // each time. Memory that each place kept for the longest frame it
         // held would come to all of them: 128 MiB.
