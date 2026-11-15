@@ -143,7 +143,8 @@ impl<'s> Builder<'s> {
     /// zero is one thread for each core. They find where its chunks end, and
     /// hash and keep them; for a file that is read, while the calling thread
     /// reads on. With help, a builder holds up to 64 MiB of a long file that
-    /// it reads at a time; alone it holds up to 16 MiB.
+    /// it reads at a time; alone it holds up to 16 MiB. When the tree is
+    /// finished, they look in the store for the chunks of its long lists.
     pub fn threads(mut self, threads: usize) -> Self {
         self.helpers = Helpers::for_threads(threads);
         self
@@ -256,8 +257,12 @@ impl<'s> Builder<'s> {
     /// ones a tree goes through when it is taken in, and the totals in the
     /// record are what those checks counted.
     pub fn finish(self, top: Target, extra: ExtraData) -> Result<Root> {
-        let totals = Intake::measure(self.store, top, self.chunking)?;
-        let record = Record::new(top, totals, self.chunking, extra)?;
+        // The tree is measured with this builder's threads: the helpers that
+        // are free look in the store for the chunks of a long list.
+        let helping = self.helpers.take(usize::MAX);
+        let totals = Intake::measure(self.store, top, self.chunking, helping + 1);
+        self.helpers.give(helping);
+        let record = Record::new(top, totals?, self.chunking, extra)?;
         let bytes = record.encode();
         let root = Root::of_record(&bytes);
         self.store.put(Stored::Record, root.as_hash(), &bytes)?;

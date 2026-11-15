@@ -23,7 +23,7 @@ use crate::format::{
 };
 use crate::hash::{Hash, Root};
 use crate::store::{lent, load_record, missing, Store, Stored};
-use crate::threads::on_threads;
+use crate::threads::{cores, on_threads};
 use crate::wire::{
     read_next_onto, Next, Request, FRAME_CHUNK, FRAME_FILE_LIST, FRAME_FOLDER_LIST, FRAME_RECORD,
 };
@@ -35,6 +35,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// The most chunks one request asks for.
 const CHUNKS_PER_REQUEST: u32 = 64;
+
+/// How many chunks one thread looks for in a store before another thread
+/// helps. A store on disk looks at a file for each, which takes tens of
+/// microseconds, and handing work to another thread takes about one.
+const LOOKS_BY_EACH: usize = 64;
 
 fn invalid(detail: &str) -> Error {
     Error::InvalidData {
@@ -100,7 +105,8 @@ impl VerifyOptions {
         self
     }
 
-    /// How many chunks are hashed at once. Zero is one for each core.
+    /// How many threads check the tree at once: they hash its chunks, and look
+    /// in the store for the chunks of a long list. Zero is one for each core.
     pub fn workers(mut self, workers: usize) -> Self {
         self.workers = workers;
         self
@@ -113,6 +119,9 @@ struct Mode {
     rechunk: bool,
     /// Remove from the store what is damaged there, and want it again.
     discard: bool,
+    /// How many threads look in the store at once for the chunks of a list.
+    /// Zero is one for each core.
+    threads: usize,
 }
 
 struct FolderSlot {
@@ -228,8 +237,18 @@ impl<'s> Intake<'s> {
     /// different chunk and each different list, once. The store must hold
     /// every list. This is how a builder comes by a record's totals, so a
     /// tree that is built has passed the checks of a tree that is taken in.
-    pub(crate) fn measure(store: &'s dyn Store, top: Target, chunking: Chunking) -> Result<Totals> {
-        let mut intake = Self::bare(store, Root::from_hash(Hash::ZERO), Mode::default());
+    /// Up to `threads` threads look in the store at once.
+    pub(crate) fn measure(
+        store: &'s dyn Store,
+        top: Target,
+        chunking: Chunking,
+        threads: usize,
+    ) -> Result<Totals> {
+        let mode = Mode {
+            threads,
+            ..Mode::default()
+        };
+        let mut intake = Self::bare(store, Root::from_hash(Hash::ZERO), mode);
         intake.measuring = Some(chunking);
         intake.refer(top)?;
         intake.drain()?;
@@ -363,6 +382,35 @@ impl<'s> Intake<'s> {
         } else {
             Err(Error::Corrupt { what, hash: *hash })
         }
+    }
+
+    /// Whether the store holds the chunk of each of `items`, in their order:
+    /// asked on several threads at once where there are enough of them to
+    /// share.
+    fn held_of(&self, items: &[(u64, &ChunkRef)]) -> Vec<Result<bool>> {
+        let threads = match self.mode.threads {
+            0 => cores(),
+            threads => threads,
+        };
+        let workers = (items.len() / LOOKS_BY_EACH).clamp(1, threads);
+        if workers == 1 {
+            return items.iter().map(|(_, item)| self.holds(item)).collect();
+        }
+        let next = AtomicUsize::new(0);
+        let work = || {
+            let mut found = Vec::new();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((_, item)) = items.get(index) else {
+                    return found;
+                };
+                found.push((index, self.holds(item)));
+            }
+        };
+        let mut found: Vec<(usize, Result<bool>)> =
+            on_threads(workers, &work).into_iter().flatten().collect();
+        found.sort_unstable_by_key(|(index, _)| *index);
+        found.into_iter().map(|(_, held)| held).collect()
     }
 
     /// Whether the store holds the chunk that `item` names. The chunk's
@@ -598,19 +646,44 @@ impl<'s> Intake<'s> {
         let order = slot.order;
         self.wanted_lists.remove(&order);
         self.count_list_bytes(list.encoded_len())?;
+        // The chunks that this list names for the first time are counted in
+        // their order, up to the first that is wrong.
+        let mut first: HashMap<Hash, u32> = HashMap::new();
+        let mut fresh: Vec<(u64, &ChunkRef)> = Vec::new();
+        let mut wrong = None;
         for (number, item) in (0_u64..).zip(list.items()) {
-            if let Some(slot) = self.chunks.get(&item.hash) {
-                if slot.length != item.length {
-                    return Err(Error::SizeMismatch {
+            let known = self
+                .chunks
+                .get(&item.hash)
+                .map(|slot| slot.length)
+                .or_else(|| first.get(&item.hash).copied());
+            if let Some(length) = known {
+                if length != item.length {
+                    wrong = Some(Error::SizeMismatch {
                         what: "a chunk that is listed with two lengths",
-                        expected: u64::from(slot.length),
+                        expected: u64::from(length),
                         actual: u64::from(item.length),
                     });
+                    break;
                 }
                 continue;
             }
-            self.count_chunk(item.length)?;
-            let held = self.holds(item)?;
+            if let Err(error) = self.count_chunk(item.length) {
+                wrong = Some(error);
+                break;
+            }
+            first.insert(item.hash, item.length);
+            fresh.push((number, item));
+        }
+        // Whether the store holds each of them is asked on several threads
+        // at once: a store on disk looks at a file for each, and a list can
+        // name a great many. Only the chunks before the first that is wrong
+        // are asked about, and the answers are taken in their order, so the
+        // error is that of the first chunk that is wrong, as it would be if
+        // each were asked about in turn.
+        let held = self.held_of(&fresh);
+        for ((number, item), held) in fresh.into_iter().zip(held) {
+            let held = held?;
             let wanted_at = (!held).then_some((order, number));
             if let Some(at) = wanted_at {
                 self.wanted_chunks.insert(at, item.hash);
@@ -622,6 +695,9 @@ impl<'s> Intake<'s> {
                     wanted_at,
                 },
             );
+        }
+        if let Some(error) = wrong {
+            return Err(error);
         }
         if self.mode.rechunk && chunking == Chunking::FastCdcV1 {
             self.to_rechunk.push(*list.hash());
@@ -1437,6 +1513,7 @@ pub fn verify_with(store: &dyn Store, root: &Root, options: VerifyOptions) -> Re
     let mode = Mode {
         rechunk: options.rechunk,
         discard: options.discard,
+        threads: options.workers,
     };
     let mut intake = Intake::with_mode(store, *root, mode)?;
     intake.rehash_held(options.workers)?;

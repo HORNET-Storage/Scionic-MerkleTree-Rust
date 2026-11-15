@@ -8,10 +8,13 @@ use scionic_merkletree::{
     Builder, ChunkRef, Chunking, Error, ExtraData, Hash, Intake, MemoryStore, Refusal, Request,
     Responder, Result, Root, Store, Stored, VerifyOptions, BUNDLE_MAGIC, FRAME_CHUNK,
 };
+use std::collections::HashSet;
 use std::io::{self, Read};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
+use std::time::{Duration, Instant};
 use support::{
     bytes, contents, sample_folder, small_chunks, small_options, write, TempDir, TestPeer,
 };
@@ -391,6 +394,158 @@ fn a_store_that_falls_over_while_it_keeps_a_chunk_leaves_the_intake_done() {
         import(&Falling(MemoryStore::new()), &root, &mut bundle.as_slice())
     }));
     assert!(fell.is_err());
+}
+
+/// A store that takes a while to look for a thing, as one on disk does, and
+/// cannot tell whether it holds the things it is told of.
+struct Slow {
+    inner: MemoryStore,
+    unsure: Vec<(Hash, &'static str)>,
+}
+
+impl Store for Slow {
+    fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
+        self.inner.put(kind, hash, bytes)
+    }
+
+    fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>> {
+        self.inner.get(kind, hash)
+    }
+
+    fn remove(&self, kind: Stored, hash: &Hash) -> Result<()> {
+        self.inner.remove(kind, hash)
+    }
+
+    fn size(&self, kind: Stored, hash: &Hash) -> Result<Option<u64>> {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_micros(20) {
+            std::hint::spin_loop();
+        }
+        match self.unsure.iter().find(|(unsure, _)| unsure == hash) {
+            Some(&(_, detail)) => Err(Error::Invariant { detail }),
+            None => self.inner.size(kind, hash),
+        }
+    }
+}
+
+/// A tree of one file of a thousand short chunks, enough that whether a
+/// store holds each is asked on several threads at once, and its chunks.
+fn many_chunks(seed: u64) -> (MemoryStore, Root, Vec<Vec<u8>>) {
+    let data = long_bytes(seed, 16 * 1000);
+    let store = MemoryStore::new();
+    let mut builder = Builder::new(&store, Chunking::fixed(16).unwrap());
+    let top = builder.file_from_bytes(&data).unwrap();
+    let root = builder.finish(top, ExtraData::new()).unwrap();
+    (store, root, data.chunks(16).map(<[u8]>::to_vec).collect())
+}
+
+/// A store that holds what `source` holds, but for its chunks.
+fn lists_of(source: &MemoryStore) -> MemoryStore {
+    let store = MemoryStore::new();
+    for (kind, hash, bytes) in contents(source) {
+        if kind != Stored::Chunk {
+            store.put(kind, &hash, &bytes).unwrap();
+        }
+    }
+    store
+}
+
+#[test]
+fn what_a_store_holds_of_a_long_list_is_found_as_one_thread_finds_it() {
+    let (source, root, chunks) = many_chunks(11);
+    // The store holds the record, the list and two chunks in three, and one
+    // of those it holds cut short: damaged.
+    let store = Slow {
+        inner: lists_of(&source),
+        unsure: Vec::new(),
+    };
+    let mut lacking = 0;
+    for (number, chunk) in chunks.iter().enumerate() {
+        let hash = Hash::of(chunk);
+        if number % 3 == 0 {
+            lacking += 1;
+        } else if number == 500 {
+            store.inner.put(Stored::Chunk, &hash, &chunk[1..]).unwrap();
+        } else {
+            store.inner.put(Stored::Chunk, &hash, chunk).unwrap();
+        }
+    }
+    let intake = Intake::new(&store, root).unwrap();
+    assert_eq!(intake.outstanding(), lacking + 1);
+    // What it wants is what it lacks: once that is fetched, the tree is whole.
+    fetch(&store, &root, &mut TestPeer::new(&source)).unwrap();
+    assert_eq!(contents(&store.inner), contents(&source));
+}
+
+#[test]
+fn the_failure_told_of_a_long_list_is_that_of_its_first_chunk_that_fails() {
+    let (source, root, chunks) = many_chunks(13);
+    let store = Slow {
+        inner: lists_of(&source),
+        unsure: vec![
+            (Hash::of(&chunks[900]), "the second chunk it cannot tell of"),
+            (Hash::of(&chunks[100]), "the first chunk it cannot tell of"),
+        ],
+    };
+    let result = Intake::new(&store, root).map(|_| ());
+    assert!(
+        matches!(
+            result,
+            Err(Error::Invariant {
+                detail: "the first chunk it cannot tell of"
+            })
+        ),
+        "{result:?}"
+    );
+}
+
+/// A store that notes every thread that asks it anything.
+#[derive(Default)]
+struct Watched {
+    inner: MemoryStore,
+    threads: Mutex<HashSet<ThreadId>>,
+}
+
+impl Watched {
+    fn note(&self) {
+        let thread = std::thread::current().id();
+        self.threads.lock().unwrap().insert(thread);
+    }
+}
+
+impl Store for Watched {
+    fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
+        self.note();
+        self.inner.put(kind, hash, bytes)
+    }
+
+    fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>> {
+        self.note();
+        self.inner.get(kind, hash)
+    }
+
+    fn remove(&self, kind: Stored, hash: &Hash) -> Result<()> {
+        self.note();
+        self.inner.remove(kind, hash)
+    }
+
+    fn size(&self, kind: Stored, hash: &Hash) -> Result<Option<u64>> {
+        self.note();
+        self.inner.size(kind, hash)
+    }
+}
+
+#[test]
+fn a_build_and_a_check_asked_for_one_thread_use_one_thread() {
+    // A long list, whose chunks would be looked for on several threads.
+    let data = long_bytes(19, 16 * 1000);
+    let store = Watched::default();
+    let mut builder = Builder::new(&store, Chunking::fixed(16).unwrap()).threads(1);
+    let top = builder.file_from_bytes(&data).unwrap();
+    let root = builder.finish(top, ExtraData::new()).unwrap();
+    verify_with(&store, &root, VerifyOptions::new().workers(1)).unwrap();
+    let here = std::thread::current().id();
+    assert_eq!(*store.threads.lock().unwrap(), HashSet::from([here]));
 }
 
 /// A store that holds what `source` holds, with the chunk `hash` damaged:
