@@ -154,7 +154,8 @@ fn a_responder_can_keep_to_itself_which_chunks_it_holds() {
 /// request to the next. What it sends is the chunk that was asked for and
 /// nothing of a longer one before it, and a frame that is lent out is never
 /// filled again: a request that is answered inside the answer to another is
-/// given a frame of its own.
+/// given a frame of its own. Otherwise the frame is filled again in the same
+/// memory.
 #[test]
 fn a_frame_that_is_filled_again_holds_the_chunk_asked_for_alone() {
     let store = MemoryStore::new();
@@ -192,6 +193,21 @@ fn a_frame_that_is_filled_again_holds_the_chunk_asked_for_alone() {
         .unwrap();
     assert_eq!(Frame::decode(&outer).unwrap(), Frame::Chunk(&long));
     assert_eq!(Frame::decode(&inner).unwrap(), Frame::Chunk(&short));
+
+    // Otherwise the frame is filled again in the same memory.
+    let place = |chunk: &[u8]| {
+        let mut at = std::ptr::null();
+        responder
+            .answer(&ask(chunk), &mut |frame| {
+                at = frame.as_ptr();
+                Ok(())
+            })
+            .unwrap();
+        at
+    };
+    let first = place(&long);
+    assert_eq!(place(&short), first);
+    assert_eq!(place(&long), first);
 }
 
 #[test]
