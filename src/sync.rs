@@ -209,6 +209,10 @@ pub struct Responder<'s> {
     folders: Mutex<Recent<OpenFolder>>,
     /// The frame that the last chunk was sent in, filled again for the next.
     frame: Mutex<Vec<u8>>,
+    /// Reads the chunks of an answer ahead of sending them, into frames
+    /// that are filled again for the next answer.
+    ahead: Mutex<ChunksAhead>,
+    threads: usize,
     recent: u64,
     have: bool,
 }
@@ -234,6 +238,8 @@ impl<'s> Responder<'s> {
             files: Mutex::new(Recent::new()),
             folders: Mutex::new(Recent::new()),
             frame: Mutex::new(Vec::new()),
+            ahead: Mutex::new(ChunksAhead::new()),
+            threads: 0,
             recent: RECENT_ITEMS,
             have: true,
         }
@@ -256,6 +262,20 @@ impl<'s> Responder<'s> {
     /// such a request as it does for a file it does not hold.
     pub fn have(mut self, on: bool) -> Self {
         self.have = on;
+        self
+    }
+
+    /// How many threads read the chunks of one answer from the store, ahead
+    /// of sending them: 1 is the thread that answers alone, and zero, the
+    /// default, is one for each core. Several are worth it when reading a
+    /// chunk takes longer than sending it, as from a disk to a fast
+    /// receiver. With several, a responder keeps up to 64 MiB of memory
+    /// between answers, to read the chunks of the next one into. A responder
+    /// that serves many peers at once may give each answer one thread, which
+    /// keeps memory for one chunk.
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self.ahead = Mutex::new(ChunksAhead::with_threads(threads));
         self
     }
 
@@ -334,6 +354,18 @@ impl<'s> Responder<'s> {
             // thread left in it when it panicked is ever sent.
             Err(TryLockError::Poisoned(poisoned)) => with(&mut poisoned.into_inner()),
             Err(TryLockError::WouldBlock) => with(&mut Vec::new()),
+        }
+    }
+
+    /// Hands `with` what reads the chunks of an answer ahead of sending
+    /// them. As with [`Responder::with_frame`], a thread that finds it in use
+    /// is given one of its own.
+    fn with_ahead(&self, with: impl FnOnce(&mut ChunksAhead) -> Result<()>) -> Result<()> {
+        match self.ahead.try_lock() {
+            Ok(mut kept) => with(&mut kept),
+            // Each frame is filled from its start each time.
+            Err(TryLockError::Poisoned(poisoned)) => with(&mut poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => with(&mut ChunksAhead::with_threads(self.threads)),
         }
     }
 
@@ -428,20 +460,15 @@ impl<'s> Responder<'s> {
                     return on_frame(&out_of_range);
                 }
                 let count = u64::from(count).min(MAX_CHUNKS_PER_ANSWER) as usize;
-                // A frame is lent to `on_frame` for the call only: the next chunk
-                // is filled into it.
-                self.with_frame(|frame| {
-                    for item in list.items()[start as usize..].iter().take(count) {
-                        let held = lent(self.store, Stored::Chunk, &item.hash, &mut |bytes| {
-                            refill(frame, bytes);
-                            Ok(())
-                        })?;
-                        if !held {
-                            return on_frame(&not_held);
-                        }
-                        on_frame(frame.as_slice())?;
-                    }
-                    Ok(())
+                let items = &list.items()[start as usize..];
+                let items = &items[..count.min(items.len())];
+                // The chunks are read ahead, several at once, and sent in
+                // their order. A frame is lent to `on_frame` for the call
+                // only: the next chunk is read into it.
+                self.with_ahead(|ahead| {
+                    ahead.frames(self.store, items, &mut |frame| {
+                        on_frame(frame.unwrap_or(not_held.as_slice()))
+                    })
                 })
             }
             Request::Have(file) => {

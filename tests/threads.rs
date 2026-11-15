@@ -4,9 +4,9 @@
 mod support;
 
 use scionic_merkletree::{
-    build, export, fetch, import, read_file, read_range, record_of, verify_with, Builder, ChunkRef,
-    Chunking, Error, ExtraData, Hash, Intake, MemoryStore, Request, Result, Root, Store, Stored,
-    VerifyOptions, BUNDLE_MAGIC, FRAME_CHUNK,
+    build, export, fetch, import, read_file, read_range, record_of, refused_frame, verify_with,
+    Builder, ChunkRef, Chunking, Error, ExtraData, Hash, Intake, MemoryStore, Refusal, Request,
+    Responder, Result, Root, Store, Stored, VerifyOptions, BUNDLE_MAGIC, FRAME_CHUNK,
 };
 use std::io::{self, Read};
 use std::panic::AssertUnwindSafe;
@@ -706,4 +706,75 @@ fn a_store_that_falls_over_while_more_chunks_come_does_not_leave_a_fetch_waiting
         )
     }));
     assert!(fell.is_err());
+}
+
+/// The frames of a responder's answer to a request for chunks.
+fn chunks_answer(responder: &Responder, file: &Hash, start: u64) -> Vec<Vec<u8>> {
+    let request = Request::Chunks {
+        file: *file,
+        start,
+        count: 256,
+    }
+    .encode();
+    let mut frames = Vec::new();
+    responder
+        .answer(&request, &mut |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        })
+        .unwrap();
+    frames
+}
+
+#[test]
+fn a_responder_that_reads_chunks_ahead_answers_as_one_that_does_not() {
+    let (source, root, frames) = long_tree("threads-responder");
+    let chunks: Vec<Vec<u8>> = chunk_places(&frames)
+        .into_iter()
+        .map(|place| frames[place].clone())
+        .collect();
+    assert!(chunks.len() > 3, "several chunks");
+    let file = record_of(&source, &root).unwrap().top().hash;
+    let not_held = refused_frame(Refusal::NotHeld);
+    // The third chunk is not held: the answer is the two before it and a
+    // refusal, and nothing after.
+    let missing = damaged_copy(&source, &Hash::of(&chunks[2][1..]));
+    missing
+        .remove(Stored::Chunk, &Hash::of(&chunks[2][1..]))
+        .unwrap();
+    let mut cut_short = chunks[..2].to_vec();
+    cut_short.push(not_held.clone());
+    for threads in [1, 2, 0] {
+        let responder = Responder::new(&source).threads(threads);
+        assert!(
+            chunks_answer(&responder, &file, 0) == chunks,
+            "{threads} threads"
+        );
+        assert!(
+            chunks_answer(&responder, &file, 1) == chunks[1..],
+            "{threads} threads"
+        );
+        let responder = Responder::new(&missing).threads(threads);
+        assert!(
+            chunks_answer(&responder, &file, 0) == cut_short,
+            "{threads} threads"
+        );
+        assert!(
+            chunks_answer(&responder, &file, 2) == [not_held.clone()],
+            "{threads} threads"
+        );
+    }
+    // Several threads asking one responder at once are each answered whole.
+    let responder = Responder::new(&source);
+    std::thread::scope(|scope| {
+        for start in 0..4 {
+            let (responder, chunks) = (&responder, &chunks);
+            scope.spawn(move || {
+                for _ in 0..3 {
+                    let answer = chunks_answer(responder, &file, start);
+                    assert!(answer == chunks[start as usize..], "from chunk {start}");
+                }
+            });
+        }
+    });
 }

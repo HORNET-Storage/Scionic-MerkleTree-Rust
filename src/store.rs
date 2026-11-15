@@ -11,6 +11,7 @@
 
 use crate::format::{ChunkRef, FileList, FolderList, Kind, Record, Target};
 use crate::hash::{Hash, Root};
+use crate::wire::FRAME_CHUNK;
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -313,29 +314,74 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The most bytes of chunks that are read and checked ahead of what is done
-/// with them.
+/// The most bytes of chunks that are read ahead of what is done with them.
 const AHEAD_BYTES: u64 = 64 << 20;
 
-/// The most chunks that are read and checked ahead, however short.
+/// The most chunks that are read ahead, however short.
 const AHEAD_COUNT: usize = 1024;
 
 /// The least bytes of chunks that are worth a thread of their own.
 const AHEAD_BYTES_BY_EACH: u64 = 1 << 20;
 
-/// Reads chunks from a store and checks them ahead of what is done with
-/// them, several at once. The buffers serve one batch after another: memory
-/// that is used again costs much less than fresh memory.
+/// How chunks are read ahead.
+#[derive(Clone, Copy)]
+enum Ahead {
+    /// Checked, as [`lend_chunk`] checks them.
+    Checked,
+    /// As frames to send, as the store holds them: whoever takes them
+    /// checks them.
+    Framed,
+}
+
+/// What is given each chunk that is read ahead, with its place: None for
+/// one that the store does not hold.
+type Given<'g> = dyn FnMut(usize, Option<&[u8]>) -> Result<()> + 'g;
+
+/// Reads the chunk that `item` names into `buffer`, from its start, as
+/// `ahead` says, and says whether the store holds it.
+fn read_into(
+    store: &dyn Store,
+    item: &ChunkRef,
+    ahead: Ahead,
+    buffer: &mut Vec<u8>,
+) -> Result<bool> {
+    buffer.clear();
+    let mut copy = |bytes: &[u8]| {
+        buffer.extend_from_slice(bytes);
+        Ok(())
+    };
+    match ahead {
+        Ahead::Checked => lend_chunk(store, item, &mut copy),
+        Ahead::Framed => {
+            copy(&[FRAME_CHUNK])?;
+            lent(store, Stored::Chunk, &item.hash, &mut copy)
+        }
+    }
+}
+
+/// Reads chunks from a store ahead of what is done with them, several at
+/// once. The buffers serve one batch after another: memory that is used
+/// again costs much less than fresh memory.
 pub(crate) struct ChunksAhead {
     buffers: Vec<Mutex<Vec<u8>>>,
-    cores: usize,
+    threads: usize,
 }
 
 impl ChunksAhead {
     pub(crate) fn new() -> Self {
+        Self::with_threads(0)
+    }
+
+    /// Reads with up to `threads` threads at once; zero is one for each
+    /// core.
+    pub(crate) fn with_threads(threads: usize) -> Self {
+        let threads = match threads {
+            0 => std::thread::available_parallelism().map_or(1, usize::from),
+            threads => threads,
+        };
         Self {
             buffers: Vec::new(),
-            cores: std::thread::available_parallelism().map_or(1, usize::from),
+            threads,
         }
     }
 
@@ -352,6 +398,41 @@ impl ChunksAhead {
         items: &[ChunkRef],
         with: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
     ) -> Result<()> {
+        self.each(
+            store,
+            items,
+            Ahead::Checked,
+            &mut |place, bytes| match bytes {
+                Some(bytes) => with(place, bytes),
+                None => Err(missing("the chunk", &items[place].hash)),
+            },
+        )
+    }
+
+    /// Gives `with` the frames of the chunks that `items` name, in their
+    /// order, read from the store as it holds them: whoever takes them checks
+    /// them. Where the chunks are long enough to be worth it, several are
+    /// read at once, ahead of `with`. A chunk that the store does not hold is
+    /// given as None, and nothing after it.
+    pub(crate) fn frames(
+        &mut self,
+        store: &dyn Store,
+        items: &[ChunkRef],
+        with: &mut dyn FnMut(Option<&[u8]>) -> Result<()>,
+    ) -> Result<()> {
+        self.each(store, items, Ahead::Framed, &mut |_, frame| with(frame))
+    }
+
+    /// Gives `with` each chunk that `items` name, read as `ahead` says, with
+    /// its place among them, in their order. A chunk that the store does not
+    /// hold is given as None, and nothing after it.
+    fn each(
+        &mut self,
+        store: &dyn Store,
+        items: &[ChunkRef],
+        ahead: Ahead,
+        with: &mut Given<'_>,
+    ) -> Result<()> {
         let mut first = 0;
         while first < items.len() {
             let mut count = 0;
@@ -365,33 +446,63 @@ impl ChunksAhead {
             }
             let batch = &items[first..first + count];
             let worth = usize::try_from(bytes / AHEAD_BYTES_BY_EACH).unwrap_or(usize::MAX);
-            let workers = self.cores.min(worth.saturating_add(1)).min(count);
-            if workers <= 1 {
-                for (place, item) in (first..).zip(batch) {
-                    let held = lend_chunk(store, item, &mut |bytes| with(place, bytes))?;
-                    if !held {
-                        return Err(missing("the chunk", &item.hash));
-                    }
-                }
+            let workers = self.threads.min(worth.saturating_add(1)).min(count);
+            let mut with_place = |index: usize, bytes: Option<&[u8]>| with(first + index, bytes);
+            let ended = if workers <= 1 {
+                self.one_at_a_time(store, batch, ahead, &mut with_place)?
             } else {
-                self.ahead(store, batch, workers, &mut |index, bytes| {
-                    with(first + index, bytes)
-                })?;
+                self.several_at_once(store, batch, ahead, workers, &mut with_place)?
+            };
+            if ended {
+                return Ok(());
             }
             first += count;
         }
         Ok(())
     }
 
-    /// Reads and checks the chunks of `batch` on `workers` threads, and then
-    /// lends them to `with` in their order.
-    fn ahead(
+    /// Gives `with` the chunks of `batch`, read one at a time: a checked one
+    /// straight from the store. Says whether one was missing.
+    fn one_at_a_time(
         &mut self,
         store: &dyn Store,
         batch: &[ChunkRef],
+        ahead: Ahead,
+        with: &mut Given<'_>,
+    ) -> Result<bool> {
+        for (index, item) in batch.iter().enumerate() {
+            let held = match ahead {
+                Ahead::Checked => lend_chunk(store, item, &mut |bytes| with(index, Some(bytes)))?,
+                Ahead::Framed => {
+                    if self.buffers.is_empty() {
+                        self.buffers.push(Mutex::new(Vec::new()));
+                    }
+                    let mut frame = lock(&self.buffers[0]);
+                    let held = read_into(store, item, ahead, &mut frame)?;
+                    if held {
+                        with(index, Some(&frame))?;
+                    }
+                    held
+                }
+            };
+            if !held {
+                with(index, None)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Reads the chunks of `batch` on `workers` threads, and then gives them
+    /// to `with` in their order. Says whether one was missing.
+    fn several_at_once(
+        &mut self,
+        store: &dyn Store,
+        batch: &[ChunkRef],
+        ahead: Ahead,
         workers: usize,
-        with: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
-    ) -> Result<()> {
+        with: &mut Given<'_>,
+    ) -> Result<bool> {
         while self.buffers.len() < batch.len() {
             self.buffers.push(Mutex::new(Vec::new()));
         }
@@ -404,12 +515,7 @@ impl ChunksAhead {
                 let Some(item) = batch.get(index) else {
                     return done;
                 };
-                let mut buffer = lock(&buffers[index]);
-                buffer.clear();
-                let held = lend_chunk(store, item, &mut |bytes| {
-                    buffer.extend_from_slice(bytes);
-                    Ok(())
-                });
+                let held = read_into(store, item, ahead, &mut lock(&buffers[index]));
                 done.push((index, held));
             }
         };
@@ -427,11 +533,12 @@ impl ChunksAhead {
         done.sort_unstable_by_key(|(index, _)| *index);
         for (index, held) in done {
             if !held? {
-                return Err(missing("the chunk", &batch[index].hash));
+                with(index, None)?;
+                return Ok(true);
             }
-            with(index, &lock(&buffers[index]))?;
+            with(index, Some(&lock(&buffers[index])))?;
         }
-        Ok(())
+        Ok(false)
     }
 }
 
