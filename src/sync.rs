@@ -26,7 +26,7 @@ use crate::format::{
 use crate::hash::{Hash, Root};
 use crate::intake::{Arrived, Intake, Summary};
 use crate::read::{file_of, folder_of, record_of};
-use crate::store::{check_chunk, damaged, load_chunk, missing, Store, Stored};
+use crate::store::{check_chunk, damaged, lend_chunk, lent, missing, Store, Stored};
 use crate::wire::{
     chunk_frame, file_branch_frame, file_list_frame, folder_branch_frame, folder_list_frame,
     have_frame, read_next, refused_frame, write_end, write_frame, write_framed, Frame, HaveMap,
@@ -334,10 +334,14 @@ impl<'s> Responder<'s> {
                 Some(bytes) => on_frame(&file_list_frame(&bytes)),
                 None => on_frame(&not_held),
             },
-            Request::Chunk(chunk) => match self.store.get(Stored::Chunk, &chunk)? {
-                Some(bytes) => on_frame(&chunk_frame(&bytes)),
-                None => on_frame(&not_held),
-            },
+            Request::Chunk(chunk) => {
+                let mut frame = Vec::new();
+                let held = lent(self.store, Stored::Chunk, &chunk, &mut |bytes| {
+                    frame = chunk_frame(bytes);
+                    Ok(())
+                })?;
+                on_frame(if held { &frame } else { &not_held })
+            }
             Request::FolderBranch {
                 folder,
                 start,
@@ -401,15 +405,16 @@ impl<'s> Responder<'s> {
                 // to `on_frame` for the call only.
                 let mut frame = Vec::new();
                 for item in list.items()[start as usize..].iter().take(count) {
-                    match self.store.get(Stored::Chunk, &item.hash)? {
-                        Some(bytes) => {
-                            frame.clear();
-                            frame.push(FRAME_CHUNK);
-                            frame.extend_from_slice(&bytes);
-                            on_frame(&frame)?;
-                        }
-                        None => return on_frame(&not_held),
+                    let held = lent(self.store, Stored::Chunk, &item.hash, &mut |bytes| {
+                        frame.clear();
+                        frame.push(FRAME_CHUNK);
+                        frame.extend_from_slice(bytes);
+                        Ok(())
+                    })?;
+                    if !held {
+                        return on_frame(&not_held);
                     }
+                    on_frame(&frame)?;
                 }
                 Ok(())
             }
@@ -786,9 +791,12 @@ pub fn export(store: &dyn Store, root: &Root, out: &mut dyn Write) -> Result<()>
                 write_framed(out, FRAME_FILE_LIST, &list.encode())?;
                 for item in list.items() {
                     if chunks.insert(item.hash) {
-                        let bytes = load_chunk(store, item)?
-                            .ok_or_else(|| missing("the chunk", &item.hash))?;
-                        write_framed(out, FRAME_CHUNK, &bytes)?;
+                        let held = lend_chunk(store, item, &mut |bytes| {
+                            write_framed(out, FRAME_CHUNK, bytes)
+                        })?;
+                        if !held {
+                            return Err(missing("the chunk", &item.hash));
+                        }
                     }
                 }
             }

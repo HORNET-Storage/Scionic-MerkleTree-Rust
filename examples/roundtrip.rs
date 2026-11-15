@@ -23,7 +23,7 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 struct DirStore {
@@ -31,6 +31,10 @@ struct DirStore {
     /// Numbers the files that are being written, so that two writers of the
     /// same thing do not write to the same file.
     writing: AtomicU64,
+    /// Memory that things are read into, kept for the next read: fresh
+    /// memory for each chunk, as `get` takes, costs some systems more than
+    /// the reading does. One for each thread that reads at once.
+    read: Mutex<Vec<Vec<u8>>>,
 }
 
 fn failed(operation: &'static str, path: &Path, source: std::io::Error) -> Error {
@@ -46,6 +50,7 @@ impl DirStore {
         Self {
             dir,
             writing: AtomicU64::new(0),
+            read: Mutex::new(Vec::new()),
         }
     }
 
@@ -68,7 +73,11 @@ impl Store for DirStore {
             return Ok(());
         }
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| failed("create", parent, error))?;
+            // Looked at first: trying to make a folder that is there already
+            // costs several times what seeing that it is there does.
+            if !parent.is_dir() {
+                fs::create_dir_all(parent).map_err(|error| failed("create", parent, error))?;
+            }
         }
         // Written under another name first, so that a file is never found
         // under a hash before all of its bytes are there.
@@ -109,6 +118,35 @@ impl Store for DirStore {
         file.read_exact(room)
             .map_err(|error| failed("read", &path, error))?;
         Ok(Some(bytes))
+    }
+
+    /// The library reads a tree's chunks through here, and each is read into
+    /// memory that was read into before.
+    fn lend(
+        &self,
+        kind: Stored,
+        hash: &Hash,
+        with: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<bool> {
+        let path = self.path(kind, hash);
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(failed("open", &path, error)),
+        };
+        let mut bytes = match self.read.lock() {
+            Ok(mut kept) => kept.pop().unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        bytes.clear();
+        let lent = file
+            .read_to_end(&mut bytes)
+            .map_err(|error| failed("read", &path, error))
+            .and_then(|_| with(&bytes));
+        if let Ok(mut kept) = self.read.lock() {
+            kept.push(bytes);
+        }
+        lent.map(|()| true)
     }
 
     fn size(&self, kind: Stored, hash: &Hash) -> Result<Option<u64>> {

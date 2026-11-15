@@ -12,7 +12,7 @@ use crate::format::{
     MAX_FOLDER_DEPTH,
 };
 use crate::hash::{Hash, Root};
-use crate::store::{load_chunk, load_file, load_folder, load_record, missing, Store, Stored};
+use crate::store::{lend_chunk, load_file, load_folder, load_record, missing, Store, Stored};
 use crate::{io_error, Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -184,14 +184,18 @@ fn write_stretch(
         }
     }
     for (item, start) in wanted {
-        let bytes = load_chunk(store, item)?.ok_or_else(|| missing("the chunk", &item.hash))?;
         let from = offset.saturating_sub(*start) as usize;
         let to = (end.min(start + u64::from(item.length)) - start) as usize;
-        out.write_all(&bytes[from..to])
-            .map_err(|source| Error::Stream {
-                operation: "write a file's bytes",
-                source,
-            })?;
+        let held = lend_chunk(store, item, &mut |bytes| {
+            out.write_all(&bytes[from..to])
+                .map_err(|source| Error::Stream {
+                    operation: "write a file's bytes",
+                    source,
+                })
+        })?;
+        if !held {
+            return Err(missing("the chunk", &item.hash));
+        }
     }
     Ok(())
 }

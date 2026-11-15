@@ -22,7 +22,7 @@ use crate::format::{
     MAX_CHUNK_BYTES, MAX_FOLDER_DEPTH, MAX_RECORD_BYTES,
 };
 use crate::hash::{Hash, Root};
-use crate::store::{load_record, missing, Store, Stored};
+use crate::store::{lent, load_record, missing, Store, Stored};
 use crate::wire::{Request, FRAME_CHUNK, FRAME_FILE_LIST, FRAME_FOLDER_LIST, FRAME_RECORD};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -648,12 +648,21 @@ impl<'s> Intake<'s> {
                 let Some(item) = held.get(index) else {
                     return Ok(spoiled);
                 };
-                let bytes = store
-                    .get(Stored::Chunk, &item.hash)
-                    .and_then(|bytes| bytes.ok_or_else(|| missing("the chunk", &item.hash)));
-                match bytes {
-                    Ok(bytes) if item.matches(&bytes) => {}
-                    Ok(_) => spoiled.push(index),
+                let mut sound = false;
+                let found = lent(store, Stored::Chunk, &item.hash, &mut |bytes| {
+                    sound = item.matches(bytes);
+                    Ok(())
+                })
+                .and_then(|held| {
+                    if held {
+                        Ok(())
+                    } else {
+                        Err(missing("the chunk", &item.hash))
+                    }
+                });
+                match found {
+                    Ok(()) if sound => {}
+                    Ok(()) => spoiled.push(index),
                     Err(error) => {
                         next.store(held.len(), Ordering::Relaxed);
                         return Err(error);
