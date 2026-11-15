@@ -164,14 +164,14 @@ Version 2.5.6 is a new tree format, built for deduplication and for trees of a t
 
 ## Install
 
-The crate is not published on crates.io. Depend on it by git:
+The crate is on [crates.io](https://crates.io/crates/scionic-merkletree):
 
 ```toml
 [dependencies]
-scionic-merkletree = { git = "https://github.com/HORNET-Storage/Scionic-MerkleTree-Rust", branch = "main" }
+scionic-merkletree = "2.5.6"
 ```
 
-For a build that can be repeated, pin a commit with `rev = "..."` in place of the branch.
+Or run `cargo add scionic-merkletree`. The API documentation is on [docs.rs](https://docs.rs/scionic-merkletree).
 
 | Requirement | |
 | --- | --- |

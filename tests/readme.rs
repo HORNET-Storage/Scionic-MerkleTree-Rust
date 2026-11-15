@@ -22,6 +22,10 @@ fn the_readme_names_this_version() {
         README.contains(&format!("What's New in {version}")),
         "what is new is told for version {version}"
     );
+    assert!(
+        README.contains(&format!("scionic-merkletree = \"{version}\"")),
+        "the line that installs the crate names version {version}"
+    );
     let oldest = env!("CARGO_PKG_RUST_VERSION");
     assert!(
         README.contains(&format!("rustc-{oldest}%2B"))

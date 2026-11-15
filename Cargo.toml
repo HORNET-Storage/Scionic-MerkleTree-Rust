@@ -3,9 +3,13 @@ name = "scionic-merkletree"
 version = "2.5.6"
 edition = "2021"
 rust-version = "1.85"
-publish = false
 description = "Scionic Merkle trees: a folder of files under one root, with identical chunks, files and folders stored once, and any part of it shown and checked without the rest"
 license = "MIT"
+repository = "https://github.com/HORNET-Storage/Scionic-MerkleTree-Rust"
+keywords = ["merkle", "merkle-tree", "deduplication", "chunking", "sync"]
+categories = ["data-structures", "cryptography", "filesystem"]
+# What the repository keeps for its own work, and not for the crate's users.
+exclude = [".github/", "AGENTS.md"]
 
 [dependencies]
 sha2 = { version = "0.11", default-features = false }
