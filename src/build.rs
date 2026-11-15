@@ -48,6 +48,13 @@ const KEPT_BY_EACH: usize = 1 << 20;
 /// The most chunks of a fixed size that a window holds.
 const FIXED_CHUNKS_IN_A_WINDOW: usize = 1024;
 
+/// How many of a file's windows in a row must find its chunks still being
+/// kept once the next window is read, while as many helpers are free as the
+/// window could use, before its windows grow to what a builder with help
+/// holds. Helpers are free for a moment while other files are between
+/// windows, and that is not worth the memory.
+const WINDOWS_BEHIND_TO_GROW: usize = 3;
+
 /// What a window holds when it starts on its first file. A window grows only
 /// as a file turns out to be longer, so a small file never costs a large one.
 const WINDOW_START: usize = 64 * 1024;
@@ -83,8 +90,13 @@ impl Helpers {
         Self::new(threads - 1)
     }
 
+    /// How many helpers are free.
+    fn free(&self) -> usize {
+        self.free.load(Ordering::Relaxed)
+    }
+
     fn any(&self) -> bool {
-        self.free.load(Ordering::Relaxed) > 0
+        self.free() > 0
     }
 
     /// Takes up to `most` helpers, and says how many it got.
@@ -188,11 +200,18 @@ impl<'s> Builder<'s> {
     /// time. While the chunks of one window are hashed and kept, what is left
     /// of it goes to the start of the other, and the file is read on into
     /// that one.
+    ///
+    /// A file that starts while no helper is free is read in short windows.
+    /// They grow once keeping its chunks is what holds the file up while
+    /// helpers are free: a store that writes each chunk to a disk keeps it
+    /// more slowly than the file is read, and a longer window gives the free
+    /// helpers a share.
     fn file_from(&mut self, mut read: impl FnMut(&mut [u8]) -> Result<usize>) -> Result<Target> {
         let store = self.store;
         let chunking = self.chunking;
         let helpers = &*self.helpers;
-        let room = window_room(chunking, helpers.any());
+        let mut room = window_room(chunking, helpers.any());
+        let mut behind_in_a_row = 0;
         let Windows { current, next } = &mut self.windows;
         let mut items = Vec::new();
         let (mut filled, mut ended) = fill(current, 0, room, &mut read)?;
@@ -205,19 +224,30 @@ impl<'s> Builder<'s> {
             }
             let settled_to: usize = chunks.iter().map(|chunk| chunk.len()).sum();
             let tail = &current[settled_to..filled];
-            // Once the file has ended there is nothing to read meanwhile.
+            // Once the file has ended there is nothing to read meanwhile. A
+            // window takes no more helpers than it has chunks, and leaves the
+            // others to the files beside it.
             let most = if ended {
                 chunks.len() / 2
             } else {
-                settled_to.div_ceil(KEPT_BY_EACH)
+                settled_to.div_ceil(KEPT_BY_EACH).min(chunks.len())
             };
             let (kept, refilled) =
-                keep_chunks_while(store, helpers, most, &chunks, &mut items, || {
+                keep_chunks_while(store, helpers, most, &chunks, &mut items, |behind| {
                     carry(tail, next, room)?;
                     if ended {
                         return Ok((tail.len(), true));
                     }
-                    fill(next, tail.len(), room, &mut read)
+                    let refilled = fill(next, tail.len(), room, &mut read);
+                    if behind() && helpers.free() >= most {
+                        behind_in_a_row += 1;
+                        if behind_in_a_row >= WINDOWS_BEHIND_TO_GROW {
+                            room = window_room(chunking, true);
+                        }
+                    } else {
+                        behind_in_a_row = 0;
+                    }
+                    refilled
                 });
             kept?;
             (filled, ended) = refilled?;
@@ -289,22 +319,24 @@ fn keep_chunks(
     items: &mut Vec<ChunkRef>,
 ) -> Result<()> {
     // A helper is worth starting only for a few chunks of its own.
-    keep_chunks_while(store, helpers, chunks.len() / 2, chunks, items, || ()).0
+    keep_chunks_while(store, helpers, chunks.len() / 2, chunks, items, |_| ()).0
 }
 
 /// Hashes and keeps chunks as [`keep_chunks`] does, with up to `most`
 /// helpers, while this thread does `meanwhile`; then this thread takes a
-/// share too. Gives what became of the chunks, and what `meanwhile` gave.
+/// share too. `meanwhile` can ask whether helpers are still keeping the
+/// chunks. Gives what became of the chunks, and what `meanwhile` gave.
 fn keep_chunks_while<T>(
     store: &dyn Store,
     helpers: &Helpers,
     most: usize,
     chunks: &[&[u8]],
     items: &mut Vec<ChunkRef>,
-    meanwhile: impl FnOnce() -> T,
+    meanwhile: impl FnOnce(&dyn Fn() -> bool) -> T,
 ) -> (Result<()>, T) {
     let helping = helpers.take(most);
     let next = AtomicUsize::new(0);
+    let finished = AtomicUsize::new(0);
     let work = || {
         let mut kept = Vec::new();
         loop {
@@ -317,9 +349,13 @@ fn keep_chunks_while<T>(
                 next.store(chunks.len(), Ordering::Relaxed);
             }
             kept.push((index, item));
+            finished.fetch_add(1, Ordering::Relaxed);
         }
     };
-    let (kept, done) = with_helpers(helping, &work, meanwhile);
+    // With no helper, nothing is kept before `meanwhile` is done, and that
+    // says nothing of how fast the store keeps.
+    let behind = || helping > 0 && finished.load(Ordering::Relaxed) < chunks.len();
+    let (kept, done) = with_helpers(helping, &work, || meanwhile(&behind));
     let kept: Vec<_> = kept.into_iter().flatten().collect();
     helpers.give(helping);
     (in_order(kept, chunks.len(), items), done)
@@ -1095,6 +1131,234 @@ fn format_epoch_seconds(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Hash, MemoryStore};
+    use std::time::{Duration, Instant};
+
+    /// Chunks of a fixed 4 MiB: a window of a builder alone holds two, and
+    /// one of a builder with help eight.
+    const CHUNK: usize = 4 << 20;
+
+    /// What one window of a builder alone holds.
+    const ALONE: usize = ROOM_ALONE / 2;
+
+    /// A store that takes a while over each thing it keeps, as one that
+    /// writes to a disk does.
+    struct Slow(MemoryStore);
+
+    impl Store for Slow {
+        fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
+            std::thread::sleep(Duration::from_millis(100));
+            self.0.put(kind, hash, bytes)
+        }
+
+        fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>> {
+            self.0.get(kind, hash)
+        }
+
+        fn remove(&self, kind: Stored, hash: &Hash) -> Result<()> {
+            self.0.remove(kind, hash)
+        }
+    }
+
+    /// A store that counts the chunks it has kept.
+    struct Counted {
+        inner: MemoryStore,
+        chunks: AtomicUsize,
+    }
+
+    impl Store for Counted {
+        fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
+            self.inner.put(kind, hash, bytes)?;
+            if kind == Stored::Chunk {
+                self.chunks.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>> {
+            self.inner.get(kind, hash)
+        }
+
+        fn remove(&self, kind: Stored, hash: &Hash) -> Result<()> {
+            self.inner.remove(kind, hash)
+        }
+    }
+
+    /// A store that takes every helper that is free whenever it is handed
+    /// something to keep, as other files would.
+    struct Taking {
+        inner: MemoryStore,
+        helpers: Arc<Helpers>,
+    }
+
+    impl Store for Taking {
+        fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
+            self.helpers.take(usize::MAX);
+            self.inner.put(kind, hash, bytes)
+        }
+
+        fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>> {
+            self.inner.get(kind, hash)
+        }
+
+        fn remove(&self, kind: Stored, hash: &Hash) -> Result<()> {
+            self.inner.remove(kind, hash)
+        }
+    }
+
+    /// Builds a file of `chunks` chunks of [`CHUNK`] bytes, each of a byte of
+    /// its own, with the helpers `helpers` counts. `asked` is told where each
+    /// read starts and how much it asks for, before it is answered.
+    fn read_through(
+        store: &dyn Store,
+        helpers: Arc<Helpers>,
+        chunks: usize,
+        mut asked: impl FnMut(usize, usize),
+    ) {
+        let chunking = Chunking::fixed(CHUNK as u32).unwrap();
+        let mut builder = Builder::sharing(store, chunking, helpers);
+        // Windows as long as they get, as a builder has them after a long
+        // file: each read then asks for all that the window may hold.
+        let longest = window_room(chunking, true);
+        builder.windows.current.resize(longest, 0);
+        builder.windows.next.resize(longest, 0);
+        let length = chunks * CHUNK;
+        let mut at = 0;
+        builder
+            .file_from(|buffer| {
+                asked(at, buffer.len());
+                let count = buffer.len().min(length - at);
+                let mut done = 0;
+                while done < count {
+                    let chunk = (at + done) / CHUNK;
+                    let end = ((chunk + 1) * CHUNK - at).min(count);
+                    buffer[done..end].fill(chunk as u8);
+                    done = end;
+                }
+                at += count;
+                Ok(count)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_file_whose_chunks_are_kept_slowly_is_read_in_longer_windows_once_helpers_are_free() {
+        let store = Slow(MemoryStore::new());
+        // The file starts while no helper is free, as one does that starts
+        // before the threads with no file of their own give themselves up.
+        let helpers = Helpers::new(0);
+        let free = Arc::clone(&helpers);
+        let mut longest = 0;
+        read_through(&store, helpers, 12, |at, length| {
+            if at == 0 {
+                free.give(6);
+            }
+            longest = longest.max(length);
+        });
+        assert!(
+            longest > ALONE,
+            "the longest read asked for {longest} bytes"
+        );
+    }
+
+    #[test]
+    fn a_file_whose_chunks_are_kept_as_fast_as_it_is_read_keeps_its_short_windows() {
+        let store = Counted {
+            inner: MemoryStore::new(),
+            chunks: AtomicUsize::new(0),
+        };
+        let helpers = Helpers::new(0);
+        let free = Arc::clone(&helpers);
+        let mut longest = 0;
+        read_through(&store, helpers, 12, |at, length| {
+            if at == 0 {
+                free.give(6);
+            }
+            // A window is read only once the chunks before it are kept, and
+            // a while after: the store keeps up with the file, however long
+            // hashing takes here.
+            let waited = Instant::now();
+            while store.chunks.load(Ordering::SeqCst) < at / CHUNK
+                && waited.elapsed() < Duration::from_secs(10)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            longest = longest.max(length);
+        });
+        assert!(longest <= ALONE, "a read asked for {longest} bytes");
+    }
+
+    #[test]
+    fn helpers_that_are_free_for_a_moment_do_not_grow_a_window() {
+        let store = Slow(MemoryStore::new());
+        let helpers = Helpers::new(0);
+        let free = Arc::clone(&helpers);
+        let mut held = 0;
+        let mut longest_early = 0;
+        let mut longest = 0;
+        // Free while windows 1 to WINDOWS_BEHIND_TO_GROW - 1 are read, taken
+        // by other files while the next one is read, and free again from the
+        // one after: the windows may grow only that many windows later.
+        let early = (2 * WINDOWS_BEHIND_TO_GROW + 1) * ALONE;
+        read_through(&store, helpers, 20, |at, length| {
+            let window = at / ALONE;
+            if at == 0 {
+                free.give(6);
+            } else if window == WINDOWS_BEHIND_TO_GROW {
+                held += free.take(usize::MAX);
+            } else if window == WINDOWS_BEHIND_TO_GROW + 1 {
+                free.give(std::mem::take(&mut held));
+            }
+            if at < early {
+                longest_early = longest_early.max(length);
+            }
+            longest = longest.max(length);
+        });
+        assert!(
+            longest_early <= ALONE,
+            "a read before byte {early} asked for {longest_early} bytes"
+        );
+        assert!(longest > ALONE, "the windows never grew");
+    }
+
+    #[test]
+    fn a_window_that_too_few_helpers_could_share_keeps_its_length() {
+        let store = Slow(MemoryStore::new());
+        let helpers = Helpers::new(0);
+        let free = Arc::clone(&helpers);
+        let mut longest = 0;
+        // Each window takes two helpers for its two chunks, and leaves one.
+        read_through(&store, helpers, 12, |at, length| {
+            if at == 0 {
+                free.give(3);
+            }
+            longest = longest.max(length);
+        });
+        assert!(longest <= ALONE, "a read asked for {longest} bytes");
+    }
+
+    #[test]
+    fn chunks_that_no_helper_keeps_do_not_count_as_behind() {
+        let helpers = Helpers::new(0);
+        let store = Taking {
+            inner: MemoryStore::new(),
+            helpers: Arc::clone(&helpers),
+        };
+        let free = Arc::clone(&helpers);
+        let mut longest = 0;
+        // No helper is free when a window's chunks are handed out, and six
+        // are once the next window is read: this thread keeps every chunk
+        // itself, after the read, and the store has kept none of them by then
+        // whatever its speed.
+        read_through(&store, helpers, 12, |at, length| {
+            if at > 0 {
+                free.give(6);
+            }
+            longest = longest.max(length);
+        });
+        assert!(longest <= ALONE, "a read asked for {longest} bytes");
+    }
 
     #[test]
     fn the_time_is_written_in_utc_to_the_second() {
