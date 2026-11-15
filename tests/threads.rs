@@ -385,3 +385,39 @@ fn a_store_that_falls_over_while_it_keeps_a_chunk_leaves_the_intake_done() {
     }));
     assert!(fell.is_err());
 }
+
+#[test]
+fn a_bundle_ends_at_the_first_chunk_that_is_damaged_or_missing() {
+    let (source, root, frames) = long_tree("threads-export");
+    let places = chunk_places(&frames);
+    let copy = || {
+        let store = MemoryStore::new();
+        for (kind, hash, bytes) in contents(&source) {
+            store.put(kind, &hash, &bytes).unwrap();
+        }
+        store
+    };
+    // The chunks are read and checked ahead, several at once, and written
+    // in order: what comes out is the bundle up to the bad chunk.
+    for bad in [places[0], places[2], places[places.len() - 1]] {
+        let hash = Hash::of(&frames[bad][1..]);
+        let before = bundle_of(&frames[..bad]);
+
+        let damaged = copy();
+        damaged.remove(Stored::Chunk, &hash).unwrap();
+        let mut bytes = frames[bad][1..].to_vec();
+        bytes[0] ^= 1;
+        damaged.put(Stored::Chunk, &hash, &bytes).unwrap();
+        let mut out = Vec::new();
+        let result = export(&damaged, &root, &mut out);
+        assert!(matches!(result, Err(Error::Corrupt { .. })), "{result:?}");
+        assert!(out == before, "damaged chunk at frame {bad}");
+
+        let missing = copy();
+        missing.remove(Stored::Chunk, &hash).unwrap();
+        let mut out = Vec::new();
+        let result = export(&missing, &root, &mut out);
+        assert!(matches!(result, Err(Error::Missing { .. })), "{result:?}");
+        assert!(out == before, "missing chunk at frame {bad}");
+    }
+}
