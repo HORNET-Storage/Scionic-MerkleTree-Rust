@@ -1191,8 +1191,12 @@ fn take_chunk(
     }
 }
 
-/// The most bytes of chunk frames that wait to be taken in together.
-const CHUNK_FRAMES_BYTES: usize = 64 << 20;
+/// The most bytes of chunk frames that wait to be taken in together. One
+/// batch is taken in while the next comes. Batches of 16 MiB, about eight
+/// chunks of the default chunking, are taken in sooner after they come than
+/// larger ones, and both stay in a processor's cache more often; smaller
+/// ones leave too few chunks to share among threads.
+const CHUNK_FRAMES_BYTES: usize = 16 << 20;
 
 /// The most chunk frames that wait to be taken in together, however short.
 const CHUNK_FRAMES_COUNT: usize = 1024;
