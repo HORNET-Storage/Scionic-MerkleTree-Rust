@@ -362,7 +362,7 @@ pub type EntryExtra<'a> = dyn Fn(&Path, &str, Kind) -> Result<ExtraData> + Sync 
 /// same root wherever it is and whatever it is called. Entries have no extra
 /// data: [`build_with`] adds some.
 pub fn build(store: &dyn Store, path: impl AsRef<Path>, options: &BuildOptions) -> Result<Root> {
-    build_with(store, path, options, &|_, _, _| Ok(ExtraData::new()))
+    build_tree(store, path.as_ref(), options, None)
 }
 
 /// Builds a tree as [`build`] does, and asks `entry_extra` for the extra
@@ -373,7 +373,15 @@ pub fn build_with(
     options: &BuildOptions,
     entry_extra: &EntryExtra<'_>,
 ) -> Result<Root> {
-    let path = path.as_ref();
+    build_tree(store, path.as_ref(), options, Some(entry_extra))
+}
+
+fn build_tree(
+    store: &dyn Store,
+    path: &Path,
+    options: &BuildOptions,
+    entry_extra: Option<&EntryExtra<'_>>,
+) -> Result<Root> {
     let chunking = options.chunking.unwrap_or(Chunking::FastCdcV1);
     let mut extra = options.extra.clone();
     if options.timestamp {
@@ -397,25 +405,30 @@ pub fn build_with(
     for index in (0..folders.len()).rev() {
         let mut entries = Vec::with_capacity(folders[index].children.len());
         for child in &folders[index].children {
-            // A file's path is put together here, for the caller to see. No
-            // file is opened by it.
-            let file_path;
-            let (target, child_path) = match child.kind {
-                Kind::File => {
-                    file_path = folders[index].path.join(&child.name);
-                    let target = file_targets.get(child.index).ok_or(Error::Invariant {
-                        detail: "a file was left out of the build",
-                    })?;
-                    (*target, file_path.as_path())
-                }
-                Kind::Folder => (
-                    folder_targets[child.index].ok_or(Error::Invariant {
-                        detail: "a folder was made before a folder inside it",
-                    })?,
-                    folders[child.index].path.as_path(),
-                ),
+            let target = match child.kind {
+                Kind::File => *file_targets.get(child.index).ok_or(Error::Invariant {
+                    detail: "a file was left out of the build",
+                })?,
+                Kind::Folder => folder_targets[child.index].ok_or(Error::Invariant {
+                    detail: "a folder was made before a folder inside it",
+                })?,
             };
-            let extra = entry_extra(child_path, &child.name, child.kind)?;
+            let extra = match entry_extra {
+                // A file's path is put together here, for the caller to see,
+                // and only when there is a caller to see it. No file is opened
+                // by it.
+                Some(entry_extra) => match child.kind {
+                    Kind::File => entry_extra(
+                        &folders[index].path.join(&child.name),
+                        &child.name,
+                        child.kind,
+                    )?,
+                    Kind::Folder => {
+                        entry_extra(&folders[child.index].path, &child.name, child.kind)?
+                    }
+                },
+                None => ExtraData::new(),
+            };
             entries.push(Entry::new(child.name.as_str(), target, extra)?);
         }
         folder_targets[index] = Some(builder.folder(entries)?);
