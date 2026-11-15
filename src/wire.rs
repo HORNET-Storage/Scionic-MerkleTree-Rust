@@ -410,9 +410,29 @@ pub fn write_frame(out: &mut dyn Write, frame: &[u8]) -> Result<()> {
     out.write_all(frame).map_err(failed)
 }
 
+/// Writes the frame that `tag` and `body` make, without making it: the body
+/// of a chunk's frame is megabytes long, and is written from where it is.
+pub(crate) fn write_framed(out: &mut dyn Write, tag: u8, body: &[u8]) -> Result<()> {
+    let length = u32::try_from(body.len() + 1).map_err(|_| Error::LimitExceeded {
+        what: "a frame",
+        limit: u64::from(u32::MAX),
+        requested: body.len() as u64 + 1,
+    })?;
+    let failed = |source| Error::Stream {
+        operation: "write a frame",
+        source,
+    };
+    let mut head = [0; 5];
+    head[..4].copy_from_slice(&length.to_be_bytes());
+    head[4] = tag;
+    out.write_all(&head).map_err(failed)?;
+    out.write_all(body).map_err(failed)
+}
+
 /// What comes next on a stream of frames.
 pub(crate) enum Next {
-    Frame(Vec<u8>),
+    /// A frame, which is in the buffer that was given to read it into.
+    Frame,
     /// A length of zero. Where answers are sent, it ends one answer.
     End,
     /// The stream has ended, between two frames.
@@ -427,10 +447,16 @@ pub(crate) fn write_end(out: &mut dyn Write) -> Result<()> {
     })
 }
 
-/// Reads what comes next on a stream. A frame longer than `limit` is refused
-/// before any of it is read, and a stream that ends inside a frame is an
-/// error. A frame's bytes are set aside as they come, a megabyte at a time.
-pub(crate) fn read_next(input: &mut dyn Read, limit: usize) -> Result<Next> {
+/// Reads what comes next on a stream, a frame into `frame`, which is emptied
+/// first. One buffer serves frame after frame, so that memory is not taken
+/// afresh for each: memory that is used again costs much less than fresh
+/// memory, which a system has to find and clear first.
+///
+/// A frame longer than `limit` is refused before any of it is read, and a
+/// stream that ends inside a frame is an error. A frame's bytes are set aside
+/// as they come, a megabyte at a time, so that what a peer only says it will
+/// send costs nothing until it is sent.
+pub(crate) fn read_next(input: &mut dyn Read, limit: usize, frame: &mut Vec<u8>) -> Result<Next> {
     let failed = |source| Error::Stream {
         operation: "read a frame",
         source,
@@ -464,7 +490,7 @@ pub(crate) fn read_next(input: &mut dyn Read, limit: usize) -> Result<Next> {
             requested: length as u64,
         });
     }
-    let mut frame = Vec::new();
+    frame.clear();
     while frame.len() < length {
         let held = frame.len();
         let more = (length - held).min(READ_STEP_BYTES);
@@ -477,15 +503,16 @@ pub(crate) fn read_next(input: &mut dyn Read, limit: usize) -> Result<Next> {
         frame.resize(held + more, 0);
         input.read_exact(&mut frame[held..]).map_err(cut_short)?;
     }
-    Ok(Next::Frame(frame))
+    Ok(Next::Frame)
 }
 
 /// Reads one frame from a stream, or nothing when the stream has ended. A
 /// frame longer than `limit` is refused before any of it is read, and a
 /// stream that ends inside a frame is an error.
 pub fn read_frame(input: &mut dyn Read, limit: usize) -> Result<Option<Vec<u8>>> {
-    match read_next(input, limit)? {
-        Next::Frame(frame) => Ok(Some(frame)),
+    let mut frame = Vec::new();
+    match read_next(input, limit, &mut frame)? {
+        Next::Frame => Ok(Some(frame)),
         Next::End => Err(invalid("a frame is empty")),
         Next::Closed => Ok(None),
     }

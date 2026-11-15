@@ -29,8 +29,9 @@ use crate::read::{file_of, folder_of, record_of};
 use crate::store::{check_chunk, damaged, load_chunk, missing, Store, Stored};
 use crate::wire::{
     chunk_frame, file_branch_frame, file_list_frame, folder_branch_frame, folder_list_frame,
-    have_frame, read_frame, read_next, refused_frame, write_end, write_frame, Frame, HaveMap, Next,
-    Refusal, Request, BUNDLE_MAGIC, FRAME_REFUSED, MAX_REQUEST_BYTES,
+    have_frame, read_next, refused_frame, write_end, write_frame, write_framed, Frame, HaveMap,
+    Next, Refusal, Request, BUNDLE_MAGIC, FRAME_CHUNK, FRAME_FILE_LIST, FRAME_FOLDER_LIST,
+    FRAME_REFUSED, MAX_REQUEST_BYTES,
 };
 use crate::{Error, Result};
 use std::collections::HashSet;
@@ -394,9 +395,19 @@ impl<'s> Responder<'s> {
                     return on_frame(&out_of_range);
                 }
                 let count = u64::from(count).min(MAX_CHUNKS_PER_ANSWER) as usize;
+                // One frame is filled again for each chunk. Memory that is used
+                // again costs much less than fresh memory for every chunk,
+                // which a system has to find and clear first. A frame is lent
+                // to `on_frame` for the call only.
+                let mut frame = Vec::new();
                 for item in list.items()[start as usize..].iter().take(count) {
                     match self.store.get(Stored::Chunk, &item.hash)? {
-                        Some(bytes) => on_frame(&chunk_frame(&bytes))?,
+                        Some(bytes) => {
+                            frame.clear();
+                            frame.push(FRAME_CHUNK);
+                            frame.extend_from_slice(&bytes);
+                            on_frame(&frame)?;
+                        }
                         None => return on_frame(&not_held),
                     }
                 }
@@ -767,17 +778,17 @@ pub fn export(store: &dyn Store, root: &Root, out: &mut dyn Write) -> Result<()>
         match target.kind {
             Kind::Folder => {
                 let list = folder_of(store, &target)?;
-                write_frame(out, &folder_list_frame(&list.encode()))?;
+                write_framed(out, FRAME_FOLDER_LIST, &list.encode())?;
                 pending.extend(list.entries().iter().rev().map(Entry::target));
             }
             Kind::File => {
                 let list = file_of(store, &target)?;
-                write_frame(out, &file_list_frame(&list.encode()))?;
+                write_framed(out, FRAME_FILE_LIST, &list.encode())?;
                 for item in list.items() {
                     if chunks.insert(item.hash) {
                         let bytes = load_chunk(store, item)?
                             .ok_or_else(|| missing("the chunk", &item.hash))?;
-                        write_frame(out, &chunk_frame(&bytes))?;
+                        write_framed(out, FRAME_CHUNK, &bytes)?;
                     }
                 }
             }
@@ -803,8 +814,16 @@ pub fn import(store: &dyn Store, root: &Root, input: &mut dyn Read) -> Result<Su
         return Err(invalid("a stream does not start as a bundle does"));
     }
     let mut intake = Intake::new(store, *root)?;
-    while let Some(frame) = read_frame(input, intake.frame_limit())? {
-        intake.accept(&frame)?;
+    // One buffer serves every frame of the bundle.
+    let mut frame = Vec::new();
+    loop {
+        match read_next(input, intake.frame_limit(), &mut frame)? {
+            Next::Frame => {
+                intake.accept(&frame)?;
+            }
+            Next::End => return Err(invalid("a frame is empty")),
+            Next::Closed => break,
+        }
     }
     intake.finish()
 }
@@ -820,12 +839,13 @@ pub fn import(store: &dyn Store, root: &Root, input: &mut dyn Read) -> Result<Su
 /// What is not held is answered with a refusal, and the serving goes on.
 pub fn serve(store: &dyn Store, input: &mut dyn Read, output: &mut dyn Write) -> Result<()> {
     let responder = Responder::new(store);
+    let mut request = Vec::new();
     loop {
-        let request = match read_next(input, MAX_REQUEST_BYTES)? {
-            Next::Frame(request) => request,
+        match read_next(input, MAX_REQUEST_BYTES, &mut request)? {
+            Next::Frame => {}
             Next::End => return Err(invalid("a request is empty")),
             Next::Closed => return Ok(()),
-        };
+        }
         responder.answer(&request, &mut |frame| write_frame(output, frame))?;
         write_end(output)?;
         output.flush().map_err(|source| Error::Stream {
@@ -845,6 +865,8 @@ pub struct StreamPeer<R, W> {
     input: R,
     output: W,
     broken: bool,
+    /// One buffer for every frame that is read, from answer to answer.
+    frame: Vec<u8>,
 }
 
 impl<R: Read, W: Write> StreamPeer<R, W> {
@@ -853,6 +875,7 @@ impl<R: Read, W: Write> StreamPeer<R, W> {
             input,
             output,
             broken: false,
+            frame: Vec::new(),
         }
     }
 }
@@ -901,8 +924,8 @@ impl<R: Read, W: Write> Peer for StreamPeer<R, W> {
             })?;
             for (place, (_, limit)) in requests.iter().enumerate().take(sent).skip(answered) {
                 loop {
-                    match read_next(&mut self.input, *limit)? {
-                        Next::Frame(frame) => on_frame(place, &frame)?,
+                    match read_next(&mut self.input, *limit, &mut self.frame)? {
+                        Next::Frame => on_frame(place, &self.frame)?,
                         Next::End => break,
                         Next::Closed => {
                             return Err(peer_error("closed the connection inside an answer"));
