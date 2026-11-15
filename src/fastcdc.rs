@@ -336,13 +336,21 @@ pub(crate) fn chunks_of(data: &[u8], ended: bool, threads: usize) -> Vec<&[u8]> 
     chunks
 }
 
+/// How many stretches of a file there are for each thread that looks through
+/// it for matches. The threads take them one at a time, so a thread that runs
+/// slower than the others, on a slower core or on one that it shares, takes
+/// fewer, and the others do not wait for it. Where chunks end does not depend
+/// on it.
+const STRETCHES_FOR_EACH: usize = 8;
+
 /// Every match in `data` from [`FIRST_WHOLE_HASH`] on, in order, found by
-/// `threads` threads, each in a stretch of its own.
+/// `threads` threads, which take its stretches one at a time.
 fn matches_on_threads(data: &[u8], threads: usize) -> Vec<Match> {
     let Some(length) = data.len().checked_sub(FIRST_WHOLE_HASH) else {
         return Vec::new();
     };
-    let each = length.div_ceil(threads.max(1)).max(1);
+    let threads = threads.max(1);
+    let each = length.div_ceil(threads * STRETCHES_FOR_EACH).max(1);
     let stretches: Vec<(usize, usize)> = (FIRST_WHOLE_HASH..data.len())
         .step_by(each)
         .map(|from| (from, (from + each).min(data.len())))
@@ -356,10 +364,9 @@ fn matches_on_threads(data: &[u8], threads: usize) -> Vec<Match> {
         }
         found
     };
-    let mut found: Vec<(usize, Vec<Match>)> = on_threads(stretches.len(), &work)
-        .into_iter()
-        .flatten()
-        .collect();
+    let threads = threads.min(stretches.len());
+    let mut found: Vec<(usize, Vec<Match>)> =
+        on_threads(threads, &work).into_iter().flatten().collect();
     found.sort_unstable_by_key(|(from, _)| *from);
     found.into_iter().flat_map(|(_, matches)| matches).collect()
 }
