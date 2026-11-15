@@ -293,29 +293,41 @@ const FIRST_WHOLE_HASH: usize = FASTCDC_MIN_SIZE + GEAR_WINDOW - 1;
 
 /// Chunks `data` with fastcdc-v1 as [`Chunking::cut`] does, with `threads`
 /// threads at work. Unless `ended`, more of the stream comes after `data`,
-/// and only the chunks that are settled are given: each one that begins at
-/// least [`FASTCDC_MAX_SIZE`] bytes before the end of `data`.
+/// and only the chunks that are settled are given: each whose end is found
+/// before the end of `data`, or that holds [`FASTCDC_MAX_SIZE`] bytes. What
+/// comes after a chunk's end cannot change where the chunk ends.
 ///
 /// Where a chunk ends depends on where it began, so a file's chunks follow
 /// one another. But from a chunk's 64th hashed byte on, its hash holds the
 /// 64 bytes that end there and nothing else, so it is the same wherever the
-/// chunk began. So each thread first finds, in a stretch of its own, every
-/// byte where that hash matches the loose mask, and whether it matches the
-/// strict mask too. Matches are few: one in 512 KiB, on average. The chunks
-/// are then settled one after another from the matches, and only the first
-/// 63 hashed bytes of each chunk are rolled over here. That gives exactly
-/// the chunks that one hash gives, rolled over a byte at a time.
-pub(crate) fn chunks_on_threads(data: &[u8], ended: bool, threads: usize) -> Vec<&[u8]> {
-    let matches = matches_on_threads(data, threads);
+/// chunk began. So with several threads, each first finds, in a stretch of
+/// its own, every byte where that hash matches the loose mask, and whether
+/// it matches the strict mask too. Matches are few: one in 512 KiB, on
+/// average. The chunks are then settled one after another from the
+/// matches, and only the first 63 hashed bytes of each chunk are rolled over
+/// here. That gives exactly the chunks that one hash gives, rolled over a
+/// byte at a time.
+pub(crate) fn chunks_of(data: &[u8], ended: bool, threads: usize) -> Vec<&[u8]> {
+    let matches = if threads > 1 {
+        matches_on_threads(data, threads)
+    } else {
+        Vec::new()
+    };
     let mut chunks = Vec::with_capacity(data.len() / FASTCDC_TARGET_SIZE + 1);
     let mut start = 0;
     let mut next = 0;
     while start < data.len() {
         let rest = &data[start..];
-        if !ended && rest.len() < FASTCDC_MAX_SIZE {
+        let length = if threads > 1 {
+            boundary_from(rest, start, &matches, &mut next)
+        } else {
+            fastcdc_boundary(rest)
+        };
+        // A chunk that runs to the end of what is held, and is shorter than
+        // the longest, may end further on.
+        if !ended && length == rest.len() && length < FASTCDC_MAX_SIZE {
             break;
         }
-        let length = boundary_from(rest, start, &matches, &mut next);
         chunks.push(&rest[..length]);
         start += length;
     }
@@ -794,19 +806,13 @@ mod tests {
         assert!(Chunking::FastCdcV1.cut(&[]).is_empty());
     }
 
-    /// Chunks one after another, each with `boundary`, as a stream is
-    /// chunked: unless `ended`, only the chunks that begin at least
-    /// [`FASTCDC_MAX_SIZE`] bytes before the end of `data`.
-    fn one_at_a_time(data: &[u8], ended: bool, boundary: fn(&[u8]) -> usize) -> Vec<&[u8]> {
+    /// The chunks of the whole of `data`, each found by the plain definition.
+    fn plain_chunks(data: &[u8]) -> Vec<&[u8]> {
         let mut chunks = Vec::new();
         let mut start = 0;
         while start < data.len() {
-            let rest = &data[start..];
-            if !ended && rest.len() < FASTCDC_MAX_SIZE {
-                break;
-            }
-            let length = boundary(rest);
-            chunks.push(&rest[..length]);
+            let length = fastcdc_boundary_plain(&data[start..]);
+            chunks.push(&data[start..start + length]);
             start += length;
         }
         chunks
@@ -832,11 +838,14 @@ mod tests {
         let inputs = lengths.iter().map(|&length| &corpus[..length]);
         for data in inputs.chain([zeros.as_slice()]) {
             for ended in [true, false] {
-                let expected = one_at_a_time(data, ended, fastcdc_boundary);
+                let expected = chunks_of(data, ended, 1);
+                if ended {
+                    assert_eq!(expected, Chunking::FastCdcV1.cut(data));
+                }
                 // Stretches of every length, and so ends at every place.
-                for threads in [1, 2, 3, 5, 8, 13] {
+                for threads in [2, 3, 5, 8, 13] {
                     assert_eq!(
-                        chunks_on_threads(data, ended, threads),
+                        chunks_of(data, ended, threads),
                         expected,
                         "length {}, {threads} threads, ended {ended}",
                         data.len()
@@ -873,7 +882,7 @@ mod tests {
         let last = second + FASTCDC_MIN_SIZE + 10;
         data[last + 1 - GEAR_WINDOW..=last].copy_from_slice(&window);
 
-        let expected = one_at_a_time(&data, true, fastcdc_boundary_plain);
+        let expected = plain_chunks(&data);
         assert_eq!(expected[0].len(), second);
         assert!(expected[1].len() > FASTCDC_MIN_SIZE + 11);
         let at_last = Match {
@@ -882,7 +891,41 @@ mod tests {
         };
         assert!(matches_on_threads(&data, 2).contains(&at_last));
         for threads in [1, 2, 4] {
-            assert_eq!(chunks_on_threads(&data, true, threads), expected);
+            assert_eq!(chunks_of(&data, true, threads), expected);
+        }
+    }
+
+    #[test]
+    fn a_chunk_is_settled_once_its_end_is_held() {
+        let corpus = corpus_bytes("scionic-fastcdc-v1:test:settled", 14 << 20);
+        let whole = plain_chunks(&corpus);
+        let mut ends = vec![0];
+        for chunk in &whole {
+            ends.push(ends[ends.len() - 1] + chunk.len());
+        }
+        assert!(whole.len() > 3, "several chunks");
+        // Around where chunks end, and where the longest kind would end.
+        let mut held: Vec<usize> = Vec::new();
+        for &end in &ends[1..4] {
+            held.extend([end - 1, end, end + 1]);
+        }
+        for &start in &ends[..3] {
+            held.extend([start + FASTCDC_MAX_SIZE - 1, start + FASTCDC_MAX_SIZE]);
+        }
+        held.extend([FASTCDC_MIN_SIZE, FIRST_WHOLE_HASH + 5]);
+        held.retain(|&held| held < corpus.len());
+        for held in held {
+            let data = &corpus[..held];
+            for threads in [1, 3] {
+                let settled = chunks_of(data, false, threads);
+                // A chunk that is settled is one of the whole's: nothing that
+                // comes later changes it.
+                assert!(settled[..] == whole[..settled.len()], "held {held}");
+                // And only the chunk that runs on past what is held is left.
+                let reach: usize = settled.iter().map(|chunk| chunk.len()).sum();
+                let next = whole.get(settled.len()).map_or(0, |chunk| chunk.len());
+                assert!(reach + next >= held, "held {held}, {threads} threads");
+            }
         }
     }
 

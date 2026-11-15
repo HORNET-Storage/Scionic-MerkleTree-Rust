@@ -7,6 +7,7 @@ use scionic_merkletree::{
     build, export, fetch, import, verify_with, Builder, ChunkRef, Chunking, Error, ExtraData, Hash,
     Intake, MemoryStore, Result, Root, Store, Stored, VerifyOptions, BUNDLE_MAGIC, FRAME_CHUNK,
 };
+use std::io::{self, Read};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -419,5 +420,109 @@ fn a_bundle_ends_at_the_first_chunk_that_is_damaged_or_missing() {
         let result = export(&missing, &root, &mut out);
         assert!(matches!(result, Err(Error::Missing { .. })), "{result:?}");
         assert!(out == before, "missing chunk at frame {bad}");
+    }
+}
+
+/// Bytes that look random, made quickly: a long file for a test.
+fn long_bytes(seed: u64, length: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut out = Vec::with_capacity(length + 8);
+    while out.len() < length {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(length);
+    out
+}
+
+/// A reader that gives at most `step` bytes at a time, and fails once it has
+/// given `fails_at`.
+struct Stutter<'a> {
+    data: &'a [u8],
+    at: usize,
+    step: usize,
+    fails_at: usize,
+}
+
+impl<'a> Stutter<'a> {
+    fn new(data: &'a [u8], step: usize) -> Self {
+        Self {
+            data,
+            at: 0,
+            step,
+            fails_at: usize::MAX,
+        }
+    }
+}
+
+impl Read for Stutter<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.at >= self.fails_at {
+            return Err(io::Error::other("the disk went away"));
+        }
+        let count = buffer.len().min(self.step).min(self.data.len() - self.at);
+        buffer[..count].copy_from_slice(&self.data[self.at..self.at + count]);
+        self.at += count;
+        Ok(count)
+    }
+}
+
+#[test]
+fn a_long_file_that_is_read_is_the_file_held_in_memory() {
+    // Longer than a window of a builder that works alone, and than the two
+    // windows of one that has help.
+    let data = long_bytes(7, 72 << 20);
+    for chunking in [Chunking::FastCdcV1, Chunking::fixed(3 << 20).unwrap()] {
+        let mut first: Option<(scionic_merkletree::Target, _)> = None;
+        for threads in [1, 3] {
+            let store = MemoryStore::new();
+            let mut builder = Builder::new(&store, chunking).threads(threads);
+            let in_memory = builder.file_from_bytes(&data).unwrap();
+            // Reads that end anywhere, and a window filled in many reads.
+            for step in [(1 << 20) + 17, 5_000_011] {
+                let read = builder.file(&mut Stutter::new(&data, step)).unwrap();
+                assert_eq!(
+                    read, in_memory,
+                    "{chunking:?}, {threads} threads, step {step}"
+                );
+            }
+            let kept = contents(&store);
+            match &first {
+                None => first = Some((in_memory, kept)),
+                Some((target, held)) => {
+                    assert_eq!(&in_memory, target, "{chunking:?}, {threads} threads");
+                    assert!(&kept == held, "{chunking:?}, {threads} threads");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_long_file_that_cannot_be_read_or_kept_whole_has_no_list() {
+    let data = long_bytes(11, 48 << 20);
+    for threads in [1, 3] {
+        // The reader fails in the second window, while the first is kept.
+        let store = MemoryStore::new();
+        let mut builder = Builder::new(&store, Chunking::FastCdcV1).threads(threads);
+        let mut reader = Stutter::new(&data, 1 << 20);
+        reader.fails_at = 40 << 20;
+        let result = builder.file(&mut reader);
+        assert!(matches!(result, Err(Error::Stream { .. })), "{result:?}");
+        assert_eq!(store.count(Stored::FileList), 0);
+
+        // The store will not keep a chunk of the first window.
+        let chunks = Chunking::FastCdcV1.cut(&data);
+        let refused = ChunkRef::of(chunks[2]).unwrap().hash;
+        let store = Refusing {
+            inner: MemoryStore::new(),
+            refused,
+        };
+        let mut builder = Builder::new(&store, Chunking::FastCdcV1).threads(threads);
+        let result = builder.file(&mut Stutter::new(&data, 1 << 20));
+        assert!(matches!(result, Err(Error::Invariant { .. })), "{result:?}");
+        assert_eq!(store.inner.count(Stored::FileList), 0);
     }
 }

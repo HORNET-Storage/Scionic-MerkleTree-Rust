@@ -1,7 +1,7 @@
 //! Building a tree: from a folder or a file on disk, or part by part.
 
 use crate::disk::{Found, Held, Refused};
-use crate::fastcdc::{chunks_on_threads, StreamChunker, FASTCDC_MAX_SIZE};
+use crate::fastcdc::{chunks_of, FASTCDC_MAX_SIZE};
 use crate::format::{
     check_name, ChunkRef, Chunking, Entry, ExtraData, FileList, FolderList, Kind, Record, Target,
     MAX_FOLDER_DEPTH, TIMESTAMP_KEY,
@@ -29,16 +29,27 @@ pub(crate) fn read_some(reader: &mut dyn Read, buffer: &mut [u8]) -> io::Result<
 }
 
 /// How much of a file a builder holds at a time when it works alone: two
-/// chunks of the longest kind.
+/// chunks of the longest kind, one in each of its two windows.
 const ROOM_ALONE: usize = 2 * FASTCDC_MAX_SIZE;
 
-/// How much of a file a builder holds at a time when other threads help it:
-/// enough chunks to give each of them some.
+/// How much of a file a builder holds at a time when other threads help it,
+/// in its two windows: enough chunks to give each of them some.
 const ROOM_WITH_HELP: usize = 8 * FASTCDC_MAX_SIZE;
 
-/// The least of a file that lies in memory that is worth a thread of its
-/// own, when several threads look through it for where its chunks may end.
+/// The least of a file that is worth a thread of its own, when several
+/// threads look through it for where its chunks may end.
 const LOOKED_THROUGH_BY_EACH: usize = 4 << 20;
+
+/// The least bytes of chunks that are worth a helper of their own, while
+/// the thread that reads a file reads on.
+const KEPT_BY_EACH: usize = 1 << 20;
+
+/// The most chunks of a fixed size that a window holds.
+const FIXED_CHUNKS_IN_A_WINDOW: usize = 1024;
+
+/// What a window holds when it starts on its first file. A window grows only
+/// as a file turns out to be longer, so a small file never costs a large one.
+const WINDOW_START: usize = 64 * 1024;
 
 fn cores() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
@@ -47,12 +58,13 @@ fn cores() -> usize {
 /// The threads that are free to help with a long file.
 ///
 /// Where one chunk ends decides where the next begins, so a file is chunked
-/// in order, on the thread that asks for it. A file that lies in memory is
-/// first looked through by the helpers that are free, each in a stretch of
-/// its own, for every place where a chunk may end, and is then chunked from
+/// in order, on the thread that asks for it. A long stretch of a file is
+/// first looked through by the helpers that are free, each in a part of its
+/// own, for every place where a chunk may end, and is then chunked from
 /// those places alone. Hashing and keeping the chunks is the greater part of
 /// the work and needs no order, so it is shared out among that thread and
-/// the helpers that are free.
+/// the helpers that are free: for a file that is read, while that thread
+/// reads on.
 pub(crate) struct Helpers {
     free: AtomicUsize,
 }
@@ -111,7 +123,7 @@ impl Helpers {
 pub struct Builder<'s> {
     store: &'s dyn Store,
     chunking: Chunking,
-    chunker: StreamChunker,
+    windows: Windows,
     helpers: Arc<Helpers>,
 }
 
@@ -125,17 +137,16 @@ impl<'s> Builder<'s> {
         Self {
             store,
             chunking,
-            chunker: StreamChunker::new(),
+            windows: Windows::default(),
             helpers,
         }
     }
 
     /// How many threads work on one file: 1 is the calling thread alone, and
-    /// zero is one thread for each core. They hash and keep its chunks, and
-    /// for a file that lies in memory they also find where its chunks end. A
-    /// file that is read is chunked on the calling thread. With help, a
-    /// builder holds up to 64 MiB of a long file that it reads at a time;
-    /// alone it holds up to 16 MiB.
+    /// zero is one thread for each core. They find where its chunks end, and
+    /// hash and keep them; for a file that is read, while the calling thread
+    /// reads on. With help, a builder holds up to 64 MiB of a long file that
+    /// it reads at a time; alone it holds up to 16 MiB.
     pub fn threads(mut self, threads: usize) -> Self {
         self.helpers = Helpers::for_threads(threads);
         self
@@ -161,20 +172,7 @@ impl<'s> Builder<'s> {
     /// The file with these bytes. They are chunked where they lie, and nothing
     /// is copied on the way to the store.
     pub fn file_from_bytes(&mut self, bytes: &[u8]) -> Result<Target> {
-        let chunks = match self.chunking {
-            Chunking::FastCdcV1 => {
-                let wanted = (bytes.len() / LOOKED_THROUGH_BY_EACH).saturating_sub(1);
-                let helping = self.helpers.take(wanted);
-                let chunks = if helping == 0 {
-                    self.chunking.cut(bytes)
-                } else {
-                    chunks_on_threads(bytes, true, helping + 1)
-                };
-                self.helpers.give(helping);
-                chunks
-            }
-            Chunking::Fixed(_) => self.chunking.cut(bytes),
-        };
+        let chunks = settled(self.chunking, &self.helpers, bytes, true);
         let mut items = Vec::with_capacity(chunks.len());
         keep_chunks(self.store, &self.helpers, &chunks, &mut items)?;
         self.keep_list(items)
@@ -188,18 +186,45 @@ impl<'s> Builder<'s> {
         })
     }
 
-    fn file_from(&mut self, read: impl FnMut(&mut [u8]) -> Result<usize>) -> Result<Target> {
+    /// Chunks, hashes and keeps a file that `read` reads, one window at a
+    /// time. While the chunks of one window are hashed and kept, what is left
+    /// of it goes to the start of the other, and the file is read on into
+    /// that one.
+    fn file_from(&mut self, mut read: impl FnMut(&mut [u8]) -> Result<usize>) -> Result<Target> {
         let store = self.store;
-        let helpers = &self.helpers;
-        let room = if helpers.any() {
-            ROOM_WITH_HELP
-        } else {
-            ROOM_ALONE
-        };
+        let chunking = self.chunking;
+        let helpers = &*self.helpers;
+        let room = window_room(chunking, helpers.any());
+        let Windows { current, next } = &mut self.windows;
         let mut items = Vec::new();
-        self.chunker.cut(self.chunking, room, read, |chunks| {
-            keep_chunks(store, helpers, chunks, &mut items)
-        })?;
+        let (mut filled, mut ended) = fill(current, 0, room, &mut read)?;
+        while filled > 0 {
+            let chunks = settled(chunking, helpers, &current[..filled], ended);
+            if chunks.is_empty() {
+                return Err(Error::Invariant {
+                    detail: "a full window settled no chunk",
+                });
+            }
+            let settled_to: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+            let tail = &current[settled_to..filled];
+            // Once the file has ended there is nothing to read meanwhile.
+            let most = if ended {
+                chunks.len() / 2
+            } else {
+                settled_to.div_ceil(KEPT_BY_EACH)
+            };
+            let (kept, refilled) =
+                keep_chunks_while(store, helpers, most, &chunks, &mut items, || {
+                    carry(tail, next, room)?;
+                    if ended {
+                        return Ok((tail.len(), true));
+                    }
+                    fill(next, tail.len(), room, &mut read)
+                });
+            kept?;
+            (filled, ended) = refilled?;
+            std::mem::swap(current, next);
+        }
         self.keep_list(items)
     }
 
@@ -262,13 +287,21 @@ fn keep_chunks(
     items: &mut Vec<ChunkRef>,
 ) -> Result<()> {
     // A helper is worth starting only for a few chunks of its own.
-    let helping = helpers.take(chunks.len() / 2);
-    if helping == 0 {
-        for chunk in chunks {
-            items.push(keep_chunk(store, chunk)?);
-        }
-        return Ok(());
-    }
+    keep_chunks_while(store, helpers, chunks.len() / 2, chunks, items, || ()).0
+}
+
+/// Hashes and keeps chunks as [`keep_chunks`] does, with up to `most`
+/// helpers, while this thread does `meanwhile`; then this thread takes a
+/// share too. Gives what became of the chunks, and what `meanwhile` gave.
+fn keep_chunks_while<T>(
+    store: &dyn Store,
+    helpers: &Helpers,
+    most: usize,
+    chunks: &[&[u8]],
+    items: &mut Vec<ChunkRef>,
+    meanwhile: impl FnOnce() -> T,
+) -> (Result<()>, T) {
+    let helping = helpers.take(most);
     let next = AtomicUsize::new(0);
     let work = || {
         let mut kept = Vec::new();
@@ -284,8 +317,9 @@ fn keep_chunks(
             kept.push((index, item));
         }
     };
-    let kept: Vec<(usize, Result<ChunkRef>)> = std::thread::scope(|scope| {
+    let (kept, done) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..helping).map(|_| scope.spawn(work)).collect();
+        let done = meanwhile();
         let mut kept = work();
         for handle in handles {
             match handle.join() {
@@ -293,10 +327,20 @@ fn keep_chunks(
                 Err(payload) => std::panic::resume_unwind(payload),
             }
         }
-        kept
+        (kept, done)
     });
     helpers.give(helping);
-    let mut found: Vec<Option<ChunkRef>> = vec![None; chunks.len()];
+    (in_order(kept, chunks.len(), items), done)
+}
+
+/// Adds what the chunks that were kept are to `items`, in their order, or
+/// gives the failure there was.
+fn in_order(
+    kept: Vec<(usize, Result<ChunkRef>)>,
+    count: usize,
+    items: &mut Vec<ChunkRef>,
+) -> Result<()> {
+    let mut found: Vec<Option<ChunkRef>> = vec![None; count];
     for (index, item) in kept {
         found[index] = Some(item?);
     }
@@ -305,6 +349,108 @@ fn keep_chunks(
             detail: "a chunk was left out of a file",
         })?);
     }
+    Ok(())
+}
+
+/// What a builder holds of a file that it reads, in two windows: while the
+/// chunks of one are hashed and kept, the file is read on into the other.
+#[derive(Default)]
+struct Windows {
+    current: Vec<u8>,
+    next: Vec<u8>,
+}
+
+/// The most bytes one of a builder's two windows holds: half of what the
+/// builder may hold, and never less than one chunk of the longest kind.
+fn window_room(chunking: Chunking, help: bool) -> usize {
+    let room = if help { ROOM_WITH_HELP } else { ROOM_ALONE };
+    match chunking {
+        Chunking::FastCdcV1 => (room / 2).max(FASTCDC_MAX_SIZE),
+        Chunking::Fixed(size) => {
+            let size = size.get() as usize;
+            let most = size.saturating_mul(FIXED_CHUNKS_IN_A_WINDOW);
+            (room / 2).min(most).max(size)
+        }
+    }
+}
+
+/// The chunks of `data`, the start of what is left of a file, that are
+/// settled: all of them once the file has ended. Helpers that are free look
+/// through a long stretch for where its chunks may end.
+fn settled<'d>(
+    chunking: Chunking,
+    helpers: &Helpers,
+    data: &'d [u8],
+    ended: bool,
+) -> Vec<&'d [u8]> {
+    match chunking {
+        Chunking::FastCdcV1 => {
+            let wanted = (data.len() / LOOKED_THROUGH_BY_EACH).saturating_sub(1);
+            let helping = helpers.take(wanted);
+            let chunks = chunks_of(data, ended, helping + 1);
+            helpers.give(helping);
+            chunks
+        }
+        Chunking::Fixed(size) => {
+            let size = size.get() as usize;
+            let mut chunks: Vec<&[u8]> = data.chunks(size).collect();
+            if !ended && chunks.last().is_some_and(|last| last.len() < size) {
+                chunks.pop();
+            }
+            chunks
+        }
+    }
+}
+
+/// Makes `window` at least `least` bytes long: twice as long as it was, and
+/// no longer than `room` unless `least` is longer.
+fn grow(window: &mut Vec<u8>, least: usize, room: usize) -> Result<()> {
+    let length = (window.len() * 2).max(WINDOW_START).min(room).max(least);
+    let more = length.saturating_sub(window.len());
+    window
+        .try_reserve_exact(more)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "the chunking window",
+            requested: length as u64,
+        })?;
+    window.resize(length, 0);
+    Ok(())
+}
+
+/// Reads into `window` from `filled` on, until it holds `room` bytes or the
+/// file has ended. Gives how many bytes it holds, and whether the file has
+/// ended.
+fn fill(
+    window: &mut Vec<u8>,
+    mut filled: usize,
+    room: usize,
+    read: &mut dyn FnMut(&mut [u8]) -> Result<usize>,
+) -> Result<(usize, bool)> {
+    while filled < room {
+        if filled == window.len() {
+            grow(window, filled + 1, room)?;
+        }
+        let end = window.len().min(room);
+        let count = read(&mut window[filled..end])?;
+        if count > end - filled {
+            return Err(Error::Invariant {
+                detail: "a reader gave more bytes than it was asked for",
+            });
+        }
+        if count == 0 {
+            return Ok((filled, true));
+        }
+        filled += count;
+    }
+    Ok((filled, false))
+}
+
+/// Puts `tail`, what is left of one window, at the start of the other.
+fn carry(tail: &[u8], window: &mut Vec<u8>, room: usize) -> Result<()> {
+    if window.len() < tail.len() {
+        grow(window, tail.len(), room)?;
+    }
+    window[..tail.len()].copy_from_slice(tail);
     Ok(())
 }
 
