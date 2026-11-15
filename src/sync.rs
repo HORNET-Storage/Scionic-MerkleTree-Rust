@@ -24,7 +24,7 @@ use crate::format::{
     MAX_NAME_BYTES, MAX_RECORD_BYTES,
 };
 use crate::hash::{Hash, Root};
-use crate::intake::{Arrived, ChunkFrames, Intake, Summary};
+use crate::intake::{Arrived, ChunkFrames, Intake, Summary, TakingIn};
 use crate::read::{file_of, folder_of, record_of};
 use crate::store::{check_chunk, damaged, lent, ChunksAhead, Store, Stored};
 use crate::wire::{
@@ -513,8 +513,8 @@ fn ask_one(peer: &mut dyn Peer, request: &Request, limit: usize) -> Result<Vec<u
 pub fn fetch(store: &dyn Store, root: &Root, peer: &mut dyn Peer) -> Result<Summary> {
     let mut intake = Intake::new(store, *root)?;
     // Chunks that come one after another are held, and taken in together
-    // by several threads.
-    let mut held = ChunkFrames::new();
+    // by several threads while the next ones come.
+    let mut frames = [ChunkFrames::new(), ChunkFrames::new()];
     loop {
         let requests = intake.requests(REQUESTS_PER_ROUND);
         if requests.is_empty() {
@@ -533,39 +533,40 @@ pub fn fetch(store: &dyn Store, root: &Root, peer: &mut dyn Peer) -> Result<Summ
             .collect();
         let mut taken = vec![0_usize; requests.len()];
         let mut refused = vec![false; requests.len()];
-        peer.ask_all(&asks, &mut |place, frame| {
-            let (Some(expected), Some(taken), Some(refused)) = (
-                expected.get(place),
-                taken.get_mut(place),
-                refused.get_mut(place),
-            ) else {
-                return Err(peer_error("answered a request that was not sent"));
-            };
-            if *refused {
-                return Err(peer_error("sent more after it refused"));
-            }
-            if frame.first() == Some(&FRAME_REFUSED) {
-                Frame::decode(frame)?;
-                *refused = true;
-                return Ok(());
-            }
-            let Some(expected) = expected.get(*taken) else {
-                return Err(TOO_MUCH);
-            };
-            if matches!(expected, Arrived::Chunk(_)) && frame.first() == Some(&FRAME_CHUNK) {
-                held.hold_copy(frame, Some(*expected));
-                if held.full() {
-                    held.take_in(&mut intake)?;
+        std::thread::scope(|scope| {
+            let mut taking = TakingIn::new(scope, &mut intake, &mut frames);
+            let asked = peer.ask_all(&asks, &mut |place, frame| {
+                let (Some(expected), Some(taken), Some(refused)) = (
+                    expected.get(place),
+                    taken.get_mut(place),
+                    refused.get_mut(place),
+                ) else {
+                    return Err(peer_error("answered a request that was not sent"));
+                };
+                if *refused {
+                    return Err(peer_error("sent more after it refused"));
                 }
-            } else {
-                // What came before is taken in first.
-                held.take_in(&mut intake)?;
-                intake.accept_expected(frame, *expected)?;
-            }
-            *taken += 1;
-            Ok(())
+                if frame.first() == Some(&FRAME_REFUSED) {
+                    Frame::decode(frame)?;
+                    *refused = true;
+                    return Ok(());
+                }
+                let Some(expected) = expected.get(*taken) else {
+                    return Err(TOO_MUCH);
+                };
+                if matches!(expected, Arrived::Chunk(_)) && frame.first() == Some(&FRAME_CHUNK) {
+                    taking.hold_copy(frame, Some(*expected))?;
+                } else {
+                    // What came before is taken in first.
+                    taking.intake()?.accept_expected(frame, *expected)?;
+                }
+                *taken += 1;
+                Ok(())
+            });
+            // What came before a failure is taken in first, and its own
+            // failure is the one given.
+            taking.finish().and(asked)
         })?;
-        held.take_in(&mut intake)?;
         if taken.contains(&0) {
             return Err(peer_error("does not hold what the tree needs"));
         }
@@ -862,33 +863,49 @@ pub fn import(store: &dyn Store, root: &Root, input: &mut dyn Read) -> Result<Su
     }
     let mut intake = Intake::new(store, *root)?;
     // Chunks that come one after another are held, and taken in together
-    // by several threads, once the record is in. Each frame is read into a
-    // buffer of theirs, and one more buffer serves every other frame of the
-    // bundle.
-    let mut held = ChunkFrames::new();
+    // by several threads while the next ones are read, once the record is
+    // in. Each frame is read into a buffer of theirs, and one more buffer
+    // serves every other frame of the bundle.
+    let mut frames = [ChunkFrames::new(), ChunkFrames::new()];
     let mut frame = Vec::new();
-    loop {
-        match read_next(input, intake.frame_limit(), held.next_buffer())? {
-            Next::Frame if held.next_is_chunk() && intake.record().is_some() => {
-                held.hold(None);
-                if held.full() {
-                    held.take_in(&mut intake)?;
+    // What the intake takes changes only when it takes a frame that is not
+    // a chunk's, and those are taken here.
+    let mut limit = intake.frame_limit();
+    let mut recorded = intake.record().is_some();
+    std::thread::scope(|scope| {
+        let mut taking = TakingIn::new(scope, &mut intake, &mut frames);
+        let read = loop {
+            let next = match read_next(input, limit, taking.next_buffer()) {
+                Ok(next) => next,
+                Err(error) => break Err(error),
+            };
+            match next {
+                Next::Frame if recorded && taking.next_is_chunk() => {
+                    if let Err(error) = taking.hold(None) {
+                        break Err(error);
+                    }
                 }
+                Next::Frame => {
+                    // What came before is taken in first.
+                    std::mem::swap(&mut frame, taking.next_buffer());
+                    let accepted = taking.intake().and_then(|intake| {
+                        intake.accept(&frame)?;
+                        limit = intake.frame_limit();
+                        recorded = intake.record().is_some();
+                        Ok(())
+                    });
+                    if let Err(error) = accepted {
+                        break Err(error);
+                    }
+                }
+                Next::End => break Err(invalid("a frame is empty")),
+                Next::Closed => break Ok(()),
             }
-            Next::Frame => {
-                // What came before is taken in first.
-                std::mem::swap(&mut frame, held.next_buffer());
-                held.take_in(&mut intake)?;
-                intake.accept(&frame)?;
-            }
-            Next::End => {
-                held.take_in(&mut intake)?;
-                return Err(invalid("a frame is empty"));
-            }
-            Next::Closed => break,
-        }
-    }
-    held.take_in(&mut intake)?;
+        };
+        // What came before a failure is taken in first, and its own failure
+        // is the one given.
+        taking.finish().and(read)
+    })?;
     intake.finish()
 }
 

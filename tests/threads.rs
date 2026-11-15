@@ -5,7 +5,7 @@ mod support;
 
 use scionic_merkletree::{
     build, export, fetch, import, read_file, read_range, record_of, verify_with, Builder, ChunkRef,
-    Chunking, Error, ExtraData, Hash, Intake, MemoryStore, Result, Root, Store, Stored,
+    Chunking, Error, ExtraData, Hash, Intake, MemoryStore, Request, Result, Root, Store, Stored,
     VerifyOptions, BUNDLE_MAGIC, FRAME_CHUNK,
 };
 use std::io::{self, Read};
@@ -207,6 +207,11 @@ fn long_tree(seed: &str) -> (MemoryStore, Root, Vec<Vec<u8>>) {
     let root = builder.finish(top, ExtraData::new()).unwrap();
     let mut bundle = Vec::new();
     export(&store, &root, &mut bundle).unwrap();
+    (store, root, frames_of(&bundle))
+}
+
+/// The frames of a bundle.
+fn frames_of(bundle: &[u8]) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
     let mut rest = &bundle[BUNDLE_MAGIC.len()..];
     while let Some((length, after)) = rest.split_first_chunk::<4>() {
@@ -214,7 +219,7 @@ fn long_tree(seed: &str) -> (MemoryStore, Root, Vec<Vec<u8>>) {
         frames.push(frame.to_vec());
         rest = after;
     }
-    (store, root, frames)
+    frames
 }
 
 /// A bundle that holds these frames.
@@ -559,4 +564,146 @@ fn a_long_file_that_cannot_be_read_or_kept_whole_has_no_list() {
         assert!(matches!(result, Err(Error::Invariant { .. })), "{result:?}");
         assert_eq!(store.inner.count(Stored::FileList), 0);
     }
+}
+
+/// A tree of one file of many short chunks, and the frames of its bundle.
+/// Its chunks are taken in in several batches, each while the next comes.
+fn many_chunks_tree() -> (MemoryStore, Root, Vec<Vec<u8>>) {
+    // 4,100 chunks of 64 bytes: four batches of 1,024, and a few more.
+    let store = MemoryStore::new();
+    let mut builder = Builder::new(&store, Chunking::fixed(64).unwrap());
+    let top = builder.file_from_bytes(&long_bytes(13, 64 * 4100)).unwrap();
+    let root = builder.finish(top, ExtraData::new()).unwrap();
+    let mut bundle = Vec::new();
+    export(&store, &root, &mut bundle).unwrap();
+    (store, root, frames_of(&bundle))
+}
+
+/// Changes the last byte of a chunk's frame: no list names what it is then.
+fn damage(frame: &mut [u8]) {
+    let last = frame.len() - 1;
+    frame[last] ^= 1;
+}
+
+/// A peer that answers from `store`, with the chunk `bad` damaged, and with
+/// a frame longer than was asked for after the chunk that starts the
+/// request for chunks from `overlong_at` on, when that is given.
+fn bad_peer(store: &MemoryStore, bad: Option<Hash>, overlong_at: Option<u64>) -> TestPeer<'_> {
+    TestPeer::tampering(store, move |request, mut answer| {
+        for frame in &mut answer {
+            if frame[0] == FRAME_CHUNK && Some(Hash::of(&frame[1..])) == bad {
+                damage(frame);
+            }
+        }
+        if let Ok(Request::Chunks { start, .. }) = Request::decode(request) {
+            if Some(start) == overlong_at {
+                answer.insert(1, vec![FRAME_CHUNK; 4096]);
+            }
+        }
+        answer
+    })
+}
+
+#[test]
+fn chunks_taken_in_while_more_come_are_taken_in_as_by_one() {
+    let (source, root, frames) = many_chunks_tree();
+    assert!(chunk_places(&frames).len() > 4 * 1024, "several batches");
+    let imported = MemoryStore::new();
+    import(&imported, &root, &mut bundle_of(&frames).as_slice()).unwrap();
+    assert!(contents(&imported) == contents(&source));
+    let fetched = MemoryStore::new();
+    fetch(&fetched, &root, &mut TestPeer::new(&source)).unwrap();
+    assert!(contents(&fetched) == contents(&source));
+}
+
+#[test]
+fn a_bad_chunk_taken_in_while_more_come_is_what_is_told() {
+    let (source, root, frames) = many_chunks_tree();
+    let places = chunk_places(&frames);
+    // In the first batch, which is taken in while the second comes; in the
+    // second; and the last chunk, in the last batch.
+    for bad in [100, 2_000, places.len() - 1] {
+        let hash = Hash::of(&frames[places[bad]][1..]);
+        let mut forged = frames.clone();
+        damage(&mut forged[places[bad]]);
+        let imported = MemoryStore::new();
+        let result = import(&imported, &root, &mut bundle_of(&forged).as_slice());
+        assert!(
+            matches!(result, Err(Error::NotWanted { .. })),
+            "chunk {bad}: {result:?}"
+        );
+        let fetched = MemoryStore::new();
+        let result = fetch(&fetched, &root, &mut bad_peer(&source, Some(hash), None));
+        assert!(
+            matches!(result, Err(Error::NotWanted { .. })),
+            "chunk {bad}: {result:?}"
+        );
+        for store in [&imported, &fetched] {
+            // What was kept is the tree's, and so are the chunks before the
+            // bad one.
+            for (kind, hash, kept) in contents(store) {
+                assert!(source.get(kind, &hash).unwrap().as_deref() == Some(kept.as_slice()));
+            }
+            for &place in &places[..bad] {
+                let hash = Hash::of(&frames[place][1..]);
+                assert!(store.has(Stored::Chunk, &hash).unwrap(), "chunk {bad}");
+            }
+            assert!(!store.has(Stored::Chunk, &hash).unwrap());
+        }
+    }
+}
+
+#[test]
+fn a_failure_after_a_bad_chunk_that_is_being_taken_in_is_not_what_is_told() {
+    let (source, root, frames) = many_chunks_tree();
+    let places = chunk_places(&frames);
+    // Chunk 100 is in the first batch, which is taken in while the second
+    // comes, and the failure comes in the second, at chunk 1,500.
+    let bad = Hash::of(&frames[places[100]][1..]);
+    let mut forged = frames.clone();
+    damage(&mut forged[places[100]]);
+    let fails_at = bundle_of(&frames[..places[1_500]]).len();
+    for (frames, damaged) in [(&forged, true), (&frames, false)] {
+        let bundle = bundle_of(frames);
+        let mut reader = Stutter::new(&bundle, 1_000);
+        reader.fails_at = fails_at;
+        let result = import(&MemoryStore::new(), &root, &mut reader);
+        if damaged {
+            assert!(matches!(result, Err(Error::NotWanted { .. })), "{result:?}");
+        } else {
+            assert!(matches!(result, Err(Error::Stream { .. })), "{result:?}");
+        }
+    }
+    // A peer that sends a frame longer than was asked for in the answer for
+    // chunks 1,472 to 1,535.
+    for (bad, damaged) in [(Some(bad), true), (None, false)] {
+        let mut peer = bad_peer(&source, bad, Some(1_472));
+        let result = fetch(&MemoryStore::new(), &root, &mut peer);
+        if damaged {
+            assert!(matches!(result, Err(Error::NotWanted { .. })), "{result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(Error::LimitExceeded { .. })),
+                "{result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_store_that_falls_over_while_more_chunks_come_does_not_leave_a_fetch_waiting() {
+    let (source, root, frames) = many_chunks_tree();
+    let bundle = bundle_of(&frames);
+    let fell = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        import(&Falling(MemoryStore::new()), &root, &mut bundle.as_slice())
+    }));
+    assert!(fell.is_err());
+    let fell = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        fetch(
+            &Falling(MemoryStore::new()),
+            &root,
+            &mut TestPeer::new(&source),
+        )
+    }));
+    assert!(fell.is_err());
 }

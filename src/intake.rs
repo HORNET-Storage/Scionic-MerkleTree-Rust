@@ -1258,7 +1258,12 @@ impl ChunkFrames {
     }
 
     /// Takes the frames that are held into `intake`, and holds none after.
+    /// With none held, the intake is not asked anything: an intake that
+    /// failed has given its failure already.
     pub(crate) fn take_in(&mut self, intake: &mut Intake<'_>) -> Result<()> {
+        if self.held == 0 {
+            return Ok(());
+        }
         let frames: Vec<(&[u8], Option<Arrived>)> = self.buffers[..self.held]
             .iter()
             .map(Vec::as_slice)
@@ -1270,6 +1275,122 @@ impl ChunkFrames {
         self.bytes = 0;
         self.expected.clear();
         taken
+    }
+}
+
+/// What a batch of chunk frames that other threads took in gives back.
+type TakenIn<'a, 's> = (&'a mut Intake<'s>, &'a mut ChunkFrames, Result<()>);
+
+/// Where an intake is while chunk frames are taken in.
+enum Away<'scope, 'a, 's> {
+    /// Here, with the frames that the next batch will be held in after this
+    /// one.
+    Here(&'a mut Intake<'s>, &'a mut ChunkFrames),
+    /// With other threads, which take in a batch of chunk frames.
+    Taking(std::thread::ScopedJoinHandle<'scope, TakenIn<'a, 's>>),
+}
+
+/// Chunk frames that are taken in by other threads while more come: one
+/// batch is held while the one before it is taken in. Anything else that is
+/// done with the intake waits until every frame before it is in, so the
+/// frames are taken in in their order, and the error is that of the first
+/// frame that is refused or cannot be kept.
+pub(crate) struct TakingIn<'scope, 'env, 'a, 's> {
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    held: &'a mut ChunkFrames,
+    /// None once a batch has failed: its failure is what was given.
+    away: Option<Away<'scope, 'a, 's>>,
+}
+
+impl<'scope, 'env, 'a: 'scope, 's: 'scope> TakingIn<'scope, 'env, 'a, 's> {
+    pub(crate) fn new(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        intake: &'a mut Intake<'s>,
+        frames: &'a mut [ChunkFrames; 2],
+    ) -> Self {
+        let [held, spare] = frames;
+        Self {
+            scope,
+            held,
+            away: Some(Away::Here(intake, spare)),
+        }
+    }
+
+    /// The buffer that the next frame is read into, as
+    /// [`ChunkFrames::next_buffer`] gives it.
+    pub(crate) fn next_buffer(&mut self) -> &mut Vec<u8> {
+        self.held.next_buffer()
+    }
+
+    /// Whether the frame in the next buffer is a chunk's.
+    pub(crate) fn next_is_chunk(&self) -> bool {
+        self.held.next_is_chunk()
+    }
+
+    /// Holds the frame in the next buffer, as [`ChunkFrames::hold`] does.
+    pub(crate) fn hold(&mut self, expected: Option<Arrived>) -> Result<()> {
+        self.held.hold(expected);
+        self.hand_over_when_full()
+    }
+
+    /// Holds a copy of `frame`, which is lent for the call only.
+    pub(crate) fn hold_copy(&mut self, frame: &[u8], expected: Option<Arrived>) -> Result<()> {
+        self.held.hold_copy(frame, expected);
+        self.hand_over_when_full()
+    }
+
+    /// Once enough frames are held, hands them to other threads to take in,
+    /// as soon as the batch before them is in.
+    fn hand_over_when_full(&mut self) -> Result<()> {
+        if !self.held.full() {
+            return Ok(());
+        }
+        let (intake, spare) = self.back()?;
+        let full = std::mem::replace(&mut self.held, spare);
+        let handle = self.scope.spawn(move || {
+            let taken = full.take_in(intake);
+            (intake, full, taken)
+        });
+        self.away = Some(Away::Taking(handle));
+        Ok(())
+    }
+
+    /// Waits until the batch that other threads take in is in, and gives the
+    /// intake and the frames that the next batch is to be held in.
+    fn back(&mut self) -> Result<(&'a mut Intake<'s>, &'a mut ChunkFrames)> {
+        match self.away.take() {
+            Some(Away::Here(intake, spare)) => Ok((intake, spare)),
+            Some(Away::Taking(handle)) => match handle.join() {
+                Ok((intake, spare, Ok(()))) => Ok((intake, spare)),
+                Ok((_, _, Err(error))) => Err(error),
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+            None => Err(Error::IntakeFailed),
+        }
+    }
+
+    /// The intake, once every frame held is in.
+    pub(crate) fn intake(&mut self) -> Result<&mut Intake<'s>> {
+        let (intake, spare) = self.back()?;
+        let taken = self.held.take_in(intake);
+        let away = self.away.insert(Away::Here(intake, spare));
+        taken?;
+        match away {
+            Away::Here(intake, _) => Ok(&mut **intake),
+            Away::Taking(_) => Err(Error::Invariant {
+                detail: "an intake that was here is away",
+            }),
+        }
+    }
+
+    /// Takes in every frame that is held, and gives the failure of the first
+    /// that is refused or cannot be kept. A failure that was given already
+    /// is not given again.
+    pub(crate) fn finish(mut self) -> Result<()> {
+        if self.away.is_none() {
+            return Ok(());
+        }
+        self.intake().map(|_| ())
     }
 }
 
