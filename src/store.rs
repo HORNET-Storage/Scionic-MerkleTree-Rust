@@ -35,7 +35,7 @@ pub enum Stored {
 /// A store that can say how long a thing is without reading it should have
 /// its own [`Store::size`]: a store on disk above all. Without it, seeing
 /// whether a chunk is there takes a read of the whole chunk. A store on disk
-/// should have its own [`Store::lend`] too.
+/// should have its own [`Store::lend`] and [`Store::read_into`] too.
 pub trait Store: Send + Sync {
     /// Keeps `bytes` under `hash`. Keeping what is kept already changes
     /// nothing.
@@ -64,6 +64,20 @@ pub trait Store: Send + Sync {
             Some(bytes) => with(&bytes).map(|()| true),
             None => Ok(false),
         }
+    }
+
+    /// Adds what is kept under `hash` to the end of `buffer`, and says
+    /// whether anything is kept.
+    ///
+    /// The library reads chunks this way where it holds them a while: to
+    /// send them, or to read several at once. A store on disk should have its
+    /// own, which reads straight into `buffer`. Unless a store has its own,
+    /// this asks [`Store::lend`] and copies what is lent.
+    fn read_into(&self, kind: Stored, hash: &Hash, buffer: &mut Vec<u8>) -> Result<bool> {
+        self.lend(kind, hash, &mut |bytes| {
+            buffer.extend_from_slice(bytes);
+            Ok(())
+        })
     }
 
     /// Whether anything is kept under `hash`. Unless a store has its own,
@@ -290,18 +304,26 @@ pub(crate) fn lend_chunk(
     with: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<bool> {
     lent(store, Stored::Chunk, &item.hash, &mut |bytes| {
-        if Hash::of(bytes) != item.hash {
-            return Err(damaged("a stored chunk", &item.hash));
-        }
-        if bytes.len() as u64 != u64::from(item.length) {
-            return Err(Error::SizeMismatch {
-                what: "a stored chunk",
-                expected: u64::from(item.length),
-                actual: bytes.len() as u64,
-            });
-        }
+        check_stored_chunk(item, bytes)?;
         with(bytes)
     })
+}
+
+/// Holds bytes read from a store to the chunk that `item` names. Bytes that
+/// do not hash to the chunk's hash are damaged. Bytes that do, and are not
+/// as many as the item says, show that the item is wrong.
+fn check_stored_chunk(item: &ChunkRef, bytes: &[u8]) -> Result<()> {
+    if Hash::of(bytes) != item.hash {
+        return Err(damaged("a stored chunk", &item.hash));
+    }
+    if bytes.len() as u64 != u64::from(item.length) {
+        return Err(Error::SizeMismatch {
+            what: "a stored chunk",
+            expected: u64::from(item.length),
+            actual: bytes.len() as u64,
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn missing(what: &'static str, hash: &Hash) -> Error {
@@ -346,15 +368,17 @@ fn read_into(
     buffer: &mut Vec<u8>,
 ) -> Result<bool> {
     buffer.clear();
-    let mut copy = |bytes: &[u8]| {
-        buffer.extend_from_slice(bytes);
-        Ok(())
-    };
     match ahead {
-        Ahead::Checked => lend_chunk(store, item, &mut copy),
+        Ahead::Checked => {
+            let held = store.read_into(Stored::Chunk, &item.hash, buffer)?;
+            if held {
+                check_stored_chunk(item, buffer)?;
+            }
+            Ok(held)
+        }
         Ahead::Framed => {
-            copy(&[FRAME_CHUNK])?;
-            lent(store, Stored::Chunk, &item.hash, &mut copy)
+            buffer.push(FRAME_CHUNK);
+            store.read_into(Stored::Chunk, &item.hash, buffer)
         }
     }
 }

@@ -778,3 +778,114 @@ fn a_responder_that_reads_chunks_ahead_answers_as_one_that_does_not() {
         }
     });
 }
+
+/// A store that reads things into the caller's memory itself, as a store on
+/// disk does. It can hand out one chunk damaged, or say it lacks one that
+/// it holds.
+struct ReadingInto {
+    inner: MemoryStore,
+    damaged: Option<Hash>,
+    lost: Option<Hash>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadingInto {
+    fn new(inner: MemoryStore) -> Self {
+        Self {
+            inner,
+            damaged: None,
+            lost: None,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Store for ReadingInto {
+    fn put(&self, kind: Stored, hash: &Hash, bytes: &[u8]) -> Result<()> {
+        self.inner.put(kind, hash, bytes)
+    }
+    fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>> {
+        self.inner.get(kind, hash)
+    }
+    fn read_into(&self, kind: Stored, hash: &Hash, buffer: &mut Vec<u8>) -> Result<bool> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        if Some(*hash) == self.lost {
+            return Ok(false);
+        }
+        let Some(bytes) = self.inner.get(kind, hash)? else {
+            return Ok(false);
+        };
+        let start = buffer.len();
+        buffer.extend_from_slice(&bytes);
+        if Some(*hash) == self.damaged {
+            buffer[start] ^= 1;
+        }
+        Ok(true)
+    }
+    fn remove(&self, kind: Stored, hash: &Hash) -> Result<()> {
+        self.inner.remove(kind, hash)
+    }
+}
+
+#[test]
+fn what_a_store_reads_into_memory_of_its_own_is_checked_as_what_it_lends() {
+    // By default, what is read is added to what the memory holds already,
+    // and nothing is added for a thing that is not held.
+    let store = MemoryStore::new();
+    store
+        .put(Stored::Chunk, &Hash::of(b"held"), b"held")
+        .unwrap();
+    let mut buffer = b"before ".to_vec();
+    assert!(store
+        .read_into(Stored::Chunk, &Hash::of(b"held"), &mut buffer)
+        .unwrap());
+    assert_eq!(buffer, b"before held");
+    assert!(!store
+        .read_into(Stored::Chunk, &Hash::of(b"not held"), &mut buffer)
+        .unwrap());
+    assert_eq!(buffer, b"before held");
+
+    let (source, root, frames) = long_tree("threads-read-into");
+    let places = chunk_places(&frames);
+    let copy = || {
+        let store = MemoryStore::new();
+        for (kind, hash, bytes) in contents(&source) {
+            store.put(kind, &hash, &bytes).unwrap();
+        }
+        ReadingInto::new(store)
+    };
+    let file = record_of(&source, &root).unwrap().top();
+    let whole = bundle_of(&frames);
+
+    // A sound store is read through its own way, and gives what the store in
+    // memory gives.
+    let reading = copy();
+    let mut out = Vec::new();
+    export(&reading, &root, &mut out).unwrap();
+    assert!(out == whole);
+    assert!(reading.reads.load(Ordering::Relaxed) >= places.len());
+    let fetched = MemoryStore::new();
+    fetch(&fetched, &root, &mut Responder::new(&reading)).unwrap();
+    assert!(contents(&fetched) == contents(&source));
+
+    // A chunk it reads damaged is found, whoever reads it.
+    let bad = Hash::of(&frames[places[2]][1..]);
+    let mut damaged = copy();
+    damaged.damaged = Some(bad);
+    let mut out = Vec::new();
+    let result = export(&damaged, &root, &mut out);
+    assert!(matches!(result, Err(Error::Corrupt { .. })), "{result:?}");
+    assert!(out == bundle_of(&frames[..places[2]]));
+    let result = read_file(&damaged, &file, &mut Vec::new());
+    assert!(matches!(result, Err(Error::Corrupt { .. })), "{result:?}");
+    let result = fetch(&MemoryStore::new(), &root, &mut Responder::new(&damaged));
+    assert!(matches!(result, Err(Error::NotWanted { .. })), "{result:?}");
+
+    // A chunk it cannot find is missing.
+    let mut lost = copy();
+    lost.lost = Some(bad);
+    let result = export(&lost, &root, &mut Vec::new());
+    assert!(matches!(result, Err(Error::Missing { .. })), "{result:?}");
+    let result = read_file(&lost, &file, &mut Vec::new());
+    assert!(matches!(result, Err(Error::Missing { .. })), "{result:?}");
+}

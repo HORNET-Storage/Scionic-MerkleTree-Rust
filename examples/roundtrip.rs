@@ -149,6 +149,20 @@ impl Store for DirStore {
         lent.map(|()| true)
     }
 
+    /// The library reads chunks that it sends, or reads several at once,
+    /// through here, straight into memory of its own.
+    fn read_into(&self, kind: Stored, hash: &Hash, buffer: &mut Vec<u8>) -> Result<bool> {
+        let path = self.path(kind, hash);
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(failed("open", &path, error)),
+        };
+        file.read_to_end(buffer)
+            .map_err(|error| failed("read", &path, error))?;
+        Ok(true)
+    }
+
     fn size(&self, kind: Stored, hash: &Hash) -> Result<Option<u64>> {
         let path = self.path(kind, hash);
         match fs::metadata(&path) {
