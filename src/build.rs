@@ -1,7 +1,7 @@
 //! Building a tree: from a folder or a file on disk, or part by part.
 
 use crate::disk::{Found, Held, Refused};
-use crate::fastcdc::{StreamChunker, FASTCDC_MAX_SIZE};
+use crate::fastcdc::{chunks_on_threads, StreamChunker, FASTCDC_MAX_SIZE};
 use crate::format::{
     check_name, ChunkRef, Chunking, Entry, ExtraData, FileList, FolderList, Kind, Record, Target,
     MAX_FOLDER_DEPTH, TIMESTAMP_KEY,
@@ -36,8 +36,9 @@ const ROOM_ALONE: usize = 2 * FASTCDC_MAX_SIZE;
 /// enough chunks to give each of them some.
 const ROOM_WITH_HELP: usize = 8 * FASTCDC_MAX_SIZE;
 
-/// How many chunks of a file that lies in memory are handed on at a time.
-const CHUNKS_AT_A_TIME: usize = 64;
+/// The least of a file that lies in memory that is worth a thread of its
+/// own, when several threads look through it for where its chunks may end.
+const LOOKED_THROUGH_BY_EACH: usize = 4 << 20;
 
 fn cores() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
@@ -45,10 +46,13 @@ fn cores() -> usize {
 
 /// The threads that are free to help with a long file.
 ///
-/// A file is chunked on the thread that asks for it, because where one chunk
-/// ends decides where the next begins. Hashing and keeping the chunks is the
-/// greater part of the work and needs no order, so it is shared out among
-/// that thread and the helpers that are free.
+/// Where one chunk ends decides where the next begins, so a file is chunked
+/// in order, on the thread that asks for it. A file that lies in memory is
+/// first looked through by the helpers that are free, each in a stretch of
+/// its own, for every place where a chunk may end, and is then chunked from
+/// those places alone. Hashing and keeping the chunks is the greater part of
+/// the work and needs no order, so it is shared out among that thread and
+/// the helpers that are free.
 pub(crate) struct Helpers {
     free: AtomicUsize,
 }
@@ -126,10 +130,12 @@ impl<'s> Builder<'s> {
         }
     }
 
-    /// How many threads hash and keep the chunks of one file: 1 is the
-    /// calling thread alone, and zero is one thread for each core. A file is
-    /// always chunked on the calling thread. With help, a builder holds up to
-    /// 64 MiB of a long file at a time; alone it holds up to 16 MiB.
+    /// How many threads work on one file: 1 is the calling thread alone, and
+    /// zero is one thread for each core. They hash and keep its chunks, and
+    /// for a file that lies in memory they also find where its chunks end. A
+    /// file that is read is chunked on the calling thread. With help, a
+    /// builder holds up to 64 MiB of a long file that it reads at a time;
+    /// alone it holds up to 16 MiB.
     pub fn threads(mut self, threads: usize) -> Self {
         self.helpers = Helpers::for_threads(threads);
         self
@@ -155,10 +161,22 @@ impl<'s> Builder<'s> {
     /// The file with these bytes. They are chunked where they lie, and nothing
     /// is copied on the way to the store.
     pub fn file_from_bytes(&mut self, bytes: &[u8]) -> Result<Target> {
-        let mut items = Vec::new();
-        for chunks in self.chunking.cut(bytes).chunks(CHUNKS_AT_A_TIME) {
-            keep_chunks(self.store, &self.helpers, chunks, &mut items)?;
-        }
+        let chunks = match self.chunking {
+            Chunking::FastCdcV1 => {
+                let wanted = (bytes.len() / LOOKED_THROUGH_BY_EACH).saturating_sub(1);
+                let helping = self.helpers.take(wanted);
+                let chunks = if helping == 0 {
+                    self.chunking.cut(bytes)
+                } else {
+                    chunks_on_threads(bytes, true, helping + 1)
+                };
+                self.helpers.give(helping);
+                chunks
+            }
+            Chunking::Fixed(_) => self.chunking.cut(bytes),
+        };
+        let mut items = Vec::with_capacity(chunks.len());
+        keep_chunks(self.store, &self.helpers, &chunks, &mut items)?;
         self.keep_list(items)
     }
 

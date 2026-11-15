@@ -141,10 +141,10 @@ pub(crate) fn fastcdc_boundary(data: &[u8]) -> usize {
     let limit = n.min(FASTCDC_MAX_SIZE);
     let normal = FASTCDC_TARGET_SIZE.min(limit);
     let mut h: u64 = 0;
-    if let Some(cut) = scan(data, FASTCDC_MIN_SIZE, normal, FASTCDC_STRICT_MASK, &mut h) {
+    if let Some(cut) = scan::<FASTCDC_STRICT_MASK>(data, FASTCDC_MIN_SIZE, normal, &mut h) {
         return cut;
     }
-    if let Some(cut) = scan(data, normal, limit, FASTCDC_LOOSE_MASK, &mut h) {
+    if let Some(cut) = scan::<FASTCDC_LOOSE_MASK>(data, normal, limit, &mut h) {
         return cut;
     }
     limit
@@ -164,8 +164,9 @@ fn roll(hash: u64, byte: u8) -> u64 {
 }
 
 /// Rolls the hash `h` over `data[from..to]`, and gives the length that the
-/// first matching byte cuts at. Without a match, `h` is left as the hash
-/// after byte `to - 1`.
+/// first byte that matches `MASK` cuts at. Without a match, `h` is left as
+/// the hash after byte `to - 1`. The mask is a constant, so that each byte's
+/// test is a single comparison.
 ///
 /// One hash can take a byte only when it is done with the byte before, and
 /// that wait is what bounds a plain loop. So four stretches that follow one
@@ -178,57 +179,78 @@ fn roll(hash: u64, byte: u8) -> u64 {
 /// `from` is at least [`FASTCDC_MIN_SIZE`], where hashing begins: a stretch
 /// that is not the first one always has 64 hashed bytes before it.
 #[inline]
-fn scan(data: &[u8], from: usize, to: usize, mask: u64, h: &mut u64) -> Option<usize> {
+fn scan<const MASK: u64>(data: &[u8], from: usize, to: usize, h: &mut u64) -> Option<usize> {
     let mut hash = *h;
     let mut at = from;
-    while to - at >= 4 * STRIDE {
-        let (first, rest) = data[at..at + 4 * STRIDE].split_at(STRIDE);
-        let (second, rest) = rest.split_at(STRIDE);
-        let (third, fourth) = rest.split_at(STRIDE);
-        let warm = |before: &[u8]| {
-            before[STRIDE - GEAR_WINDOW..]
-                .iter()
-                .fold(0_u64, |hash, &byte| roll(hash, byte))
-        };
-        let mut h0 = hash;
-        let mut h1 = warm(first);
-        let mut h2 = warm(second);
-        let mut h3 = warm(third);
-        let mut steps = 0_usize;
-        let mut matched = false;
-        for (((&a, &b), &c), &d) in first.iter().zip(second).zip(third).zip(fourth) {
-            h0 = roll(h0, a);
-            h1 = roll(h1, b);
-            h2 = roll(h2, c);
-            h3 = roll(h3, d);
-            steps += 1;
-            if (h0 & mask == 0) | (h1 & mask == 0) | (h2 & mask == 0) | (h3 & mask == 0) {
-                matched = true;
+    // A block of four stretches is read as one array: its length is known,
+    // so no byte of it is checked against its end, and the four hashes and
+    // what they need fit into the machine's registers.
+    while let Some(block) = data[at..to].first_chunk::<{ 4 * STRIDE }>() {
+        let mut hashes = [hash, 0, 0, 0];
+        warm(&mut hashes, block);
+        let mut steps = 0;
+        // Two bytes of each stretch a round, so that the loop's own counting
+        // is a smaller part of the work.
+        for pair in 0..STRIDE / 2 {
+            let i = 2 * pair;
+            roll_four(&mut hashes, block, i);
+            if any_matches(&hashes, MASK) {
+                steps = i + 1;
+                break;
+            }
+            roll_four(&mut hashes, block, i + 1);
+            if any_matches(&hashes, MASK) {
+                steps = i + 2;
                 break;
             }
         }
-        if matched {
-            if h0 & mask == 0 {
+        if steps != 0 {
+            if hashes[0] & MASK == 0 {
                 return Some(at + steps);
             }
             // A later stretch matched. An earlier byte may match too, so the
             // first hash goes on alone, and stops at the first match there is.
-            hash = h0;
+            hash = hashes[0];
             at += steps;
             break;
         }
-        hash = h3;
+        hash = hashes[3];
         at += 4 * STRIDE;
     }
     for &byte in &data[at..to] {
         hash = roll(hash, byte);
         at += 1;
-        if hash & mask == 0 {
+        if hash & MASK == 0 {
             return Some(at);
         }
     }
     *h = hash;
     None
+}
+
+/// Starts the hashes of the second, third and fourth stretches of `block`:
+/// each takes the 64 bytes before its stretch, the three side by side.
+#[inline(always)]
+fn warm(hashes: &mut [u64; 4], block: &[u8; 4 * STRIDE]) {
+    for i in STRIDE - GEAR_WINDOW..STRIDE {
+        hashes[1] = roll(hashes[1], block[i]);
+        hashes[2] = roll(hashes[2], block[STRIDE + i]);
+        hashes[3] = roll(hashes[3], block[2 * STRIDE + i]);
+    }
+}
+
+/// Rolls each of the four hashes over byte `i` of its stretch.
+#[inline(always)]
+fn roll_four(hashes: &mut [u64; 4], block: &[u8; 4 * STRIDE], i: usize) {
+    hashes[0] = roll(hashes[0], block[i]);
+    hashes[1] = roll(hashes[1], block[STRIDE + i]);
+    hashes[2] = roll(hashes[2], block[2 * STRIDE + i]);
+    hashes[3] = roll(hashes[3], block[3 * STRIDE + i]);
+}
+
+#[inline(always)]
+fn any_matches(hashes: &[u64; 4], mask: u64) -> bool {
+    hashes[0] & mask == 0 || hashes[1] & mask == 0 || hashes[2] & mask == 0 || hashes[3] & mask == 0
 }
 
 /// The boundary definition as it is written down: one byte a step.
@@ -252,6 +274,173 @@ fn fastcdc_boundary_plain(data: &[u8]) -> usize {
         if h & FASTCDC_LOOSE_MASK == 0 {
             return i + 1;
         }
+    }
+    limit
+}
+
+/// A byte that a chunk may end after, wherever the chunk began: the hash of
+/// that byte and the 63 before it has no bit of the loose mask set. `strict`
+/// says that it has no bit of the strict mask set either.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Match {
+    at: usize,
+    strict: bool,
+}
+
+/// The first byte of a chunk whose hash holds 64 bytes, counted from the
+/// chunk's start. Hashing begins after [`FASTCDC_MIN_SIZE`] bytes.
+const FIRST_WHOLE_HASH: usize = FASTCDC_MIN_SIZE + GEAR_WINDOW - 1;
+
+/// Chunks `data` with fastcdc-v1 as [`Chunking::cut`] does, with `threads`
+/// threads at work. Unless `ended`, more of the stream comes after `data`,
+/// and only the chunks that are settled are given: each one that begins at
+/// least [`FASTCDC_MAX_SIZE`] bytes before the end of `data`.
+///
+/// Where a chunk ends depends on where it began, so a file's chunks follow
+/// one another. But from a chunk's 64th hashed byte on, its hash holds the
+/// 64 bytes that end there and nothing else, so it is the same wherever the
+/// chunk began. So each thread first finds, in a stretch of its own, every
+/// byte where that hash matches the loose mask, and whether it matches the
+/// strict mask too. Matches are few: one in 512 KiB, on average. The chunks
+/// are then settled one after another from the matches, and only the first
+/// 63 hashed bytes of each chunk are rolled over here. That gives exactly
+/// the chunks that one hash gives, rolled over a byte at a time.
+pub(crate) fn chunks_on_threads(data: &[u8], ended: bool, threads: usize) -> Vec<&[u8]> {
+    let matches = matches_on_threads(data, threads);
+    let mut chunks = Vec::with_capacity(data.len() / FASTCDC_TARGET_SIZE + 1);
+    let mut start = 0;
+    let mut next = 0;
+    while start < data.len() {
+        let rest = &data[start..];
+        if !ended && rest.len() < FASTCDC_MAX_SIZE {
+            break;
+        }
+        let length = boundary_from(rest, start, &matches, &mut next);
+        chunks.push(&rest[..length]);
+        start += length;
+    }
+    chunks
+}
+
+/// Every match in `data` from [`FIRST_WHOLE_HASH`] on, in order, found by
+/// `threads` threads, each in a stretch of its own.
+fn matches_on_threads(data: &[u8], threads: usize) -> Vec<Match> {
+    let Some(length) = data.len().checked_sub(FIRST_WHOLE_HASH) else {
+        return Vec::new();
+    };
+    let each = length.div_ceil(threads.max(1)).max(1);
+    let mut stretches = (FIRST_WHOLE_HASH..data.len())
+        .step_by(each)
+        .map(|from| (from, (from + each).min(data.len())));
+    std::thread::scope(|scope| {
+        let own = stretches.next();
+        let handles: Vec<_> = stretches
+            .map(|(from, to)| scope.spawn(move || find_matches(data, from, to)))
+            .collect();
+        let mut found = own.map_or_else(Vec::new, |(from, to)| find_matches(data, from, to));
+        for handle in handles {
+            match handle.join() {
+                Ok(more) => found.extend(more),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        found
+    })
+}
+
+/// Every match among the bytes `data[from..to]`, in order. `from` is at
+/// least 64, so that each of these bytes has the 63 before it in `data`.
+fn find_matches(data: &[u8], from: usize, to: usize) -> Vec<Match> {
+    let mut found = Vec::new();
+    let mut hash = data[from - GEAR_WINDOW..from]
+        .iter()
+        .fold(0, |hash, &byte| roll(hash, byte));
+    let mut at = from;
+    while let Some(block) = data[at..to].first_chunk::<{ 4 * STRIDE }>() {
+        let mut hashes = [hash, 0, 0, 0];
+        warm(&mut hashes, block);
+        for pair in 0..STRIDE / 2 {
+            let i = 2 * pair;
+            roll_four(&mut hashes, block, i);
+            if any_matches(&hashes, FASTCDC_LOOSE_MASK) {
+                note_four(&mut found, at + i, &hashes);
+            }
+            roll_four(&mut hashes, block, i + 1);
+            if any_matches(&hashes, FASTCDC_LOOSE_MASK) {
+                note_four(&mut found, at + i + 1, &hashes);
+            }
+        }
+        hash = hashes[3];
+        at += 4 * STRIDE;
+    }
+    for &byte in &data[at..to] {
+        hash = roll(hash, byte);
+        if hash & FASTCDC_LOOSE_MASK == 0 {
+            found.push(Match {
+                at,
+                strict: hash & FASTCDC_STRICT_MASK == 0,
+            });
+        }
+        at += 1;
+    }
+    // The four stretches of a block give their matches side by side.
+    found.sort_unstable_by_key(|found| found.at);
+    found
+}
+
+/// Notes the matches of a block's four hashes, which are at byte `at` of the
+/// first stretch and at the same place in each of the others.
+#[cold]
+fn note_four(found: &mut Vec<Match>, at: usize, hashes: &[u64; 4]) {
+    for (stretch, &hash) in hashes.iter().enumerate() {
+        if hash & FASTCDC_LOOSE_MASK == 0 {
+            found.push(Match {
+                at: at + stretch * STRIDE,
+                strict: hash & FASTCDC_STRICT_MASK == 0,
+            });
+        }
+    }
+}
+
+/// The length of the next chunk of `rest`, as [`fastcdc_boundary`] gives it,
+/// from the matches that were found ahead. `rest` begins `start` bytes into
+/// the data that `matches` were found in. `next` is the first match that may
+/// lie in this chunk, and is moved on past each one that is behind it.
+fn boundary_from(rest: &[u8], start: usize, matches: &[Match], next: &mut usize) -> usize {
+    let n = rest.len();
+    if n <= FASTCDC_MIN_SIZE {
+        return n;
+    }
+    let limit = n.min(FASTCDC_MAX_SIZE);
+    let normal = FASTCDC_TARGET_SIZE.min(limit);
+    // Over the first 63 hashed bytes the hash holds fewer than 64 bytes, so
+    // there it depends on where the chunk began, and is rolled here.
+    let whole = FIRST_WHOLE_HASH.min(limit);
+    let mut h: u64 = 0;
+    for (i, &byte) in rest.iter().enumerate().take(whole).skip(FASTCDC_MIN_SIZE) {
+        h = roll(h, byte);
+        let mask = if i < normal {
+            FASTCDC_STRICT_MASK
+        } else {
+            FASTCDC_LOOSE_MASK
+        };
+        if h & mask == 0 {
+            return i + 1;
+        }
+    }
+    while let Some(found) = matches.get(*next) {
+        if found.at < start + whole {
+            *next += 1;
+            continue;
+        }
+        let i = found.at - start;
+        if i >= limit {
+            break;
+        }
+        if found.strict || i >= normal {
+            return i + 1;
+        }
+        *next += 1;
     }
     limit
 }
@@ -603,6 +792,98 @@ mod tests {
             assert_eq!(chunks[0], &data[..]);
         }
         assert!(Chunking::FastCdcV1.cut(&[]).is_empty());
+    }
+
+    /// Chunks one after another, each with `boundary`, as a stream is
+    /// chunked: unless `ended`, only the chunks that begin at least
+    /// [`FASTCDC_MAX_SIZE`] bytes before the end of `data`.
+    fn one_at_a_time(data: &[u8], ended: bool, boundary: fn(&[u8]) -> usize) -> Vec<&[u8]> {
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        while start < data.len() {
+            let rest = &data[start..];
+            if !ended && rest.len() < FASTCDC_MAX_SIZE {
+                break;
+            }
+            let length = boundary(rest);
+            chunks.push(&rest[..length]);
+            start += length;
+        }
+        chunks
+    }
+
+    #[test]
+    fn chunks_found_on_threads_are_the_chunks_of_one_thread() {
+        let corpus = corpus_bytes("scionic-fastcdc-v1:test:threads", 12 << 20);
+        let zeros = vec![0_u8; 3 * FASTCDC_MAX_SIZE + 5];
+        let lengths = [
+            0,
+            1,
+            FASTCDC_MIN_SIZE,
+            FASTCDC_MIN_SIZE + 1,
+            FIRST_WHOLE_HASH - 1,
+            FIRST_WHOLE_HASH,
+            FIRST_WHOLE_HASH + 1,
+            FASTCDC_TARGET_SIZE + 3,
+            FASTCDC_MAX_SIZE,
+            FASTCDC_MAX_SIZE + 1,
+            corpus.len(),
+        ];
+        let inputs = lengths.iter().map(|&length| &corpus[..length]);
+        for data in inputs.chain([zeros.as_slice()]) {
+            for ended in [true, false] {
+                let expected = one_at_a_time(data, ended, fastcdc_boundary);
+                // Stretches of every length, and so ends at every place.
+                for threads in [1, 2, 3, 5, 8, 13] {
+                    assert_eq!(
+                        chunks_on_threads(data, ended, threads),
+                        expected,
+                        "length {}, {threads} threads, ended {ended}",
+                        data.len()
+                    );
+                }
+            }
+        }
+        let matches = matches_on_threads(&corpus, 1);
+        assert!(matches.iter().any(|found| found.strict));
+        assert!(matches.iter().any(|found| !found.strict));
+        for threads in [2, 7, 24] {
+            assert_eq!(matches_on_threads(&corpus, threads), matches);
+        }
+    }
+
+    #[test]
+    fn a_chunk_is_judged_by_its_own_hash_where_that_holds_fewer_than_64_bytes() {
+        let mut data = corpus_bytes("scionic-fastcdc-v1:test:short-hash", 6 << 20);
+        // Three bytes whose hash matches the strict mask, as the first three
+        // that a chunk hashes: they end the first chunk.
+        data[FASTCDC_MIN_SIZE..FASTCDC_MIN_SIZE + 3].copy_from_slice(&[158, 69, 185]);
+        let second = FASTCDC_MIN_SIZE + 3;
+        // 64 bytes whose own hash matches the strict mask, the last of them
+        // the 11th that the second chunk hashes. The chunk's hash holds 11
+        // bytes there, and does not match: the chunk goes on.
+        let window: Vec<u8> = (0..61_u32)
+            .map(|k| (37 + 11 * k) as u8)
+            .chain([6, 89, 219])
+            .collect();
+        assert_eq!(
+            window.iter().fold(0, |hash, &byte| roll(hash, byte)) & FASTCDC_STRICT_MASK,
+            0
+        );
+        let last = second + FASTCDC_MIN_SIZE + 10;
+        data[last + 1 - GEAR_WINDOW..=last].copy_from_slice(&window);
+
+        let expected = one_at_a_time(&data, true, fastcdc_boundary_plain);
+        assert_eq!(expected[0].len(), second);
+        assert!(expected[1].len() > FASTCDC_MIN_SIZE + 11);
+        let at_last = Match {
+            at: last,
+            strict: true,
+        };
+        assert!(matches_on_threads(&data, 2).contains(&at_last));
+        for threads in [1, 2, 4] {
+            assert_eq!(chunks_on_threads(&data, true, threads), expected);
+        }
     }
 
     #[test]
