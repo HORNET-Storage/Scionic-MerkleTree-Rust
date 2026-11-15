@@ -6,15 +6,17 @@
 //! ```
 //!
 //! It prints, for a file of that many MiB of bytes that look random: chunking
-//! alone, hashing alone, building the file into a store in memory, and
-//! checking every chunk of it again.
+//! alone, hashing alone, building the file into a store in memory, checking
+//! every chunk of it again, fetching it into a second store as a receiver
+//! would, and writing it as a bundle and reading that into a third.
 //!
 //! With a folder, it also builds that folder from disk into a store in
 //! memory, and prints the best of five runs: by then the system holds the
 //! files in memory, so it is the library that is measured and not the disk.
 
 use scionic_merkletree::{
-    build, record_of, verify, BuildOptions, Builder, Chunking, ExtraData, Hash, MemoryStore, Stored,
+    build, export, fetch, import, record_of, verify, BuildOptions, Builder, Chunking, ExtraData,
+    Hash, MemoryStore, Responder, Stored,
 };
 use std::time::Instant;
 
@@ -68,6 +70,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     verify(&store, &root)?;
     report("checked", started, data.len());
     println!("root {root} ({mixed:02x})");
+
+    // The tree is fetched from the first store into a second one, as a
+    // receiver would take it from a peer, and then written as a bundle and
+    // read back into a third. Each checks every byte as it comes.
+    let fetched = MemoryStore::new();
+    let started = Instant::now();
+    fetch(&fetched, &root, &mut Responder::new(&store))?;
+    report("fetched", started, data.len());
+
+    let imported = MemoryStore::new();
+    let mut bundle = Vec::with_capacity(data.len() + (1 << 20));
+    let started = Instant::now();
+    export(&store, &root, &mut bundle)?;
+    import(&imported, &root, &mut bundle.as_slice())?;
+    report("bundled", started, data.len());
 
     if let Some(folder) = std::env::args().nth(2) {
         let mut best = f64::MAX;

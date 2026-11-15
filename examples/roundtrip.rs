@@ -1,9 +1,9 @@
 //! A tree's whole way round, with a store on disk.
 //!
 //! Builds a tree from a folder, checks it, fetches it into a second store as
-//! a receiver would, reads a stretch from the middle of its largest file
-//! without the rest, writes the tree out again, and holds the copy to the
-//! same root. It prints how long each step took.
+//! a receiver would, reads stretches of its largest file without the rest,
+//! writes the tree out again, and holds the copy to the same root. It prints
+//! how long each step took.
 //!
 //! ```sh
 //! cargo run --release --example roundtrip -- <folder> <work-dir>
@@ -193,15 +193,23 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     report("fetched", started, totals.chunk_bytes);
 
     if let Some(file) = largest_file(&source, record.top())? {
+        // A stretch of 4 KiB is read from 64 places spread over the file, each
+        // asked for on its own, and the time one takes on average is printed:
+        // a single read is shorter than some systems' clocks can tell apart.
         let length = file.size.min(4096);
+        let places: u64 = 64;
         let mut holder = Responder::new(&source);
         let mut remote = Remote::open(&mut holder, &root)?;
         let mut stretch = Vec::new();
         let started = Instant::now();
-        remote.read(&file, (file.size - length) / 2, length, &mut stretch)?;
+        for place in 0..places {
+            stretch.clear();
+            let offset = (file.size - length) * place / (places - 1);
+            remote.read(&file, offset, length, &mut stretch)?;
+        }
         println!(
-            "a stretch    {:>8.4} s  {} bytes from the middle of a file of {} bytes",
-            started.elapsed().as_secs_f64(),
+            "a stretch    {:>8.4} s  {} bytes at a time, from {places} places in a file of {} bytes",
+            started.elapsed().as_secs_f64() / places as f64,
             stretch.len(),
             file.size
         );
