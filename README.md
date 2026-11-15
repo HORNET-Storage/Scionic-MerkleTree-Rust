@@ -310,7 +310,7 @@ The library verifies everything against the root, so a connection does not have 
 | Bring your own transport | `Intake`, `Request`, `Frame`, the `Peer` trait |
 | Bring your own storage | the `Store` trait |
 
-**Building.** Building uses every core unless `BuildOptions::workers` says otherwise. Several files are chunked at once, and the chunks of one long file are hashed several at once. A file is never held in memory whole: a builder holds up to 16 MiB of it, or up to 64 MiB while other threads help it. `BuildOptions::timestamp` writes the time into the tree's record, and `build_with` attaches extra data to each entry, such as a file mode or a media type. A link or a special file in the folder is refused, or left out with `Links::Skip`. It is never followed.
+**Building.** Building uses every core unless `BuildOptions::workers` says otherwise. Several files are chunked at once, and threads that are free help chunk and hash a long one. A file is never held in memory whole: a builder holds up to 16 MiB of it, or up to 64 MiB while other threads help it. `BuildOptions::timestamp` writes the time into the tree's record, and `build_with` attaches extra data to each entry, such as a file mode or a media type. A link or a special file in the folder is refused, or left out with `Links::Skip`. It is never followed.
 
 **Verifying and mending.** `verify` checks every list and every chunk that a store holds for a root, on every core. When bytes were harmed where they are kept, the error says which thing it is: `Error::Corrupt` carries its hash. With `VerifyOptions::new().discard_damaged(true)` the damaged parts are removed, and the next `fetch` brings back exactly those. `VerifyOptions::rechunk` also chunks every file again, and refuses a file that was not chunked the standard way.
 
@@ -362,12 +362,13 @@ pub trait Store: Send + Sync {
     /// Forgets what is kept under `hash`.
     fn remove(&self, kind: Stored, hash: &Hash) -> Result<()>;
 
-    // `has`, `size` and `lend` have default implementations. A store on disk
-    // should have its own `size` and `lend`, as the text below says.
+    // `has`, `size`, `lend` and `read_into` have default implementations. A
+    // store on disk should have its own `size`, `lend` and `read_into`, as the
+    // text below says.
 }
 ```
 
-`Stored` says which of four kinds of thing it is: a chunk, a file's chunk list, a folder's listing, or a tree's record. A store never has to understand what it holds: every byte it hands back is checked again before it is used. A store on disk should have its own `size`: `has` asks it, and without it, seeing whether a chunk is there takes a read of the whole chunk. It should have its own `lend` too: the library reads chunks through it, and a store that reads each one into memory it uses again spares the system finding fresh memory for every chunk. `examples/roundtrip.rs` has a complete store that keeps each thing as a file named by its hash.
+`Stored` says which of four kinds of thing it is: a chunk, a file's chunk list, a folder's listing, or a tree's record. A store never has to understand what it holds: every byte it hands back is checked again before it is used. A store on disk should have its own `size`: `has` asks it, and without it, seeing whether a chunk is there takes a read of the whole chunk. It should have its own `lend` too: the library reads chunks through it, and a store that reads each one into memory it uses again spares the system finding fresh memory for every chunk. And it should have its own `read_into`: where the library reads several chunks at once, or reads them to send, it hands the store memory as long as each chunk should be, and a store that looks at how long a thing is before it reads any of it reads the chunk straight there. `examples/roundtrip.rs` has a complete store that keeps each thing as a file named by its hash.
 
 ## Words Used in the API
 
@@ -453,13 +454,12 @@ The exact rules are in [`spec/FORMAT.md`](spec/FORMAT.md), under "What a receive
 
 ## Known Limitations
 
-- **One file is chunked on one core,** because where a chunk ends decides where the next begins. That is about 5.6 GiB a second on the machine above. Hashing the chunks, which is the greater part of the work, uses every core.
-- **Fetching a tree and writing a tree out use one core each.** On the disks they were tried on, the disk was the slower part.
 - **Verifying or fetching a whole tree keeps about a hundred bytes in memory for every different chunk,** so that each chunk is counted once: about 50 MB for a terabyte.
 - **A list is taken in whole.** A file's chunk list is 36 bytes a chunk, about 18 MB for each terabyte of the file, and a folder's listing has to fit in memory.
 - **A tree is built from a folder as the folder is while it is read.** If another program changes files in it meanwhile, the tree can hold a mix of old and new. It cannot be led outside the folder.
 - **Links, special files and file permissions are not stored.** An entry's extra data has room for a caller to record a mode.
 - **A responder that tells a peer which chunks of a file it holds looks into its store for each of them.** `Responder::have(false)` switches that off for one that serves strangers.
+- **A responder keeps up to 64 MiB of memory between answers,** to read the chunks of the next answer into, on every core. One that serves many peers at once may read with the answering thread alone, `Responder::threads(1)`, which keeps memory for one chunk.
 - **On Windows, opening a file so that it cannot be led astray costs about 16 millionths of a second for each file.** With every core at work it does not show. On one thread, 20,000 files of 4 KiB take 1.0 second to build where a plain open would take 0.7. While a folder is being read on Windows, other programs cannot rename or delete it.
 - **On systems that are neither Unix nor Windows, a folder is not held open,** and a link that is swapped in while a folder is read can be followed.
 
