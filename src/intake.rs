@@ -27,7 +27,7 @@ use crate::wire::{Request, FRAME_CHUNK, FRAME_FILE_LIST, FRAME_FOLDER_LIST, FRAM
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// The most chunks one request asks for.
 const CHUNKS_PER_REQUEST: u32 = 64;
@@ -786,6 +786,65 @@ impl<'s> Intake<'s> {
         self.accept_inner(frame, Some(expected))
     }
 
+    /// Takes chunk frames that come one after another, each as
+    /// [`Intake::accept`] takes it, or as [`Intake::accept_expected`] does
+    /// where it comes with what it has to be, with up to `workers` threads
+    /// hashing and keeping them at once. The error is that of the first frame,
+    /// in their order, that is refused or cannot be kept. A frame after it
+    /// may have been kept, as it would have been had it come first.
+    fn accept_chunks(&mut self, frames: &[(&[u8], Option<Arrived>)], workers: usize) -> Result<()> {
+        if self.failed {
+            return Err(Error::IntakeFailed);
+        }
+        if frames.is_empty() {
+            return Ok(());
+        }
+        self.recorded()?;
+        // As for one chunk: a store that falls over leaves the intake done.
+        self.failed = true;
+        let store = self.store;
+        let slots = Mutex::new(&mut self.chunks);
+        let next = AtomicUsize::new(0);
+        let work = || {
+            let mut settled = Vec::new();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(frame, expected)) = frames.get(index) else {
+                    return settled;
+                };
+                settled.push((index, take_chunk(store, &slots, frame, expected)));
+            }
+        };
+        let workers = workers.clamp(1, frames.len());
+        let settled = std::thread::scope(|scope| {
+            let handles: Vec<_> = (1..workers).map(|_| scope.spawn(work)).collect();
+            let mut settled = work();
+            for handle in handles {
+                match handle.join() {
+                    Ok(more) => settled.extend(more),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            settled
+        });
+        self.failed = false;
+        let mut first: Option<(usize, Error)> = None;
+        for (index, taken) in settled {
+            match taken {
+                Ok((_, Some(at))) => {
+                    self.wanted_chunks.remove(&at);
+                }
+                Ok((_, None)) => {}
+                Err(error) => {
+                    if first.as_ref().is_none_or(|(before, _)| index < *before) {
+                        first = Some((index, error));
+                    }
+                }
+            }
+        }
+        first.map_or(Ok(()), |(_, error)| Err(error))
+    }
+
     /// Runs a step that changes what the intake knows of its tree. If the
     /// step fails, the intake knows half of something, and is done.
     fn taking(&mut self, step: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
@@ -873,30 +932,20 @@ impl<'s> Intake<'s> {
             }
             FRAME_CHUNK => {
                 self.recorded()?;
-                if body.is_empty() || body.len() > MAX_CHUNK_BYTES {
-                    return Err(invalid("a chunk does not hold 1 byte to 8 MiB"));
+                // Until the chunk is settled the intake counts as failed: a
+                // store that falls over while it keeps the chunk leaves the
+                // intake done, never holding a chunk as kept that is not.
+                self.failed = true;
+                let taken = take_chunk(self.store, &Mutex::new(&mut self.chunks), frame, expected);
+                self.failed = false;
+                let (hash, kept) = taken?;
+                if let Some(at) = kept {
+                    self.wanted_chunks.remove(&at);
                 }
-                let hash = Hash::of(body);
-                let what = Arrived::Chunk(hash);
-                as_asked(what, "a chunk")?;
-                let slot = self
-                    .chunks
-                    .get_mut(&hash)
-                    .ok_or(Error::NotWanted { what: "a chunk" })?;
-                let Some(at) = slot.wanted_at else {
-                    return Ok(Accepted { what, kept: false });
-                };
-                if slot.length as usize != body.len() {
-                    return Err(Error::SizeMismatch {
-                        what: "a chunk",
-                        expected: u64::from(slot.length),
-                        actual: body.len() as u64,
-                    });
-                }
-                self.store.put(Stored::Chunk, &hash, body)?;
-                slot.wanted_at = None;
-                self.wanted_chunks.remove(&at);
-                Ok(Accepted { what, kept: true })
+                Ok(Accepted {
+                    what: Arrived::Chunk(hash),
+                    kept: kept.is_some(),
+                })
             }
             _ => Err(invalid("a frame that no tree is taken in by")),
         }
@@ -1074,6 +1123,153 @@ impl<'s> Intake<'s> {
             files: self.files.len() as u64,
             record: record.clone(),
         })
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Takes one chunk frame in, on whichever thread: hashes it, finds the slot
+/// of the chunk in `slots`, and keeps the chunk, with the checks of
+/// [`Intake::accept`], in its order. Gives the chunk's hash, and where it
+/// was wanted if it is kept now. A chunk that a slot names is claimed under
+/// the lock before it is kept, so that two frames of one chunk keep it once.
+fn take_chunk(
+    store: &dyn Store,
+    slots: &Mutex<&mut HashMap<Hash, ChunkSlot>>,
+    frame: &[u8],
+    expected: Option<Arrived>,
+) -> Result<(Hash, Option<(u64, u64)>)> {
+    let body = match frame.split_first() {
+        Some((&FRAME_CHUNK, body)) => body,
+        _ => {
+            return Err(Error::Invariant {
+                detail: "a frame taken in as a chunk is not a chunk",
+            })
+        }
+    };
+    if body.is_empty() || body.len() > MAX_CHUNK_BYTES {
+        return Err(invalid("a chunk does not hold 1 byte to 8 MiB"));
+    }
+    let hash = Hash::of(body);
+    if expected.is_some_and(|expected| expected != Arrived::Chunk(hash)) {
+        return Err(Error::NotWanted { what: "a chunk" });
+    }
+    let at = {
+        let mut slots = lock(slots);
+        let slot = slots
+            .get_mut(&hash)
+            .ok_or(Error::NotWanted { what: "a chunk" })?;
+        let Some(at) = slot.wanted_at else {
+            return Ok((hash, None));
+        };
+        if slot.length as usize != body.len() {
+            return Err(Error::SizeMismatch {
+                what: "a chunk",
+                expected: u64::from(slot.length),
+                actual: body.len() as u64,
+            });
+        }
+        slot.wanted_at = None;
+        at
+    };
+    match store.put(Stored::Chunk, &hash, body) {
+        Ok(()) => Ok((hash, Some(at))),
+        Err(error) => {
+            // Not kept, so it is wanted still.
+            if let Some(slot) = lock(slots).get_mut(&hash) {
+                slot.wanted_at = Some(at);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The most bytes of chunk frames that wait to be taken in together.
+const CHUNK_FRAMES_BYTES: usize = 64 << 20;
+
+/// The most chunk frames that wait to be taken in together, however short.
+const CHUNK_FRAMES_COUNT: usize = 1024;
+
+/// The least bytes of chunk frames that are worth a thread of their own.
+const CHUNK_BYTES_BY_EACH: usize = 1 << 20;
+
+/// Chunk frames that come one after another, held to be taken in together,
+/// so that several threads hash and keep them at once. The buffers serve
+/// one batch after another: memory that is used again costs much less than
+/// fresh memory, which a system has to find and clear first.
+pub(crate) struct ChunkFrames {
+    buffers: Vec<Vec<u8>>,
+    expected: Vec<Option<Arrived>>,
+    held: usize,
+    bytes: usize,
+    cores: usize,
+}
+
+impl ChunkFrames {
+    pub(crate) fn new() -> Self {
+        Self {
+            buffers: Vec::new(),
+            expected: Vec::new(),
+            held: 0,
+            bytes: 0,
+            cores: std::thread::available_parallelism().map_or(1, usize::from),
+        }
+    }
+
+    /// The buffer that the next frame is read into. The frame is held only
+    /// once [`ChunkFrames::hold`] is called.
+    pub(crate) fn next_buffer(&mut self) -> &mut Vec<u8> {
+        if self.held == self.buffers.len() {
+            self.buffers.push(Vec::new());
+        }
+        &mut self.buffers[self.held]
+    }
+
+    /// Whether the frame in the next buffer is a chunk's.
+    pub(crate) fn next_is_chunk(&self) -> bool {
+        self.buffers
+            .get(self.held)
+            .is_some_and(|frame| frame.first() == Some(&FRAME_CHUNK))
+    }
+
+    /// Holds the frame in the next buffer. It has to be `expected`, when
+    /// that is given.
+    pub(crate) fn hold(&mut self, expected: Option<Arrived>) {
+        self.bytes += self.next_buffer().len();
+        self.expected.push(expected);
+        self.held += 1;
+    }
+
+    /// Holds a copy of `frame`, which is lent for the call only.
+    pub(crate) fn hold_copy(&mut self, frame: &[u8], expected: Option<Arrived>) {
+        let buffer = self.next_buffer();
+        buffer.clear();
+        buffer.extend_from_slice(frame);
+        self.hold(expected);
+    }
+
+    /// Whether enough frames are held to take them in now.
+    pub(crate) fn full(&self) -> bool {
+        self.bytes >= CHUNK_FRAMES_BYTES || self.held >= CHUNK_FRAMES_COUNT
+    }
+
+    /// Takes the frames that are held into `intake`, and holds none after.
+    pub(crate) fn take_in(&mut self, intake: &mut Intake<'_>) -> Result<()> {
+        let frames: Vec<(&[u8], Option<Arrived>)> = self.buffers[..self.held]
+            .iter()
+            .map(Vec::as_slice)
+            .zip(self.expected.iter().copied())
+            .collect();
+        let workers = self.cores.min(self.bytes / CHUNK_BYTES_BY_EACH + 1);
+        let taken = intake.accept_chunks(&frames, workers);
+        self.held = 0;
+        self.bytes = 0;
+        self.expected.clear();
+        taken
     }
 }
 

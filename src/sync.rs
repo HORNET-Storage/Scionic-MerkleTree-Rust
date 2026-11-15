@@ -24,7 +24,7 @@ use crate::format::{
     MAX_RECORD_BYTES,
 };
 use crate::hash::{Hash, Root};
-use crate::intake::{Arrived, Intake, Summary};
+use crate::intake::{Arrived, ChunkFrames, Intake, Summary};
 use crate::read::{file_of, folder_of, record_of};
 use crate::store::{check_chunk, damaged, lend_chunk, lent, missing, Store, Stored};
 use crate::wire::{
@@ -512,6 +512,9 @@ fn ask_one(peer: &mut dyn Peer, request: &Request, limit: usize) -> Result<Vec<u
 /// holds.
 pub fn fetch(store: &dyn Store, root: &Root, peer: &mut dyn Peer) -> Result<Summary> {
     let mut intake = Intake::new(store, *root)?;
+    // Chunks that come one after another are held, and taken in together
+    // by several threads.
+    let mut held = ChunkFrames::new();
     loop {
         let requests = intake.requests(REQUESTS_PER_ROUND);
         if requests.is_empty() {
@@ -549,10 +552,20 @@ pub fn fetch(store: &dyn Store, root: &Root, peer: &mut dyn Peer) -> Result<Summ
             let Some(expected) = expected.get(*taken) else {
                 return Err(TOO_MUCH);
             };
-            intake.accept_expected(frame, *expected)?;
+            if matches!(expected, Arrived::Chunk(_)) && frame.first() == Some(&FRAME_CHUNK) {
+                held.hold_copy(frame, Some(*expected));
+                if held.full() {
+                    held.take_in(&mut intake)?;
+                }
+            } else {
+                // What came before is taken in first.
+                held.take_in(&mut intake)?;
+                intake.accept_expected(frame, *expected)?;
+            }
             *taken += 1;
             Ok(())
         })?;
+        held.take_in(&mut intake)?;
         if taken.contains(&0) {
             return Err(peer_error("does not hold what the tree needs"));
         }
@@ -848,17 +861,34 @@ pub fn import(store: &dyn Store, root: &Root, input: &mut dyn Read) -> Result<Su
         return Err(invalid("a stream does not start as a bundle does"));
     }
     let mut intake = Intake::new(store, *root)?;
-    // One buffer serves every frame of the bundle.
+    // Chunks that come one after another are held, and taken in together
+    // by several threads, once the record is in. Each frame is read into a
+    // buffer of theirs, and one more buffer serves every other frame of the
+    // bundle.
+    let mut held = ChunkFrames::new();
     let mut frame = Vec::new();
     loop {
-        match read_next(input, intake.frame_limit(), &mut frame)? {
+        match read_next(input, intake.frame_limit(), held.next_buffer())? {
+            Next::Frame if held.next_is_chunk() && intake.record().is_some() => {
+                held.hold(None);
+                if held.full() {
+                    held.take_in(&mut intake)?;
+                }
+            }
             Next::Frame => {
+                // What came before is taken in first.
+                std::mem::swap(&mut frame, held.next_buffer());
+                held.take_in(&mut intake)?;
                 intake.accept(&frame)?;
             }
-            Next::End => return Err(invalid("a frame is empty")),
+            Next::End => {
+                held.take_in(&mut intake)?;
+                return Err(invalid("a frame is empty"));
+            }
             Next::Closed => break,
         }
     }
+    held.take_in(&mut intake)?;
     intake.finish()
 }
 
