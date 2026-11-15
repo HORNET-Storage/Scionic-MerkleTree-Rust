@@ -26,7 +26,7 @@ use crate::format::{
 use crate::hash::{Hash, Root};
 use crate::intake::{Arrived, ChunkFrames, Intake, Summary};
 use crate::read::{file_of, folder_of, record_of};
-use crate::store::{check_chunk, damaged, lend_chunk, lent, missing, Store, Stored};
+use crate::store::{check_chunk, damaged, lent, ChunksAhead, Store, Stored};
 use crate::wire::{
     file_branch_frame, file_list_frame, folder_branch_frame, folder_list_frame, have_frame,
     read_next, refused_frame, write_end, write_frame, write_framed, Frame, HaveMap, Next, Refusal,
@@ -36,7 +36,6 @@ use crate::wire::{
 use crate::{Error, Result};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
 /// The most requests [`fetch`] sends before it looks at what is still wanted.
@@ -836,102 +835,13 @@ pub fn export(store: &dyn Store, root: &Root, out: &mut dyn Write) -> Result<()>
                     .filter(|item| chunks.insert(item.hash))
                     .copied()
                     .collect();
-                ahead.write(store, &new, out)?;
+                ahead.lend(store, &new, &mut |_, bytes| {
+                    write_framed(out, FRAME_CHUNK, bytes)
+                })?;
             }
         }
     }
     Ok(())
-}
-
-/// The most bytes of chunks that [`export`] reads and checks ahead of what
-/// it writes.
-const AHEAD_BYTES: u64 = 64 << 20;
-
-/// The most chunks that [`export`] reads and checks ahead, however short.
-const AHEAD_COUNT: usize = 1024;
-
-/// The least bytes of chunks that are worth a thread of their own.
-const AHEAD_BYTES_BY_EACH: u64 = 1 << 20;
-
-/// Reads chunks from a store and checks them ahead of writing them, several
-/// at once. The buffers serve one batch after another: memory that is used
-/// again costs much less than fresh memory.
-struct ChunksAhead {
-    buffers: Vec<Mutex<Vec<u8>>>,
-    cores: usize,
-}
-
-impl ChunksAhead {
-    fn new() -> Self {
-        Self {
-            buffers: Vec::new(),
-            cores: std::thread::available_parallelism().map_or(1, usize::from),
-        }
-    }
-
-    /// Writes the frames of the chunks that `items` name to `out`, in their
-    /// order. Each is read from the store and checked first, as
-    /// [`lend_chunk`] checks it, on as many threads as are worth it. The
-    /// first chunk that is missing or damaged is the error, and nothing from
-    /// it on is written.
-    fn write(&mut self, store: &dyn Store, items: &[ChunkRef], out: &mut dyn Write) -> Result<()> {
-        let mut rest = items;
-        while !rest.is_empty() {
-            let mut count = 0;
-            let mut bytes = 0_u64;
-            for item in rest.iter().take(AHEAD_COUNT) {
-                if count > 0 && bytes + u64::from(item.length) > AHEAD_BYTES {
-                    break;
-                }
-                bytes += u64::from(item.length);
-                count += 1;
-            }
-            let (batch, after) = rest.split_at(count);
-            while self.buffers.len() < count {
-                self.buffers.push(Mutex::new(Vec::new()));
-            }
-            let buffers = &self.buffers[..count];
-            let next = AtomicUsize::new(0);
-            let work = || {
-                let mut done = Vec::new();
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = batch.get(index) else {
-                        return done;
-                    };
-                    let mut buffer = lock(&buffers[index]);
-                    buffer.clear();
-                    let held = lend_chunk(store, item, &mut |bytes| {
-                        buffer.extend_from_slice(bytes);
-                        Ok(())
-                    });
-                    done.push((index, held));
-                }
-            };
-            let worth = usize::try_from(bytes / AHEAD_BYTES_BY_EACH).unwrap_or(usize::MAX);
-            let workers = self.cores.min(worth.saturating_add(1)).min(count);
-            let mut done = std::thread::scope(|scope| {
-                let handles: Vec<_> = (1..workers).map(|_| scope.spawn(work)).collect();
-                let mut done = work();
-                for handle in handles {
-                    match handle.join() {
-                        Ok(more) => done.extend(more),
-                        Err(payload) => std::panic::resume_unwind(payload),
-                    }
-                }
-                done
-            });
-            done.sort_unstable_by_key(|(index, _)| *index);
-            for (index, held) in done {
-                if !held? {
-                    return Err(missing("the chunk", &batch[index].hash));
-                }
-                write_framed(out, FRAME_CHUNK, &lock(&buffers[index]))?;
-            }
-            rest = after;
-        }
-        Ok(())
-    }
 }
 
 /// Reads a bundle that [`export`] wrote, and takes the tree with this root

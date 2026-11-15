@@ -12,7 +12,7 @@ use crate::format::{
     MAX_FOLDER_DEPTH,
 };
 use crate::hash::{Hash, Root};
-use crate::store::{lend_chunk, load_file, load_folder, load_record, missing, Store, Stored};
+use crate::store::{load_file, load_folder, load_record, missing, ChunksAhead, Store, Stored};
 use crate::{io_error, Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -183,21 +183,19 @@ fn write_stretch(
             None => return Err(missing("the chunk", &item.hash)),
         }
     }
-    for (item, start) in wanted {
+    // A long stretch is read and checked several chunks at once, ahead of
+    // what is written.
+    let items: Vec<ChunkRef> = wanted.iter().map(|(item, _)| *item).collect();
+    ChunksAhead::new().lend(store, &items, &mut |place, bytes| {
+        let (item, start) = &wanted[place];
         let from = offset.saturating_sub(*start) as usize;
         let to = (end.min(start + u64::from(item.length)) - start) as usize;
-        let held = lend_chunk(store, item, &mut |bytes| {
-            out.write_all(&bytes[from..to])
-                .map_err(|source| Error::Stream {
-                    operation: "write a file's bytes",
-                    source,
-                })
-        })?;
-        if !held {
-            return Err(missing("the chunk", &item.hash));
-        }
-    }
-    Ok(())
+        out.write_all(&bytes[from..to])
+            .map_err(|source| Error::Stream {
+                operation: "write a file's bytes",
+                source,
+            })
+    })
 }
 
 /// Why this system cannot hold a name as it is, if it cannot.

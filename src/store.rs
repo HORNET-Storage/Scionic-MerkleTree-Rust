@@ -13,7 +13,8 @@ use crate::format::{ChunkRef, FileList, FolderList, Kind, Record, Target};
 use crate::hash::{Hash, Root};
 use crate::{Error, Result};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// The kinds of thing a store keeps.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -304,6 +305,134 @@ pub(crate) fn lend_chunk(
 
 pub(crate) fn missing(what: &'static str, hash: &Hash) -> Error {
     Error::Missing { what, hash: *hash }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The most bytes of chunks that are read and checked ahead of what is done
+/// with them.
+const AHEAD_BYTES: u64 = 64 << 20;
+
+/// The most chunks that are read and checked ahead, however short.
+const AHEAD_COUNT: usize = 1024;
+
+/// The least bytes of chunks that are worth a thread of their own.
+const AHEAD_BYTES_BY_EACH: u64 = 1 << 20;
+
+/// Reads chunks from a store and checks them ahead of what is done with
+/// them, several at once. The buffers serve one batch after another: memory
+/// that is used again costs much less than fresh memory.
+pub(crate) struct ChunksAhead {
+    buffers: Vec<Mutex<Vec<u8>>>,
+    cores: usize,
+}
+
+impl ChunksAhead {
+    pub(crate) fn new() -> Self {
+        Self {
+            buffers: Vec::new(),
+            cores: std::thread::available_parallelism().map_or(1, usize::from),
+        }
+    }
+
+    /// Lends the chunks that `items` name to `with`, each with its place
+    /// among them, in their order. Each is read from the store and checked
+    /// first, as [`lend_chunk`] checks it. Where the chunks are long enough
+    /// to be worth it, several are read and checked at once, ahead of `with`;
+    /// otherwise each is lent straight from the store. The first chunk that
+    /// is missing or damaged is the error, and `with` is given neither it nor
+    /// any after it.
+    pub(crate) fn lend(
+        &mut self,
+        store: &dyn Store,
+        items: &[ChunkRef],
+        with: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut first = 0;
+        while first < items.len() {
+            let mut count = 0;
+            let mut bytes = 0_u64;
+            for item in items[first..].iter().take(AHEAD_COUNT) {
+                if count > 0 && bytes + u64::from(item.length) > AHEAD_BYTES {
+                    break;
+                }
+                bytes += u64::from(item.length);
+                count += 1;
+            }
+            let batch = &items[first..first + count];
+            let worth = usize::try_from(bytes / AHEAD_BYTES_BY_EACH).unwrap_or(usize::MAX);
+            let workers = self.cores.min(worth.saturating_add(1)).min(count);
+            if workers <= 1 {
+                for (place, item) in (first..).zip(batch) {
+                    let held = lend_chunk(store, item, &mut |bytes| with(place, bytes))?;
+                    if !held {
+                        return Err(missing("the chunk", &item.hash));
+                    }
+                }
+            } else {
+                self.ahead(store, batch, workers, &mut |index, bytes| {
+                    with(first + index, bytes)
+                })?;
+            }
+            first += count;
+        }
+        Ok(())
+    }
+
+    /// Reads and checks the chunks of `batch` on `workers` threads, and then
+    /// lends them to `with` in their order.
+    fn ahead(
+        &mut self,
+        store: &dyn Store,
+        batch: &[ChunkRef],
+        workers: usize,
+        with: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        while self.buffers.len() < batch.len() {
+            self.buffers.push(Mutex::new(Vec::new()));
+        }
+        let buffers = &self.buffers[..batch.len()];
+        let next = AtomicUsize::new(0);
+        let work = || {
+            let mut done = Vec::new();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = batch.get(index) else {
+                    return done;
+                };
+                let mut buffer = lock(&buffers[index]);
+                buffer.clear();
+                let held = lend_chunk(store, item, &mut |bytes| {
+                    buffer.extend_from_slice(bytes);
+                    Ok(())
+                });
+                done.push((index, held));
+            }
+        };
+        let mut done = std::thread::scope(|scope| {
+            let handles: Vec<_> = (1..workers).map(|_| scope.spawn(work)).collect();
+            let mut done = work();
+            for handle in handles {
+                match handle.join() {
+                    Ok(more) => done.extend(more),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            done
+        });
+        done.sort_unstable_by_key(|(index, _)| *index);
+        for (index, held) in done {
+            if !held? {
+                return Err(missing("the chunk", &batch[index].hash));
+            }
+            with(index, &lock(&buffers[index]))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

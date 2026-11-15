@@ -4,8 +4,9 @@
 mod support;
 
 use scionic_merkletree::{
-    build, export, fetch, import, verify_with, Builder, ChunkRef, Chunking, Error, ExtraData, Hash,
-    Intake, MemoryStore, Result, Root, Store, Stored, VerifyOptions, BUNDLE_MAGIC, FRAME_CHUNK,
+    build, export, fetch, import, read_file, read_range, record_of, verify_with, Builder, ChunkRef,
+    Chunking, Error, ExtraData, Hash, Intake, MemoryStore, Result, Root, Store, Stored,
+    VerifyOptions, BUNDLE_MAGIC, FRAME_CHUNK,
 };
 use std::io::{self, Read};
 use std::panic::AssertUnwindSafe;
@@ -387,40 +388,73 @@ fn a_store_that_falls_over_while_it_keeps_a_chunk_leaves_the_intake_done() {
     assert!(fell.is_err());
 }
 
+/// A store that holds what `source` holds, with the chunk `hash` damaged:
+/// its first byte changed.
+fn damaged_copy(source: &MemoryStore, hash: &Hash) -> MemoryStore {
+    let store = MemoryStore::new();
+    for (kind, held, mut bytes) in contents(source) {
+        if kind == Stored::Chunk && held == *hash {
+            bytes[0] ^= 1;
+        }
+        store.put(kind, &held, &bytes).unwrap();
+    }
+    store
+}
+
 #[test]
 fn a_bundle_ends_at_the_first_chunk_that_is_damaged_or_missing() {
     let (source, root, frames) = long_tree("threads-export");
     let places = chunk_places(&frames);
-    let copy = || {
-        let store = MemoryStore::new();
-        for (kind, hash, bytes) in contents(&source) {
-            store.put(kind, &hash, &bytes).unwrap();
-        }
-        store
-    };
     // The chunks are read and checked ahead, several at once, and written
     // in order: what comes out is the bundle up to the bad chunk.
     for bad in [places[0], places[2], places[places.len() - 1]] {
         let hash = Hash::of(&frames[bad][1..]);
         let before = bundle_of(&frames[..bad]);
 
-        let damaged = copy();
-        damaged.remove(Stored::Chunk, &hash).unwrap();
-        let mut bytes = frames[bad][1..].to_vec();
-        bytes[0] ^= 1;
-        damaged.put(Stored::Chunk, &hash, &bytes).unwrap();
+        let damaged = damaged_copy(&source, &hash);
         let mut out = Vec::new();
         let result = export(&damaged, &root, &mut out);
         assert!(matches!(result, Err(Error::Corrupt { .. })), "{result:?}");
         assert!(out == before, "damaged chunk at frame {bad}");
 
-        let missing = copy();
+        let missing = damaged_copy(&source, &hash);
         missing.remove(Stored::Chunk, &hash).unwrap();
         let mut out = Vec::new();
         let result = export(&missing, &root, &mut out);
         assert!(matches!(result, Err(Error::Missing { .. })), "{result:?}");
         assert!(out == before, "missing chunk at frame {bad}");
     }
+}
+
+#[test]
+fn a_long_file_is_read_back_whole_and_stops_at_a_damaged_chunk() {
+    let (source, root, frames) = long_tree("threads-read");
+    let places = chunk_places(&frames);
+    let data: Vec<u8> = places
+        .iter()
+        .flat_map(|&place| frames[place][1..].iter().copied())
+        .collect();
+    let file = record_of(&source, &root).unwrap().top();
+    let mut out = Vec::new();
+    read_file(&source, &file, &mut out).unwrap();
+    assert!(out == data);
+    // A stretch over several chunks.
+    let (offset, length) = (1_000_003, 7 << 20);
+    let mut out = Vec::new();
+    read_range(&source, &file, offset, length, &mut out).unwrap();
+    assert!(out[..] == data[offset as usize..(offset + length) as usize]);
+
+    // Read and checked ahead, written in order: the bytes before the damaged
+    // chunk come out, and nothing from it on.
+    let damaged = damaged_copy(&source, &Hash::of(&frames[places[2]][1..]));
+    let mut out = Vec::new();
+    let result = read_file(&damaged, &file, &mut out);
+    assert!(matches!(result, Err(Error::Corrupt { .. })), "{result:?}");
+    let before: usize = places[..2]
+        .iter()
+        .map(|&place| frames[place].len() - 1)
+        .sum();
+    assert!(out[..] == data[..before]);
 }
 
 /// Bytes that look random, made quickly: a long file for a test.
