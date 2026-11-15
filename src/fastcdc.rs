@@ -12,7 +12,9 @@
 //! file the same hash only when both cut at the same bytes.
 
 use crate::format::Chunking;
+use crate::threads::on_threads;
 use crate::{Error, Result};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Cut-point skipping floor: no boundary test runs inside the first
 /// `FASTCDC_MIN_SIZE` bytes of a chunk, and those bytes are not hashed at
@@ -341,23 +343,25 @@ fn matches_on_threads(data: &[u8], threads: usize) -> Vec<Match> {
         return Vec::new();
     };
     let each = length.div_ceil(threads.max(1)).max(1);
-    let mut stretches = (FIRST_WHOLE_HASH..data.len())
+    let stretches: Vec<(usize, usize)> = (FIRST_WHOLE_HASH..data.len())
         .step_by(each)
-        .map(|from| (from, (from + each).min(data.len())));
-    std::thread::scope(|scope| {
-        let own = stretches.next();
-        let handles: Vec<_> = stretches
-            .map(|(from, to)| scope.spawn(move || find_matches(data, from, to)))
-            .collect();
-        let mut found = own.map_or_else(Vec::new, |(from, to)| find_matches(data, from, to));
-        for handle in handles {
-            match handle.join() {
-                Ok(more) => found.extend(more),
-                Err(payload) => std::panic::resume_unwind(payload),
-            }
+        .map(|from| (from, (from + each).min(data.len())))
+        .collect();
+    // Each thread takes the next stretch that no thread has taken.
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut found = Vec::new();
+        while let Some(&(from, to)) = stretches.get(next.fetch_add(1, Ordering::Relaxed)) {
+            found.push((from, find_matches(data, from, to)));
         }
         found
-    })
+    };
+    let mut found: Vec<(usize, Vec<Match>)> = on_threads(stretches.len(), &work)
+        .into_iter()
+        .flatten()
+        .collect();
+    found.sort_unstable_by_key(|(from, _)| *from);
+    found.into_iter().flat_map(|(_, matches)| matches).collect()
 }
 
 /// Every match among the bytes `data[from..to]`, in order. `from` is at

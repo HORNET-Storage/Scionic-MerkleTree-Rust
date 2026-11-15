@@ -9,6 +9,7 @@ use crate::format::{
 use crate::hash::Root;
 use crate::intake::Intake;
 use crate::store::{Store, Stored};
+use crate::threads::{cores, with_helpers};
 use crate::{io_error, Error, Result};
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -50,10 +51,6 @@ const FIXED_CHUNKS_IN_A_WINDOW: usize = 1024;
 /// What a window holds when it starts on its first file. A window grows only
 /// as a file turns out to be longer, so a small file never costs a large one.
 const WINDOW_START: usize = 64 * 1024;
-
-fn cores() -> usize {
-    std::thread::available_parallelism().map_or(1, usize::from)
-}
 
 /// The threads that are free to help with a long file.
 ///
@@ -317,18 +314,8 @@ fn keep_chunks_while<T>(
             kept.push((index, item));
         }
     };
-    let (kept, done) = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..helping).map(|_| scope.spawn(work)).collect();
-        let done = meanwhile();
-        let mut kept = work();
-        for handle in handles {
-            match handle.join() {
-                Ok(more) => kept.extend(more),
-                Err(payload) => std::panic::resume_unwind(payload),
-            }
-        }
-        (kept, done)
-    });
+    let (kept, done) = with_helpers(helping, &work, meanwhile);
+    let kept: Vec<_> = kept.into_iter().flatten().collect();
     helpers.give(helping);
     (in_order(kept, chunks.len(), items), done)
 }

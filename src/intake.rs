@@ -23,6 +23,7 @@ use crate::format::{
 };
 use crate::hash::{Hash, Root};
 use crate::store::{lent, load_record, missing, Store, Stored};
+use crate::threads::on_threads;
 use crate::wire::{
     read_next_onto, Next, Request, FRAME_CHUNK, FRAME_FILE_LIST, FRAME_FOLDER_LIST, FRAME_RECORD,
 };
@@ -678,20 +679,7 @@ impl<'s> Intake<'s> {
             workers => workers,
         }
         .min(held.len());
-        let results: Vec<Result<Vec<usize>>> = if workers <= 1 {
-            vec![work()]
-        } else {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..workers).map(|_| scope.spawn(work)).collect();
-                handles
-                    .into_iter()
-                    .map(|handle| match handle.join() {
-                        Ok(result) => result,
-                        Err(payload) => std::panic::resume_unwind(payload),
-                    })
-                    .collect()
-            })
-        };
+        let results: Vec<Result<Vec<usize>>> = on_threads(workers, &work);
         let mut spoiled = Vec::new();
         for result in results {
             spoiled.extend(result?);
@@ -819,17 +807,7 @@ impl<'s> Intake<'s> {
             }
         };
         let workers = workers.clamp(1, frames.len());
-        let settled = std::thread::scope(|scope| {
-            let handles: Vec<_> = (1..workers).map(|_| scope.spawn(work)).collect();
-            let mut settled = work();
-            for handle in handles {
-                match handle.join() {
-                    Ok(more) => settled.extend(more),
-                    Err(payload) => std::panic::resume_unwind(payload),
-                }
-            }
-            settled
-        });
+        let settled: Vec<_> = on_threads(workers, &work).into_iter().flatten().collect();
         self.failed = false;
         let mut first: Option<(usize, Error)> = None;
         for (index, taken) in settled {

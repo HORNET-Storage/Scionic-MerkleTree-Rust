@@ -11,6 +11,7 @@
 
 use crate::format::{ChunkRef, FileList, FolderList, Kind, Record, Target};
 use crate::hash::{Hash, Root};
+use crate::threads::on_threads;
 use crate::wire::FRAME_CHUNK;
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -580,17 +581,7 @@ impl ChunksAhead {
                 done.push((index, held));
             }
         };
-        let mut done = std::thread::scope(|scope| {
-            let handles: Vec<_> = (1..workers).map(|_| scope.spawn(work)).collect();
-            let mut done = work();
-            for handle in handles {
-                match handle.join() {
-                    Ok(more) => done.extend(more),
-                    Err(payload) => std::panic::resume_unwind(payload),
-                }
-            }
-            done
-        });
+        let mut done: Vec<_> = on_threads(workers, &work).into_iter().flatten().collect();
         done.sort_unstable_by_key(|(index, _)| *index);
         for (index, held) in done {
             if !held? {

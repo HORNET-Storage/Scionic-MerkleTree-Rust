@@ -10,6 +10,13 @@ license = "MIT"
 [dependencies]
 sha2 = { version = "0.11", default-features = false }
 
+# Threads that are kept from one batch of work to the next. Starting a thread
+# for each batch costs tens of microseconds, and more on Windows, which every
+# batch of chunks waited for. Lending work that borrows from its caller to
+# threads that are kept takes `unsafe` code: rayon holds it, and this crate
+# does not (`src/threads.rs` says more).
+rayon = "1.12"
+
 # Opening a file from the folder it is in, and never through a link: the
 # standard library has no way to do that without `unsafe`. Used on Unix only.
 # On Windows the same is done with what the standard library has.

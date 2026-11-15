@@ -177,7 +177,7 @@ For a build that can be repeated, pin a commit with `rev = "..."` in place of th
 | --- | --- |
 | Rust | 1.85 or newer |
 | Systems | Linux, macOS and Windows, each tested on every push |
-| Dependencies | `sha2`; on Unix `rustix`, and on Windows `windows-sys` |
+| Dependencies | `sha2` and `rayon`; on Unix `rustix`, and on Windows `windows-sys` |
 | `unsafe` code | in one function, on Windows only, which asks the system which file an open file is (`src/disk.rs`); the crate denies it everywhere else |
 
 ## Quick Start

@@ -25,6 +25,7 @@ mod intake;
 mod read;
 mod store;
 mod sync;
+mod threads;
 pub mod tree;
 mod wire;
 
