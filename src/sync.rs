@@ -28,15 +28,15 @@ use crate::intake::{Arrived, Intake, Summary};
 use crate::read::{file_of, folder_of, record_of};
 use crate::store::{check_chunk, damaged, lend_chunk, lent, missing, Store, Stored};
 use crate::wire::{
-    chunk_frame, file_branch_frame, file_list_frame, folder_branch_frame, folder_list_frame,
-    have_frame, read_next, refused_frame, write_end, write_frame, write_framed, Frame, HaveMap,
-    Next, Refusal, Request, BUNDLE_MAGIC, FRAME_CHUNK, FRAME_FILE_LIST, FRAME_FOLDER_LIST,
-    FRAME_REFUSED, MAX_REQUEST_BYTES,
+    file_branch_frame, file_list_frame, folder_branch_frame, folder_list_frame, have_frame,
+    read_next, refused_frame, write_end, write_frame, write_framed, Frame, HaveMap, Next, Refusal,
+    Request, BUNDLE_MAGIC, FRAME_CHUNK, FRAME_FILE_LIST, FRAME_FOLDER_LIST, FRAME_REFUSED,
+    MAX_REQUEST_BYTES,
 };
 use crate::{Error, Result};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 
 /// The most requests [`fetch`] sends before it looks at what is still wanted.
 const REQUESTS_PER_ROUND: usize = 64;
@@ -207,6 +207,8 @@ pub struct Responder<'s> {
     /// part of a long list needs its tree.
     files: Mutex<Recent<OpenFile>>,
     folders: Mutex<Recent<OpenFolder>>,
+    /// The frame that the last chunk was sent in, filled again for the next.
+    frame: Mutex<Vec<u8>>,
     recent: u64,
     have: bool,
 }
@@ -217,6 +219,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Fills `frame` with the frame of a chunk, from its start.
+fn refill(frame: &mut Vec<u8>, chunk: &[u8]) {
+    frame.clear();
+    frame.push(FRAME_CHUNK);
+    frame.extend_from_slice(chunk);
+}
+
 impl<'s> Responder<'s> {
     pub fn new(store: &'s dyn Store) -> Self {
         Self {
@@ -224,6 +233,7 @@ impl<'s> Responder<'s> {
             lists: Mutex::new(Recent::new()),
             files: Mutex::new(Recent::new()),
             folders: Mutex::new(Recent::new()),
+            frame: Mutex::new(Vec::new()),
             recent: RECENT_ITEMS,
             have: true,
         }
@@ -311,6 +321,22 @@ impl<'s> Responder<'s> {
         Ok(Some(open))
     }
 
+    /// Hands `with` a frame to send chunks in. It is the responder's own,
+    /// filled again for each chunk and from one request to the next: memory
+    /// that is used again costs much less than fresh memory for every chunk,
+    /// which a system has to find and clear first. A thread that finds it in
+    /// use, by another thread or by an answer that this one is still giving,
+    /// is given a frame of its own, and nobody waits for it.
+    fn with_frame(&self, with: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> Result<()> {
+        match self.frame.try_lock() {
+            Ok(mut kept) => with(&mut kept),
+            // The frame is filled from its start each time, so nothing that a
+            // thread left in it when it panicked is ever sent.
+            Err(TryLockError::Poisoned(poisoned)) => with(&mut poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => with(&mut Vec::new()),
+        }
+    }
+
     /// Answers one request. Each frame of the answer is handed to
     /// `on_frame`. A request that is malformed is an error. A request for
     /// something the store does not hold is answered with a refusal.
@@ -334,14 +360,17 @@ impl<'s> Responder<'s> {
                 Some(bytes) => on_frame(&file_list_frame(&bytes)),
                 None => on_frame(&not_held),
             },
-            Request::Chunk(chunk) => {
-                let mut frame = Vec::new();
+            Request::Chunk(chunk) => self.with_frame(|frame| {
                 let held = lent(self.store, Stored::Chunk, &chunk, &mut |bytes| {
-                    frame = chunk_frame(bytes);
+                    refill(frame, bytes);
                     Ok(())
                 })?;
-                on_frame(if held { &frame } else { &not_held })
-            }
+                on_frame(if held {
+                    frame.as_slice()
+                } else {
+                    not_held.as_slice()
+                })
+            }),
             Request::FolderBranch {
                 folder,
                 start,
@@ -399,24 +428,21 @@ impl<'s> Responder<'s> {
                     return on_frame(&out_of_range);
                 }
                 let count = u64::from(count).min(MAX_CHUNKS_PER_ANSWER) as usize;
-                // One frame is filled again for each chunk. Memory that is used
-                // again costs much less than fresh memory for every chunk,
-                // which a system has to find and clear first. A frame is lent
-                // to `on_frame` for the call only.
-                let mut frame = Vec::new();
-                for item in list.items()[start as usize..].iter().take(count) {
-                    let held = lent(self.store, Stored::Chunk, &item.hash, &mut |bytes| {
-                        frame.clear();
-                        frame.push(FRAME_CHUNK);
-                        frame.extend_from_slice(bytes);
-                        Ok(())
-                    })?;
-                    if !held {
-                        return on_frame(&not_held);
+                // A frame is lent to `on_frame` for the call only: the next chunk
+                // is filled into it.
+                self.with_frame(|frame| {
+                    for item in list.items()[start as usize..].iter().take(count) {
+                        let held = lent(self.store, Stored::Chunk, &item.hash, &mut |bytes| {
+                            refill(frame, bytes);
+                            Ok(())
+                        })?;
+                        if !held {
+                            return on_frame(&not_held);
+                        }
+                        on_frame(frame.as_slice())?;
                     }
-                    on_frame(&frame)?;
-                }
-                Ok(())
+                    Ok(())
+                })
             }
             Request::Have(file) => {
                 if !self.have {

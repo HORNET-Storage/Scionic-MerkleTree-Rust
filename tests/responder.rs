@@ -150,6 +150,50 @@ fn a_responder_can_keep_to_itself_which_chunks_it_holds() {
     );
 }
 
+/// A responder fills one frame again for every chunk it sends, from one
+/// request to the next. What it sends is the chunk that was asked for and
+/// nothing of a longer one before it, and a frame that is lent out is never
+/// filled again: a request that is answered inside the answer to another is
+/// given a frame of its own.
+#[test]
+fn a_frame_that_is_filled_again_holds_the_chunk_asked_for_alone() {
+    let store = MemoryStore::new();
+    let long = bytes("frame-long", 4_000);
+    let short = bytes("frame-short", 10);
+    for chunk in [&long, &short] {
+        store.put(Stored::Chunk, &Hash::of(chunk), chunk).unwrap();
+    }
+    let ask = |chunk: &[u8]| Request::Chunk(Hash::of(chunk)).encode();
+    let responder = Responder::new(&store);
+    let mut sent = Vec::new();
+    for chunk in [&long, &short, &long, &short] {
+        responder
+            .answer(&ask(chunk), &mut |frame| {
+                sent.push(frame.to_vec());
+                Ok(())
+            })
+            .unwrap();
+    }
+    for (frame, chunk) in sent.iter().zip([&long, &short, &long, &short]) {
+        assert_eq!(Frame::decode(frame).unwrap(), Frame::Chunk(chunk));
+    }
+
+    let (mut outer, mut inner) = (Vec::new(), Vec::new());
+    responder
+        .answer(&ask(&long), &mut |frame| {
+            responder.answer(&ask(&short), &mut |frame| {
+                inner = frame.to_vec();
+                Ok(())
+            })?;
+            // The answer inside left this frame as it was.
+            outer = frame.to_vec();
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(Frame::decode(&outer).unwrap(), Frame::Chunk(&long));
+    assert_eq!(Frame::decode(&inner).unwrap(), Frame::Chunk(&short));
+}
+
 #[test]
 fn a_list_read_with_its_tree_is_the_list_read_alone() {
     for count in [0_usize, 1, 2, 3, 5, 8, 13, 100] {
