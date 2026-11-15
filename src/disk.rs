@@ -406,13 +406,75 @@ mod imp {
         }
     }
 
-    /// Whether two open files are one file: on the same volume, with the
-    /// same number there. Where that is not to be had, nothing says that the
-    /// two are one.
+    /// Which file an open file is: the volume, and the number of the file on
+    /// it.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Identity {
+        volume: u64,
+        number: [u8; 16],
+    }
+
+    /// Which file `file` is. The long form has a 128-bit number, and every
+    /// volume of the newer kinds has it. The short form has a 64-bit number,
+    /// and every volume has it, but ReFS does not promise that its short
+    /// number is one file's alone.
+    ///
+    /// Neither can be asked of the standard library, so this is the one place
+    /// in the crate with `unsafe` code.
+    #[allow(unsafe_code)]
+    pub(super) fn identity(file: &File, long: bool) -> io::Result<Identity> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+            BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO,
+        };
+        let handle = file.as_raw_handle();
+        if long {
+            let mut info = FILE_ID_INFO::default();
+            // SAFETY: `handle` is open for as long as `file` is borrowed, and
+            // the system writes no more than the size it is given into `info`,
+            // which is a `FILE_ID_INFO` of that size.
+            let done = unsafe {
+                GetFileInformationByHandleEx(
+                    handle,
+                    FileIdInfo,
+                    (&raw mut info).cast(),
+                    size_of::<FILE_ID_INFO>() as u32,
+                )
+            };
+            if done == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(Identity {
+                volume: info.VolumeSerialNumber,
+                number: info.FileId.Identifier,
+            });
+        }
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `handle` is open for as long as `file` is borrowed, and
+        // `info` is the `BY_HANDLE_FILE_INFORMATION` that the call fills.
+        let done = unsafe { GetFileInformationByHandle(handle, &mut info) };
+        if done == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut number = [0; 16];
+        number[..4].copy_from_slice(&info.nFileIndexLow.to_le_bytes());
+        number[4..8].copy_from_slice(&info.nFileIndexHigh.to_le_bytes());
+        Ok(Identity {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            number,
+        })
+    }
+
+    /// Whether two open files are one file. Both are asked in the same form:
+    /// the long one where both volumes have it, and the short one otherwise.
+    /// Where a file's identity is not to be had, nothing says that the two
+    /// are one, and that is an error.
     pub(super) fn one_file(left: &File, right: &File) -> io::Result<bool> {
-        let left = same_file::Handle::from_file(left.try_clone()?)?;
-        let right = same_file::Handle::from_file(right.try_clone()?)?;
-        Ok(left == right)
+        if let (Ok(left), Ok(right)) = (identity(left, true), identity(right, true)) {
+            return Ok(left == right);
+        }
+        Ok(identity(left, false)? == identity(right, false)?)
     }
 
     /// Opens `path` as itself, and says whether it is a plain file with

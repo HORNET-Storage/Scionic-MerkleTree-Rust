@@ -17,8 +17,9 @@ sha2 = { version = "0.11", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
 
 # Telling whether two open files are one file, by the volume it is on and its
-# number there: the standard library has no way to do that without `unsafe`
-# either. Used on Windows only, where a file that something stands in for has
-# to be opened a second time.
+# 128-bit number there, which no safe call of the standard library or of a
+# package gives. Used on Windows only, where a file that something stands in for
+# has to be opened a second time: Microsoft's own bindings, called from the one
+# function in the crate that holds `unsafe` code (`src/disk.rs`).
 [target.'cfg(windows)'.dependencies]
-same-file = "1.0.6"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

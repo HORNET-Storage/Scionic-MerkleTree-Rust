@@ -176,8 +176,8 @@ For a build that can be repeated, pin a commit with `rev = "..."` in place of th
 | --- | --- |
 | Rust | 1.85 or newer |
 | Systems | Linux, macOS and Windows, each tested on every push |
-| Dependencies | `sha2`, and on Unix `rustix` |
-| `unsafe` code | none: the crate is `#![forbid(unsafe_code)]` |
+| Dependencies | `sha2`; on Unix `rustix`, and on Windows `windows-sys` |
+| `unsafe` code | in one function, on Windows only, which asks the system which file an open file is (`src/disk.rs`); the crate denies it everywhere else |
 
 ## Quick Start
 
@@ -446,7 +446,7 @@ A receiver trusts one thing: the root. The peer that sends a tree, the network i
 - **A link is never followed when a tree is built.** That holds for a link that is in the folder, and for one that takes a file's or a folder's place while the folder is being read. Each folder is held open while it is read, and what is in it is opened from the folder itself, never by a path that is looked up again.
 - **Nothing is written outside the destination.** A tree is written only to a new place, and only with names the system can hold as they are. The new folders are held open while they are filled, so a link that takes the place of one is not written through.
 - **A file is read under its own name.** Windows drops a dot or a space from the end of a name when it looks a path up, and takes `NUL` for a device wherever it stands, so a file `model.` beside a file `model` would be read as `model`. Everything below the folder a caller names is opened by a path that Windows takes letter for letter.
-- **No `unsafe` code.** The crate forbids it.
+- **`unsafe` code in one place only.** On Windows, one function asks the system for an open file's 128-bit number, which the standard library can't (`src/disk.rs`). Everywhere else the crate denies `unsafe` code.
 
 The exact rules are in [`spec/FORMAT.md`](spec/FORMAT.md), under "What a receiver checks", "Limits", "Building a tree" and "Writing a tree out".
 

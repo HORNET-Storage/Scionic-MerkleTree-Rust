@@ -1,4 +1,8 @@
-#![forbid(unsafe_code)]
+// `unsafe` code is denied everywhere but in one function, on Windows, which
+// asks the system which file an open file is (`disk.rs`). Each `unsafe` block
+// says why it is sound.
+#![deny(unsafe_code)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 //! Scionic Merkle trees.
 //!
 //! A tree holds a folder of files, or one file, under one root hash. A file is

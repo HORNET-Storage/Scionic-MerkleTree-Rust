@@ -362,3 +362,26 @@ fn two_open_files_are_known_to_be_one_file_or_not() {
         assert!(!one_file(&open("two"), &open("link")).unwrap());
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn both_forms_of_a_files_number_tell_files_apart() {
+    use super::imp::identity;
+    let scratch = Scratch::new("identity-forms");
+    let root = &scratch.0;
+    fs::create_dir_all(root.join("folder")).unwrap();
+    for name in ["one", "two", "folder/one"] {
+        fs::write(root.join(name), b"one").unwrap();
+    }
+    fs::hard_link(root.join("one"), root.join("again")).unwrap();
+    let open = |name: &str| fs::File::open(root.join(name)).unwrap();
+    // The long form, with its 128-bit number, is what two files are told apart
+    // by. A volume that has no long form is asked for the short one, so that
+    // is held to the same here.
+    for long in [true, false] {
+        let is = |name: &str| identity(&open(name), long).unwrap();
+        assert_eq!(is("one"), is("again"), "long: {long}");
+        assert_ne!(is("one"), is("two"), "long: {long}");
+        assert_ne!(is("one"), is("folder/one"), "long: {long}");
+    }
+}
