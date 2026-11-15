@@ -23,9 +23,12 @@ use crate::format::{
 };
 use crate::hash::{Hash, Root};
 use crate::store::{lent, load_record, missing, Store, Stored};
-use crate::wire::{Request, FRAME_CHUNK, FRAME_FILE_LIST, FRAME_FOLDER_LIST, FRAME_RECORD};
+use crate::wire::{
+    read_next_onto, Next, Request, FRAME_CHUNK, FRAME_FILE_LIST, FRAME_FOLDER_LIST, FRAME_RECORD,
+};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -1198,83 +1201,120 @@ const CHUNK_FRAMES_COUNT: usize = 1024;
 const CHUNK_BYTES_BY_EACH: usize = 1 << 20;
 
 /// Chunk frames that come one after another, held to be taken in together,
-/// so that several threads hash and keep them at once. The buffers serve
-/// one batch after another: memory that is used again costs much less than
-/// fresh memory, which a system has to find and clear first.
+/// so that several threads hash and keep them at once. They are held one
+/// after another in one stretch of memory, which serves one batch after
+/// another: memory that is used again costs much less than fresh memory,
+/// which a system has to find and clear first. A batch takes no more memory
+/// than its frames do, whatever the lengths of the frames of the batches
+/// before it.
 pub(crate) struct ChunkFrames {
-    buffers: Vec<Vec<u8>>,
+    /// The frames that are held, and after them the frame that was read
+    /// last, until it is held or taken out.
+    memory: Vec<u8>,
+    /// Where each frame that is held ends in `memory`.
+    ends: Vec<usize>,
     expected: Vec<Option<Arrived>>,
-    held: usize,
-    bytes: usize,
     cores: usize,
 }
 
 impl ChunkFrames {
     pub(crate) fn new() -> Self {
         Self {
-            buffers: Vec::new(),
+            memory: Vec::new(),
+            ends: Vec::new(),
             expected: Vec::new(),
-            held: 0,
-            bytes: 0,
             cores: std::thread::available_parallelism().map_or(1, usize::from),
         }
     }
 
-    /// The buffer that the next frame is read into. The frame is held only
-    /// once [`ChunkFrames::hold`] is called.
-    pub(crate) fn next_buffer(&mut self) -> &mut Vec<u8> {
-        if self.held == self.buffers.len() {
-            self.buffers.push(Vec::new());
+    /// How many bytes the frames that are held take.
+    fn held_bytes(&self) -> usize {
+        self.ends.last().copied().unwrap_or(0)
+    }
+
+    /// Takes room for a whole batch and the frame that ends it, once: memory
+    /// that grew a step at a time would be moved, and fresh memory taken,
+    /// at every step. Room that is not used is not touched.
+    fn make_room(&mut self) {
+        let batch = CHUNK_FRAMES_BYTES + MAX_CHUNK_BYTES + 1;
+        if self.memory.capacity() < batch {
+            self.memory.reserve_exact(batch - self.memory.len());
         }
-        &mut self.buffers[self.held]
     }
 
-    /// Whether the frame in the next buffer is a chunk's.
+    /// Reads what comes next on `input`, as `wire::read_next` does: a frame is
+    /// read after the frames that are held, and is held only once
+    /// [`ChunkFrames::hold`] is called.
+    pub(crate) fn read_next(&mut self, input: &mut dyn Read, limit: usize) -> Result<Next> {
+        self.make_room();
+        self.memory.truncate(self.held_bytes());
+        read_next_onto(input, limit, &mut self.memory)
+    }
+
+    /// Whether the frame that was read last is a chunk's.
     pub(crate) fn next_is_chunk(&self) -> bool {
-        self.buffers
-            .get(self.held)
-            .is_some_and(|frame| frame.first() == Some(&FRAME_CHUNK))
+        self.memory.get(self.held_bytes()) == Some(&FRAME_CHUNK)
     }
 
-    /// Holds the frame in the next buffer. It has to be `expected`, when
+    /// Moves the frame that was read last into `frame`, which is emptied
+    /// first.
+    pub(crate) fn take_next(&mut self, frame: &mut Vec<u8>) {
+        let held = self.held_bytes();
+        frame.clear();
+        frame.extend_from_slice(&self.memory[held..]);
+        self.memory.truncate(held);
+    }
+
+    /// Holds the frame that was read last. It has to be `expected`, when
     /// that is given.
     pub(crate) fn hold(&mut self, expected: Option<Arrived>) {
-        self.bytes += self.next_buffer().len();
+        self.ends.push(self.memory.len());
         self.expected.push(expected);
-        self.held += 1;
     }
 
     /// Holds a copy of `frame`, which is lent for the call only.
     pub(crate) fn hold_copy(&mut self, frame: &[u8], expected: Option<Arrived>) {
-        let buffer = self.next_buffer();
-        buffer.clear();
-        buffer.extend_from_slice(frame);
+        self.make_room();
+        self.memory.truncate(self.held_bytes());
+        self.memory.extend_from_slice(frame);
         self.hold(expected);
     }
 
     /// Whether enough frames are held to take them in now.
     pub(crate) fn full(&self) -> bool {
-        self.bytes >= CHUNK_FRAMES_BYTES || self.held >= CHUNK_FRAMES_COUNT
+        self.held_bytes() >= CHUNK_FRAMES_BYTES || self.ends.len() >= CHUNK_FRAMES_COUNT
     }
 
     /// Takes the frames that are held into `intake`, and holds none after.
     /// With none held, the intake is not asked anything: an intake that
     /// failed has given its failure already.
     pub(crate) fn take_in(&mut self, intake: &mut Intake<'_>) -> Result<()> {
-        if self.held == 0 {
+        if self.ends.is_empty() {
             return Ok(());
         }
-        let frames: Vec<(&[u8], Option<Arrived>)> = self.buffers[..self.held]
+        let mut start = 0;
+        let frames: Vec<(&[u8], Option<Arrived>)> = self
+            .ends
             .iter()
-            .map(Vec::as_slice)
-            .zip(self.expected.iter().copied())
+            .zip(&self.expected)
+            .map(|(&end, &expected)| {
+                let frame = &self.memory[start..end];
+                start = end;
+                (frame, expected)
+            })
             .collect();
-        let workers = self.cores.min(self.bytes / CHUNK_BYTES_BY_EACH + 1);
+        let workers = self.cores.min(self.held_bytes() / CHUNK_BYTES_BY_EACH + 1);
         let taken = intake.accept_chunks(&frames, workers);
-        self.held = 0;
-        self.bytes = 0;
+        self.memory.clear();
+        self.ends.clear();
         self.expected.clear();
         taken
+    }
+
+    /// How many bytes of memory this holds for frames.
+    #[cfg(test)]
+    fn memory_held(&self) -> usize {
+        self.memory.capacity()
     }
 }
 
@@ -1316,18 +1356,24 @@ impl<'scope, 'env, 'a: 'scope, 's: 'scope> TakingIn<'scope, 'env, 'a, 's> {
         }
     }
 
-    /// The buffer that the next frame is read into, as
-    /// [`ChunkFrames::next_buffer`] gives it.
-    pub(crate) fn next_buffer(&mut self) -> &mut Vec<u8> {
-        self.held.next_buffer()
+    /// Reads what comes next on `input`, as [`ChunkFrames::read_next`]
+    /// does.
+    pub(crate) fn read_next(&mut self, input: &mut dyn Read, limit: usize) -> Result<Next> {
+        self.held.read_next(input, limit)
     }
 
-    /// Whether the frame in the next buffer is a chunk's.
+    /// Moves the frame that was read last into `frame`, as
+    /// [`ChunkFrames::take_next`] does.
+    pub(crate) fn take_next(&mut self, frame: &mut Vec<u8>) {
+        self.held.take_next(frame);
+    }
+
+    /// Whether the frame that was read last is a chunk's.
     pub(crate) fn next_is_chunk(&self) -> bool {
         self.held.next_is_chunk()
     }
 
-    /// Holds the frame in the next buffer, as [`ChunkFrames::hold`] does.
+    /// Holds the frame that was read last, as [`ChunkFrames::hold`] does.
     pub(crate) fn hold(&mut self, expected: Option<Arrived>) -> Result<()> {
         self.held.hold(expected);
         self.hand_over_when_full()
@@ -1414,4 +1460,62 @@ pub fn verify_with(store: &dyn Store, root: &Root, options: VerifyOptions) -> Re
     intake.rehash_held(options.workers)?;
     intake.rechunk_held()?;
     intake.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::MemoryStore;
+
+    #[test]
+    fn a_batch_of_chunk_frames_takes_no_more_memory_than_its_frames() {
+        // In each batch a long frame comes after short ones, at another place
+        // each time. Memory that each place kept for the longest frame it
+        // held would come to all of them: 128 MiB.
+        let store = MemoryStore::new();
+        let mut intake = Intake::new(&store, Root::of_record(b"no such tree")).unwrap();
+        let long = vec![FRAME_CHUNK; (1 << 20) + 1];
+        let short = [FRAME_CHUNK, 1];
+        let places = 128;
+        // Room for a batch and the frame that ends it.
+        let most = CHUNK_FRAMES_BYTES + MAX_CHUNK_BYTES + 1;
+        assert!(places * (1 << 20) > most);
+        // Held as a fetch holds them.
+        let mut frames = ChunkFrames::new();
+        for place in 0..places {
+            for _ in 0..place {
+                frames.hold_copy(&short, None);
+            }
+            frames.hold_copy(&long, None);
+            // The intake has no record and takes no chunk, and the batch is
+            // let go all the same.
+            assert!(frames.take_in(&mut intake).is_err());
+        }
+        assert!(
+            frames.memory_held() <= most,
+            "{} bytes",
+            frames.memory_held()
+        );
+        // Read as an import reads them.
+        let mut frames = ChunkFrames::new();
+        for place in 0..places {
+            let mut stream = Vec::new();
+            for frame in std::iter::repeat_n(&short[..], place).chain([&long[..]]) {
+                stream.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+                stream.extend_from_slice(frame);
+            }
+            let mut input = stream.as_slice();
+            while let Next::Frame = frames.read_next(&mut input, long.len()).unwrap() {
+                assert!(frames.next_is_chunk());
+                frames.hold(None);
+            }
+            assert_eq!(frames.ends.len(), place + 1);
+            assert!(frames.take_in(&mut intake).is_err());
+        }
+        assert!(
+            frames.memory_held() <= most,
+            "{} bytes",
+            frames.memory_held()
+        );
+    }
 }

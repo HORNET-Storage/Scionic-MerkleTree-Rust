@@ -457,6 +457,33 @@ pub(crate) fn write_end(out: &mut dyn Write) -> Result<()> {
 /// as they come, a megabyte at a time, so that what a peer only says it will
 /// send costs nothing until it is sent.
 pub(crate) fn read_next(input: &mut dyn Read, limit: usize, frame: &mut Vec<u8>) -> Result<Next> {
+    frame.clear();
+    read_next_onto(input, limit, frame)
+}
+
+/// Reads what comes next on a stream as [`read_next`] does, and adds a frame
+/// to the end of `frames`, after what they hold already. Nothing is added
+/// unless a whole frame is.
+pub(crate) fn read_next_onto(
+    input: &mut dyn Read,
+    limit: usize,
+    frames: &mut Vec<u8>,
+) -> Result<Next> {
+    let start = frames.len();
+    let next = read_onto(input, limit, frames, start);
+    if !matches!(next, Ok(Next::Frame)) {
+        frames.truncate(start);
+    }
+    next
+}
+
+/// Reads what comes next on a stream, a frame into `frames` from `start` on.
+fn read_onto(
+    input: &mut dyn Read,
+    limit: usize,
+    frames: &mut Vec<u8>,
+    start: usize,
+) -> Result<Next> {
     let failed = |source| Error::Stream {
         operation: "read a frame",
         source,
@@ -490,18 +517,21 @@ pub(crate) fn read_next(input: &mut dyn Read, limit: usize, frame: &mut Vec<u8>)
             requested: length as u64,
         });
     }
-    frame.clear();
-    while frame.len() < length {
-        let held = frame.len();
-        let more = (length - held).min(READ_STEP_BYTES);
-        frame
+    let end = start.checked_add(length).ok_or(Error::AllocationFailed {
+        resource: "a frame",
+        requested: length as u64,
+    })?;
+    while frames.len() < end {
+        let held = frames.len();
+        let more = (end - held).min(READ_STEP_BYTES);
+        frames
             .try_reserve(more)
             .map_err(|_| Error::AllocationFailed {
                 resource: "a frame",
                 requested: length as u64,
             })?;
-        frame.resize(held + more, 0);
-        input.read_exact(&mut frame[held..]).map_err(cut_short)?;
+        frames.resize(held + more, 0);
+        input.read_exact(&mut frames[held..]).map_err(cut_short)?;
     }
     Ok(Next::Frame)
 }

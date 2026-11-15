@@ -464,7 +464,9 @@ impl<'s> Responder<'s> {
                 let items = &items[..count.min(items.len())];
                 // The chunks are read ahead, several at once, and sent in
                 // their order. A frame is lent to `on_frame` for the call
-                // only: the next chunk is read into it.
+                // only: the next chunk is read into it. A chunk that the
+                // store holds with another length than the list gives cannot
+                // be it, and is refused as one that is not held.
                 self.with_ahead(|ahead| {
                     ahead.frames(self.store, items, &mut |frame| {
                         on_frame(frame.unwrap_or(not_held.as_slice()))
@@ -891,8 +893,8 @@ pub fn import(store: &dyn Store, root: &Root, input: &mut dyn Read) -> Result<Su
     let mut intake = Intake::new(store, *root)?;
     // Chunks that come one after another are held, and taken in together
     // by several threads while the next ones are read, once the record is
-    // in. Each frame is read into a buffer of theirs, and one more buffer
-    // serves every other frame of the bundle.
+    // in. Each frame is read after the chunk frames that are held, and one
+    // more buffer takes every other frame of the bundle.
     let mut frames = [ChunkFrames::new(), ChunkFrames::new()];
     let mut frame = Vec::new();
     // What the intake takes changes only when it takes a frame that is not
@@ -902,7 +904,7 @@ pub fn import(store: &dyn Store, root: &Root, input: &mut dyn Read) -> Result<Su
     std::thread::scope(|scope| {
         let mut taking = TakingIn::new(scope, &mut intake, &mut frames);
         let read = loop {
-            let next = match read_next(input, limit, taking.next_buffer()) {
+            let next = match taking.read_next(input, limit) {
                 Ok(next) => next,
                 Err(error) => break Err(error),
             };
@@ -914,7 +916,7 @@ pub fn import(store: &dyn Store, root: &Root, input: &mut dyn Read) -> Result<Su
                 }
                 Next::Frame => {
                     // What came before is taken in first.
-                    std::mem::swap(&mut frame, taking.next_buffer());
+                    taking.take_next(&mut frame);
                     let accepted = taking.intake().and_then(|intake| {
                         intake.accept(&frame)?;
                         limit = intake.frame_limit();

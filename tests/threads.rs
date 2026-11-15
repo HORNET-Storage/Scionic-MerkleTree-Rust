@@ -742,6 +742,14 @@ fn a_responder_that_reads_chunks_ahead_answers_as_one_that_does_not() {
     missing
         .remove(Stored::Chunk, &Hash::of(&chunks[2][1..]))
         .unwrap();
+    // The third chunk is held with another length than its list gives: it
+    // cannot be the chunk, and the answer is the same.
+    let third = &chunks[2][1..];
+    let shortened = damaged_copy(&source, &Hash::of(third));
+    shortened.remove(Stored::Chunk, &Hash::of(third)).unwrap();
+    shortened
+        .put(Stored::Chunk, &Hash::of(third), &third[..third.len() - 1])
+        .unwrap();
     let mut cut_short = chunks[..2].to_vec();
     cut_short.push(not_held.clone());
     for threads in [1, 2, 0] {
@@ -761,6 +769,11 @@ fn a_responder_that_reads_chunks_ahead_answers_as_one_that_does_not() {
         );
         assert!(
             chunks_answer(&responder, &file, 2) == [not_held.clone()],
+            "{threads} threads"
+        );
+        let responder = Responder::new(&shortened).threads(threads);
+        assert!(
+            chunks_answer(&responder, &file, 0) == cut_short,
             "{threads} threads"
         );
     }
@@ -807,20 +820,21 @@ impl Store for ReadingInto {
     fn get(&self, kind: Stored, hash: &Hash) -> Result<Option<Arc<[u8]>>> {
         self.inner.get(kind, hash)
     }
-    fn read_into(&self, kind: Stored, hash: &Hash, buffer: &mut Vec<u8>) -> Result<bool> {
+    fn read_into(&self, kind: Stored, hash: &Hash, into: &mut [u8]) -> Result<Option<u64>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         if Some(*hash) == self.lost {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(bytes) = self.inner.get(kind, hash)? else {
-            return Ok(false);
+            return Ok(None);
         };
-        let start = buffer.len();
-        buffer.extend_from_slice(&bytes);
-        if Some(*hash) == self.damaged {
-            buffer[start] ^= 1;
+        if bytes.len() == into.len() {
+            into.copy_from_slice(&bytes);
+            if Some(*hash) == self.damaged {
+                into[0] ^= 1;
+            }
         }
-        Ok(true)
+        Ok(Some(bytes.len() as u64))
     }
     fn remove(&self, kind: Stored, hash: &Hash) -> Result<()> {
         self.inner.remove(kind, hash)
@@ -829,21 +843,22 @@ impl Store for ReadingInto {
 
 #[test]
 fn what_a_store_reads_into_memory_of_its_own_is_checked_as_what_it_lends() {
-    // By default, what is read is added to what the memory holds already,
-    // and nothing is added for a thing that is not held.
+    // By default, a thing is read into memory as long as it is, and only
+    // its length is told for memory of another length.
     let store = MemoryStore::new();
     store
         .put(Stored::Chunk, &Hash::of(b"held"), b"held")
         .unwrap();
-    let mut buffer = b"before ".to_vec();
-    assert!(store
-        .read_into(Stored::Chunk, &Hash::of(b"held"), &mut buffer)
-        .unwrap());
-    assert_eq!(buffer, b"before held");
-    assert!(!store
-        .read_into(Stored::Chunk, &Hash::of(b"not held"), &mut buffer)
-        .unwrap());
-    assert_eq!(buffer, b"before held");
+    let mut into = *b"....";
+    let length = store.read_into(Stored::Chunk, &Hash::of(b"held"), &mut into);
+    assert_eq!(length.unwrap(), Some(4));
+    assert_eq!(&into, b"held");
+    let mut longer = *b".....";
+    let length = store.read_into(Stored::Chunk, &Hash::of(b"held"), &mut longer);
+    assert_eq!(length.unwrap(), Some(4));
+    assert_eq!(&longer, b".....");
+    let length = store.read_into(Stored::Chunk, &Hash::of(b"not held"), &mut into);
+    assert_eq!(length.unwrap(), None);
 
     let (source, root, frames) = long_tree("threads-read-into");
     let places = chunk_places(&frames);
@@ -888,4 +903,32 @@ fn what_a_store_reads_into_memory_of_its_own_is_checked_as_what_it_lends() {
     assert!(matches!(result, Err(Error::Missing { .. })), "{result:?}");
     let result = read_file(&lost, &file, &mut Vec::new());
     assert!(matches!(result, Err(Error::Missing { .. })), "{result:?}");
+
+    // A chunk it holds with another length than its list gives is not read
+    // into the memory laid out for it, by it or by default. Read to be
+    // checked, it is damaged; to be sent, it is not held. A file that is
+    // read out has the lengths of its chunks looked at before any of it is
+    // written.
+    let shortened = copy();
+    let chunk = &frames[places[2]][1..];
+    shortened.inner.remove(Stored::Chunk, &bad).unwrap();
+    shortened
+        .inner
+        .put(Stored::Chunk, &bad, &chunk[..chunk.len() - 1])
+        .unwrap();
+    for store in [&shortened as &dyn Store, &shortened.inner] {
+        let mut out = Vec::new();
+        let result = export(store, &root, &mut out);
+        assert!(matches!(result, Err(Error::Corrupt { .. })), "{result:?}");
+        assert!(out == bundle_of(&frames[..places[2]]));
+        let mut out = Vec::new();
+        let result = read_file(store, &file, &mut out);
+        assert!(
+            matches!(result, Err(Error::SizeMismatch { .. })),
+            "{result:?}"
+        );
+        assert!(out.is_empty());
+        let result = fetch(&MemoryStore::new(), &root, &mut Responder::new(store));
+        assert!(matches!(result, Err(Error::Peer { .. })), "{result:?}");
+    }
 }

@@ -66,18 +66,27 @@ pub trait Store: Send + Sync {
         }
     }
 
-    /// Adds what is kept under `hash` to the end of `buffer`, and says
-    /// whether anything is kept.
+    /// Reads what is kept under `hash` into `into`, when it is as long as
+    /// `into` is, and says how long it is: None when nothing is kept. A
+    /// thing of another length is not read, and `into` is left as it was.
     ///
     /// The library reads chunks this way where it holds them a while: to
-    /// send them, or to read several at once. A store on disk should have its
-    /// own, which reads straight into `buffer`. Unless a store has its own,
-    /// this asks [`Store::lend`] and copies what is lent.
-    fn read_into(&self, kind: Stored, hash: &Hash, buffer: &mut Vec<u8>) -> Result<bool> {
-        self.lend(kind, hash, &mut |bytes| {
-            buffer.extend_from_slice(bytes);
+    /// send them, or to read several at once. Their lists say how long they
+    /// are, so they are read one after another into memory that serves one
+    /// batch after another. A store on disk should have its own, which looks
+    /// at how long a thing is before it reads any of it, and reads it
+    /// straight into `into`. Unless a store has its own, this asks
+    /// [`Store::lend`] and copies what is lent.
+    fn read_into(&self, kind: Stored, hash: &Hash, into: &mut [u8]) -> Result<Option<u64>> {
+        let mut length = None;
+        let held = self.lend(kind, hash, &mut |bytes| {
+            length = Some(bytes.len() as u64);
+            if bytes.len() == into.len() {
+                into.copy_from_slice(bytes);
+            }
             Ok(())
-        })
+        })?;
+        Ok(length.filter(|_| held))
     }
 
     /// Whether anything is kept under `hash`. Unless a store has its own,
@@ -359,35 +368,57 @@ enum Ahead {
 /// one that the store does not hold.
 type Given<'g> = dyn FnMut(usize, Option<&[u8]>) -> Result<()> + 'g;
 
-/// Reads the chunk that `item` names into `buffer`, from its start, as
-/// `ahead` says, and says whether the store holds it.
-fn read_into(
-    store: &dyn Store,
-    item: &ChunkRef,
-    ahead: Ahead,
-    buffer: &mut Vec<u8>,
-) -> Result<bool> {
-    buffer.clear();
+/// How many bytes a chunk takes when it is read ahead as `ahead` says.
+fn slot_length(item: &ChunkRef, ahead: Ahead) -> usize {
+    let length = item.length as usize;
     match ahead {
-        Ahead::Checked => {
-            let held = store.read_into(Stored::Chunk, &item.hash, buffer)?;
-            if held {
-                check_stored_chunk(item, buffer)?;
+        Ahead::Checked => length,
+        Ahead::Framed => length + 1,
+    }
+}
+
+/// Reads the chunk that `item` names into `slot`, which is as long as
+/// [`slot_length`] gives, as `ahead` says, and says whether the store holds
+/// it. A chunk that the store holds with another length than `item` gives
+/// is not read into `slot`. Read to be checked, it is lent and checked
+/// whole instead, which tells whether it is damaged or `item` is wrong. Read
+/// to be sent, it is not held: it cannot be the chunk.
+fn read_slot(store: &dyn Store, item: &ChunkRef, ahead: Ahead, slot: &mut [u8]) -> Result<bool> {
+    let length = u64::from(item.length);
+    match ahead {
+        Ahead::Checked => match store.read_into(Stored::Chunk, &item.hash, slot)? {
+            None => Ok(false),
+            Some(held) if held == length => {
+                check_stored_chunk(item, slot)?;
+                Ok(true)
             }
-            Ok(held)
-        }
+            Some(_) => match lend_chunk(store, item, &mut |_| Ok(()))? {
+                false => Ok(false),
+                true => Err(Error::Invariant {
+                    detail: "a store gave two lengths for one chunk",
+                }),
+            },
+        },
         Ahead::Framed => {
-            buffer.push(FRAME_CHUNK);
-            store.read_into(Stored::Chunk, &item.hash, buffer)
+            let Some((tag, body)) = slot.split_first_mut() else {
+                return Err(Error::Invariant {
+                    detail: "a chunk's frame has no room for its tag",
+                });
+            };
+            *tag = FRAME_CHUNK;
+            Ok(store.read_into(Stored::Chunk, &item.hash, body)? == Some(length))
         }
     }
 }
 
 /// Reads chunks from a store ahead of what is done with them, several at
-/// once. The buffers serve one batch after another: memory that is used
-/// again costs much less than fresh memory.
+/// once. The chunks of a batch are read one after another into one stretch
+/// of memory, each into as many bytes as its list gives it, and that memory
+/// serves one batch after another: memory that is used again costs much
+/// less than fresh memory. It is no longer than the longest batch, whatever
+/// the lengths of the chunks of the batches before.
 pub(crate) struct ChunksAhead {
-    buffers: Vec<Mutex<Vec<u8>>>,
+    memory: Vec<u8>,
     threads: usize,
 }
 
@@ -404,7 +435,7 @@ impl ChunksAhead {
             threads => threads,
         };
         Self {
-            buffers: Vec::new(),
+            memory: Vec::new(),
             threads,
         }
     }
@@ -436,8 +467,9 @@ impl ChunksAhead {
     /// Gives `with` the frames of the chunks that `items` name, in their
     /// order, read from the store as it holds them: whoever takes them checks
     /// them. Where the chunks are long enough to be worth it, several are
-    /// read at once, ahead of `with`. A chunk that the store does not hold is
-    /// given as None, and nothing after it.
+    /// read at once, ahead of `with`. A chunk that the store does not hold,
+    /// or holds with another length than its item gives, is given as None,
+    /// and nothing after it.
     pub(crate) fn frames(
         &mut self,
         store: &dyn Store,
@@ -498,13 +530,10 @@ impl ChunksAhead {
             let held = match ahead {
                 Ahead::Checked => lend_chunk(store, item, &mut |bytes| with(index, Some(bytes)))?,
                 Ahead::Framed => {
-                    if self.buffers.is_empty() {
-                        self.buffers.push(Mutex::new(Vec::new()));
-                    }
-                    let mut frame = lock(&self.buffers[0]);
-                    let held = read_into(store, item, ahead, &mut frame)?;
+                    let frame = self.room(slot_length(item, ahead));
+                    let held = read_slot(store, item, ahead, frame)?;
                     if held {
-                        with(index, Some(&frame))?;
+                        with(index, Some(frame))?;
                     }
                     held
                 }
@@ -527,10 +556,18 @@ impl ChunksAhead {
         workers: usize,
         with: &mut Given<'_>,
     ) -> Result<bool> {
-        while self.buffers.len() < batch.len() {
-            self.buffers.push(Mutex::new(Vec::new()));
-        }
-        let buffers = &self.buffers[..batch.len()];
+        let lengths: Vec<usize> = batch.iter().map(|item| slot_length(item, ahead)).collect();
+        // Each chunk's own part of the memory, which one thread reads it
+        // into.
+        let mut rest = self.room(lengths.iter().sum());
+        let slots: Vec<Mutex<&mut [u8]>> = lengths
+            .iter()
+            .map(|&length| {
+                let (slot, after) = std::mem::take(&mut rest).split_at_mut(length);
+                rest = after;
+                Mutex::new(slot)
+            })
+            .collect();
         let next = AtomicUsize::new(0);
         let work = || {
             let mut done = Vec::new();
@@ -539,7 +576,7 @@ impl ChunksAhead {
                 let Some(item) = batch.get(index) else {
                     return done;
                 };
-                let held = read_into(store, item, ahead, &mut lock(&buffers[index]));
+                let held = read_slot(store, item, ahead, &mut lock(&slots[index]));
                 done.push((index, held));
             }
         };
@@ -560,9 +597,25 @@ impl ChunksAhead {
                 with(index, None)?;
                 return Ok(true);
             }
-            with(index, Some(&lock(&buffers[index])))?;
+            with(index, Some(&lock(&slots[index])))?;
         }
         Ok(false)
+    }
+
+    /// The first `length` bytes of the memory, which grows to hold them, and
+    /// to no more. What it held is not needed then: fresh memory, which the
+    /// system gives cleared, is neither copied nor cleared here.
+    fn room(&mut self, length: usize) -> &mut [u8] {
+        if self.memory.len() < length {
+            self.memory = vec![0; length];
+        }
+        &mut self.memory[..length]
+    }
+
+    /// How many bytes of memory this holds for chunks.
+    #[cfg(test)]
+    fn memory_held(&self) -> usize {
+        self.memory.capacity()
     }
 }
 
@@ -798,5 +851,51 @@ mod tests {
             assert!(matches!(lent, Err(Error::Corrupt { .. })));
             assert!(seen.is_empty());
         }
+    }
+
+    #[test]
+    fn chunks_read_ahead_take_no_more_memory_than_the_longest_batch() {
+        // In each batch a long chunk comes after short ones, at another place
+        // each time. Memory that each place kept for the longest chunk it
+        // held would come to all of them.
+        let store = MemoryStore::new();
+        let long_bytes = vec![7_u8; 1 << 20];
+        let long = ChunkRef::of(&long_bytes).unwrap();
+        store.put(Stored::Chunk, &long.hash, &long_bytes).unwrap();
+        let short = ChunkRef::of(b"s").unwrap();
+        store.put(Stored::Chunk, &short.hash, b"s").unwrap();
+        let mut ahead = ChunksAhead::with_threads(4);
+        for place in 0..64 {
+            let mut items = vec![short; place];
+            items.push(long);
+            let mut given = Vec::new();
+            ahead
+                .frames(&store, &items, &mut |frame| {
+                    given.push(frame.map(<[u8]>::len));
+                    Ok(())
+                })
+                .unwrap();
+            let mut lengths: Vec<_> = items
+                .iter()
+                .map(|item| Some(item.length as usize + 1))
+                .collect();
+            assert_eq!(given, lengths);
+            // Checked, every eighth time: each check hashes the long chunk.
+            if place % 8 == 0 {
+                given.clear();
+                ahead
+                    .lend(&store, &items, &mut |_, bytes| {
+                        given.push(Some(bytes.len()));
+                        Ok(())
+                    })
+                    .unwrap();
+                lengths
+                    .iter_mut()
+                    .for_each(|length| *length = length.map(|length| length - 1));
+                assert_eq!(given, lengths);
+            }
+        }
+        let most = long_bytes.len() + 1 + 64 * 2;
+        assert!(ahead.memory_held() <= most, "{} bytes", ahead.memory_held());
     }
 }

@@ -150,17 +150,24 @@ impl Store for DirStore {
     }
 
     /// The library reads chunks that it sends, or reads several at once,
-    /// through here, straight into memory of its own.
-    fn read_into(&self, kind: Stored, hash: &Hash, buffer: &mut Vec<u8>) -> Result<bool> {
+    /// through here, straight into memory of its own. A file of another
+    /// length than that memory is not read.
+    fn read_into(&self, kind: Stored, hash: &Hash, into: &mut [u8]) -> Result<Option<u64>> {
         let path = self.path(kind, hash);
         let mut file = match File::open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(failed("open", &path, error)),
         };
-        file.read_to_end(buffer)
-            .map_err(|error| failed("read", &path, error))?;
-        Ok(true)
+        let length = file
+            .metadata()
+            .map_err(|error| failed("look at", &path, error))?
+            .len();
+        if length == into.len() as u64 {
+            file.read_exact(into)
+                .map_err(|error| failed("read", &path, error))?;
+        }
+        Ok(Some(length))
     }
 
     fn size(&self, kind: Stored, hash: &Hash) -> Result<Option<u64>> {
