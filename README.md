@@ -474,7 +474,7 @@ The exact rules are in [`spec/FORMAT.md`](spec/FORMAT.md), under "What a receive
 | Implementation | Version | |
 | --- | --- | --- |
 | Rust, this repository | 2.5.6 | The reference for the format. |
-| [Go](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) | 2.5.6 | |
+| [Go](https://github.com/HORNET-Storage/Scionic-MerkleTree-Go) | 2.5.6 | |
 | [Swift](https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift) | 2.5.6 | |
 
 The three libraries are kept in step: one format, one set of vectors and one version number. A tree built by the Go or the Swift library and one built by this library from the same folder have the same root, and each reads what the others write.
