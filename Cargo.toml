@@ -8,8 +8,9 @@ license = "MIT"
 repository = "https://github.com/HORNET-Storage/Scionic-MerkleTree-Rust"
 keywords = ["merkle", "merkle-tree", "deduplication", "chunking", "sync"]
 categories = ["data-structures", "cryptography", "filesystem"]
-# What the repository keeps for its own work, and not for the crate's users.
-exclude = [".github/", "AGENTS.md"]
+# The repository's CI, which the crate's users have no use for. `AGENTS.md`
+# stays in: the README links to it.
+exclude = [".github/"]
 
 [dependencies]
 sha2 = { version = "0.11", default-features = false }
